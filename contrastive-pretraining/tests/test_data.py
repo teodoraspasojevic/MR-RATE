@@ -77,6 +77,25 @@ class TestPercentileNormalizer:
         assert out.min() >= 0.0 - 1e-6
         assert out.max() <= 1.0 + 1e-6
 
+    def test_clip_default_true_matches_prior_behavior(self):
+        """Regression: adding clip= must not change the pre-existing default."""
+        norm = PercentileNormalizer()
+        data = np.random.randn(32, 32, 32).astype(np.float32) * 100
+        out = norm.normalize(data)
+        assert out.min() >= -1.0 - 1e-6
+        assert out.max() <= 1.0 + 1e-6
+
+    def test_clip_false_allows_out_of_range_tail(self):
+        """clip=False (added for mrrate_r2v.data.dataset's NV-Generate-CTMR-matching
+        default) must NOT clamp values beyond the upper percentile bound."""
+        norm = PercentileNormalizer(lower_percentile=0.0, upper_percentile=90.0,
+                                     lower_limit=0.0, upper_limit=1.0, clip=False)
+        # Continuous spread so low != high; values above the 90th percentile
+        # must map above upper_limit unclipped.
+        data = np.linspace(1.0, 100.0, 100).astype(np.float32).reshape(10, 10, 1)
+        out = norm.normalize(data)
+        assert out.max() > 1.0
+
 
 class TestMinMaxNormalizer:
     @pytest.fixture
