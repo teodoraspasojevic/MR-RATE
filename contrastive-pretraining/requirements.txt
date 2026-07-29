@@ -16,6 +16,14 @@ pandas>=1.5
 
 # Medical imaging
 nibabel>=5.0
+scikit-image>=0.20.0     # SSIM only; imported lazily in mrrate_r2v/eval/paired.py
+monai>=1.5.0             # only needed to load the vendored NVIDIA model (mrrate_r2v/models/nvidia.py).
+                         # The evaluation metrics deliberately do not use it -- monai <=1.6 calls
+                         # scipy.linalg.sqrtm(disp=...), removed in scipy 1.17.
+
+# Optional: only for `cli.build_manifest --source shards_parquet`. That code path imports it
+# lazily and needs no torch, so a pyarrow-only interpreter can build a manifest on its own.
+# pyarrow>=14.0
 
 # Image processing
 Pillow>=9.0

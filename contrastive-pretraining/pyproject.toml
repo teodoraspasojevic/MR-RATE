@@ -1,10 +1,11 @@
 [tool.pytest.ini_options]
-pythonpath = ["mr_rate", "vision_encoder", "scripts"]
+# "." makes `mrrate_r2v` importable; the rest are the non-package script/lib dirs.
+pythonpath = [".", "mr_rate", "vision_encoder", "scripts"]
 testpaths = ["tests"]
-addopts = "--cov=mr_rate --cov=vision_encoder --cov-report=term-missing"
+addopts = "--cov=mrrate_r2v --cov=mr_rate --cov=vision_encoder --cov-report=term-missing"
 
 [tool.coverage.run]
-source = ["mr_rate", "vision_encoder"]
+source = ["mrrate_r2v", "mr_rate", "vision_encoder"]
 omit = ["*/setup.py"]
 
 [tool.coverage.report]
