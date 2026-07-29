@@ -62,6 +62,17 @@ def parse_args(argv=None):
                          "not stable on small subgroups")
     dm.add_argument("--diversity-k", type=int, default=5)
     p.add_argument("--seed", type=int, default=42)
+
+    fig = p.add_argument_group("example figures")
+    fig.add_argument("--save-figures", type=int, default=3, metavar="N",
+                     help="orthogonal-slice montages per sequence, written to <out>/figures/ "
+                          "(0 to disable). Paired tasks show ground truth / prediction / |diff| "
+                          "and pick cases at evenly-spaced metric ranks, so N=3 gives you the "
+                          "worst, median and best case -- the worst one is where failure modes "
+                          "are visible.")
+    fig.add_argument("--save-nifti-cases", type=int, default=0, metavar="N",
+                     help="additionally export gt/prediction/absdiff as .nii.gz for the first N "
+                          "figured cases per sequence, to open in a real viewer")
     p.add_argument("--skip-metric-groups", nargs="*", default=[],
                    choices=["fidelity", "perceptual", "distribution", "report_alignment"],
                    help="drop metric groups the task would otherwise compute. `perceptual` "
@@ -114,6 +125,7 @@ def main(argv=None) -> int:
         device=args.device, fid_bootstrap=args.fid_bootstrap,
         min_subgroup_n=args.min_subgroup_n, diversity_k=args.diversity_k, seed=args.seed,
         workers=args.workers, skip_metric_groups=tuple(args.skip_metric_groups),
+        save_figures=args.save_figures, save_nifti_cases=args.save_nifti_cases,
         extra_run_metadata={"slurm_job_id": os.environ.get("SLURM_JOB_ID")},
     )
     summary = run_evaluation(inputs)

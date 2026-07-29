@@ -223,6 +223,7 @@ rebuilt per volume — three 134 MB float64 arrays, 239 ms each time).
 | `distribution_metrics.json` | population metrics, when computed |
 | `excluded_cases.json` | every unscored case, with a specific reason |
 | `run_manifest.json` | `cohort_id`, task, checkpoint hashes, contract versions |
+| `figures/` | example orthogonal-slice montages -- **look at these**; a number tells you a volume is worse, a picture tells you how |
 
 Always compare `n_scored` with `n_cohort_cases`. Exclusion categories you may see:
 
@@ -238,6 +239,29 @@ A good FID does not prove clinical correctness, and a good reconstruction does n
 report-conditioned model will score well — each stage measures something different.
 
 ---
+
+## Example figures
+
+`--save-figures N` (default 3) writes N montages per sequence into `<results>/figures/`, rendered
+by [`figures.py`](figures.py) with PIL:
+
+    paired tasks   rows = ground truth / prediction / |difference|
+    generation     rows = generated / an unpaired real reference (captioned as NOT a counterpart)
+    columns        sagittal / coronal / axial mid-slices, superior up
+
+Cases are chosen at evenly-spaced *metric ranks*, not arbitrarily, so `N=3` gives you the worst,
+median, and best case by `psnr_fg` -- the worst one is where failure modes are visible. Filenames
+are `{sequence}_rank{0..N}_{case_id}.png`, so rank0 is always the worst.
+
+Ground truth and prediction share one intensity window so the rows are genuinely comparable; the
+difference row is scaled to its own max, which is printed in the label (an auto-scaled difference
+image with no stated range is easy to misread).
+
+`--save-nifti-cases N` additionally exports gt/prediction/absdiff as `.nii.gz` for the first N
+figured cases per sequence, to open in a real viewer. The affine is synthesized from spacing -- it
+carries orientation and voxel size but no true patient-space origin.
+
+Figure generation is never fatal: a rendering failure is logged and the metrics still get written.
 
 ## Privacy
 

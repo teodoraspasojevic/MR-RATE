@@ -46,6 +46,7 @@ RESULT_FILES = {
     "distribution_metrics.json": "population-level metrics (FID, diversity), when computed",
     "excluded_cases.json": "every case that was NOT scored, with the reason",
     "run_manifest.json": "exactly what was run: cohort_id, task, model provenance, versions",
+    "figures/": "example orthogonal-slice montages (and optional .nii.gz) for visual inspection",
 }
 
 
@@ -66,8 +67,9 @@ class EvaluationInputs:
     seed: int = 42
     workers: int = 1                      # parallel worker processes for per-case scoring
     skip_metric_groups: tuple = ()         # groups to drop from what the task declares
+    save_figures: int = 3                  # example montages per sequence (0 = none)
     report_image_model: object = None     # must expose .score(text, volume) -> float
-    save_nifti_cases: int = 0
+    save_nifti_cases: int = 0              # also export gt/pred/absdiff .nii.gz for the first N
     extra_run_metadata: dict = field(default_factory=dict)
 
 
@@ -314,6 +316,9 @@ def run_evaluation(inputs: EvaluationInputs) -> dict:
 
     elapsed = time.time() - t0
 
+    # ---- example figures (and optional NIfTI exports) for visual inspection
+    figures_written = _save_examples(inputs, out, metric_rows, paired_items)
+
     # ---- write results
     paired_names = T.paired_metric_names(groups)
     per_sequence = AGG.aggregate_metric_rows(metric_rows, lambda r: r["sequence"], paired_names) if metric_rows else {}
@@ -333,6 +338,7 @@ def run_evaluation(inputs: EvaluationInputs) -> dict:
         "paired_metrics": per_sequence,
         "distribution_metrics": distribution_result,
         "elapsed_sec": round(elapsed, 1),
+        "figures": figures_written,
     }
 
     _write_csv(out / "per_case_metrics.csv", metric_rows)
@@ -359,6 +365,76 @@ def run_evaluation(inputs: EvaluationInputs) -> dict:
 
     log.info("done: %d scored, %d excluded, %.1fs -> %s", len(metric_rows), len(excluded), elapsed, out)
     return summary
+
+
+def _save_examples(inputs: EvaluationInputs, out: Path, metric_rows, paired_items) -> list:
+    """Write example figures (and optional NIfTI triplets) into `<out>/figures`.
+
+    Never fatal: a plotting failure must not throw away a completed evaluation, so problems are
+    logged and the metrics still get written. Returns the relative paths written.
+    """
+    if inputs.save_figures <= 0 and inputs.save_nifti_cases <= 0:
+        return []
+    try:
+        from . import figures as F
+    except ImportError as e:  # pragma: no cover - PIL missing
+        log.warning("cannot import figure support (%s) -- skipping example figures", e)
+        return []
+
+    cohort, predictions, task = inputs.cohort, inputs.predictions, inputs.task
+    fig_dir = out / F.FIGURES_DIR
+    written = []
+
+    try:
+        if task.paired:
+            by_id = {item.prediction_id: case for case, item in paired_items}
+            # Rank by the primary fidelity metric when it was computed; otherwise fall back to
+            # cohort order so figures still appear for a fidelity-skipped run.
+            metric = "psnr_fg" if any("psnr_fg" in r for r in metric_rows) else None
+            per_sequence: dict = {}
+            for row in metric_rows:
+                per_sequence.setdefault(row["sequence"], []).append(row)
+
+            for sequence, rows in sorted(per_sequence.items()):
+                chosen = (F.select_ranked(rows, metric, inputs.save_figures) if metric
+                          else sorted(rows, key=lambda r: r["case_id"])[:inputs.save_figures])
+                for rank, row in enumerate(chosen):
+                    case = by_id.get(row["prediction_id"])
+                    if case is None:
+                        continue
+                    gt = cohort.load_volume(case.case_id)
+                    pred = predictions.load_volume(row["prediction_id"])
+                    caption = (f"{metric}={row[metric]:.3f}" if metric and metric in row else "")
+                    name = f"{sequence}_rank{rank}_{case.case_id}.png"
+                    F.save_paired_figure(gt, pred, fig_dir / name, case_id=case.case_id,
+                                         sequence=sequence, plane=case.acquisition_plane,
+                                         caption=caption)
+                    written.append(f"{F.FIGURES_DIR}/{name}")
+                    if rank < inputs.save_nifti_cases:
+                        stem = f"{sequence}_rank{rank}_{case.case_id}"
+                        for tag, arr in (("gt", gt), ("pred", pred), ("absdiff", np.abs(gt - pred))):
+                            F.save_example_nifti(arr, case.spacing_mm,
+                                                 fig_dir / f"{stem}_{tag}.nii.gz")
+                            written.append(f"{F.FIGURES_DIR}/{stem}_{tag}.nii.gz")
+        else:
+            # Unconditional generation: no counterpart, so show a real volume alongside for scale.
+            for sequence in cohort.sequences:
+                gen_items = [i for i in predictions.items if i.sequence == sequence]
+                real = cohort.cases_for_sequence(sequence)
+                for rank, item in enumerate(gen_items[:inputs.save_figures]):
+                    reference = (cohort.load_volume(real[rank % len(real)].case_id) if real else None)
+                    name = f"{sequence}_gen{rank}_{item.prediction_id}.png"
+                    F.save_unpaired_figure(predictions.load_volume(item.prediction_id), reference,
+                                           fig_dir / name, prediction_id=item.prediction_id,
+                                           sequence=sequence)
+                    written.append(f"{F.FIGURES_DIR}/{name}")
+    except Exception as e:  # noqa: BLE001 - figures are a convenience, metrics are the result
+        log.warning("example figure generation failed (%s: %s) -- metrics are unaffected",
+                    type(e).__name__, e)
+
+    if written:
+        log.info("wrote %d example file(s) -> %s", len(written), fig_dir)
+    return written
 
 
 def _run_distribution_metrics(inputs: EvaluationInputs, paired_items):

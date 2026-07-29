@@ -155,17 +155,40 @@ as asking for four — sequence order can never shift a draw. See `cohort.select
 ### Which series of a study
 
 ```bash
---series-selection one_per_study_deterministic   # default
+--series-selection one_per_study_per_sequence   # default
 ```
 
-| Value | One sample per… | Trade-off |
-|---|---|---|
-| `one_per_study_deterministic` | study, preferring the center-modality series | no study is overrepresented; non-preferred series never seen |
-| `one_per_study_random` | study, redrawn each epoch from (seed, epoch, study) | no overrepresentation, full coverage over many epochs. Training only. |
-| `all` | eligible series | full granularity; studies with more series count more |
+| Value | One sample per… | Use it for | Cases on the real test split |
+|---|---|---|---|
+| `one_per_study_per_sequence` | **(study, sequence)** | **evaluation** — one independent observation per sequence | 17,583 (T1w 4863 · T2w 4795 · FLAIR 4550 · SWI 3375) |
+| `all` | eligible series | training, where you want maximum data | 34,453 |
+| `one_per_study_deterministic` | study, across all sequences | a single-sequence cohort only | 4,893, but **4,861 of them T1w** |
+| `one_per_study_random` | study, redrawn each epoch | training | 4,893/epoch, same modality skew |
 
-For evaluation, prefer `one_per_study_deterministic`: with `all`, a study contributing four series
-counts four times in the average.
+Two traps this table exists to prevent:
+
+- **`all` pseudo-replicates.** Near-duplicate series from one session are not independent
+  observations — measured mean 1.96, max 13 per (study, sequence). Plain means overweight
+  multi-series studies and plain std/CIs come out falsely narrow, because the aggregation does not
+  model clustering. It also biases FID by shrinking the real distribution's apparent spread.
+- **`one_per_study_deterministic` collapses to T1w.** It picks one series per *study*, preferring the
+  center-modality series, which on MR-RATE is the T1w one. A 4-sequence request therefore yields
+  ~99% T1w and leaves T2w/FLAIR/SWI essentially unevaluated — silently.
+
+### What `--n-per-sequence` counts
+
+A **case** = one (study, sequence) pair = exactly one series. So `cases == series` always, while
+distinct *studies* is smaller because one patient contributes one case per sequence they have:
+
+| `--n-per-sequence` | cases (= series) | distinct studies |
+|---|---|---|
+| 200 | 800 | 746 |
+| 500 | 2,000 | 1,726 |
+| 1000 | 4,000 | 2,940 |
+| omitted | 17,589 | 4,893 |
+
+At 500/sequence, ~14% of cases share a patient with another case, so quote the **per-sequence**
+numbers as primary — the `overall` row is mildly clustered.
 
 ### Field of view
 
@@ -228,6 +251,7 @@ Five files, same five for every task:
 | `distribution_metrics.json` | FID and diversity metrics, when computed |
 | `excluded_cases.json` | every case that was *not* scored, with a specific reason |
 | `run_manifest.json` | exactly what ran: `cohort_id`, task, checkpoint hashes, versions |
+| `figures/` | example slice montages (ground truth / prediction / difference), worth a look before trusting any number |
 
 Always check `n_scored` against `n_cohort_cases` in `summary.json`. If they differ,
 `excluded_cases.json` says why for every case. Nothing is ever silently dropped.
