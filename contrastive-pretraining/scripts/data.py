@@ -1,5 +1,6 @@
 import os
 import csv
+import gzip
 import json
 import random
 import numpy as np
@@ -44,14 +45,25 @@ class ZScoreNormalizer:
 
 
 class PercentileNormalizer:
-    """Clip to [lower, upper] percentile, rescale to [lower_limit, upper_limit]."""
+    """Rescale [lower, upper] percentile to [lower_limit, upper_limit].
+
+    clip=True (default, unchanged behavior) additionally clamps the input to
+    the [low, high] percentile bounds before rescaling, so the output is
+    guaranteed to stay within [lower_limit, upper_limit]. clip=False rescales
+    using the same bounds but does not clamp, so values beyond the upper
+    percentile can map above upper_limit -- this matches NV-Generate-CTMR's
+    MRI intensity transform (ScaleIntensityRangePercentilesd(..., clip=False),
+    ../../NV-Generate-CTMR/scripts/transforms.py:42-71) for consumers that
+    want to match that pipeline exactly.
+    """
 
     def __init__(self, lower_percentile=0.5, upper_percentile=99.5,
-                 lower_limit=-1.0, upper_limit=1.0):
+                 lower_limit=-1.0, upper_limit=1.0, clip=True):
         self.lower_percentile = lower_percentile
         self.upper_percentile = upper_percentile
         self.lower_limit = lower_limit
         self.upper_limit = upper_limit
+        self.clip = clip
 
     def normalize(self, data):
         mask = data != 0
@@ -60,7 +72,8 @@ class PercentileNormalizer:
             high = np.percentile(data[mask], self.upper_percentile)
         else:
             low, high = data.min(), data.max()
-        data = np.clip(data, low, high)
+        if self.clip:
+            data = np.clip(data, low, high)
         if high - low > 1e-8:
             data = (data - low) / (high - low)
             data = data * (self.upper_limit - self.lower_limit) + self.lower_limit
@@ -163,15 +176,22 @@ def discover_subjects(data_folder, space):
     return found
 
 
-def load_and_resample_nii(path, target_spacing):
-    """Load NIfTI, reorient to canonical RAS, resample to target spacing.
+def _canonicalize(nii_img):
+    """Reorient an already-loaded nibabel image to canonical RAS.
 
-    Returns a float32 numpy array of shape (D, H, W) = (Z, X, Y) in RAS.
+    Shared by every path- and bytes-based loader/geometry-reader in this
+    module so "how we canonicalize" is defined exactly once.
     """
-    nii_img = nib.load(str(path))
-    # Reorient to canonical RAS so axes are always (R, A, S)
-    nii_img = nib.as_closest_canonical(nii_img)
+    return nib.as_closest_canonical(nii_img)
 
+
+def _resample_canonical(nii_img, target_spacing):
+    """Core of load_and_resample_nii, operating on an already-canonicalized
+    nibabel image (i.e. the part that requires get_fdata()). Split out so
+    load_and_resample_nii (path-based) and load_and_resample_nii_from_bytes
+    (in-memory-bytes-based, used by the archive-backed storage backend in
+    mrrate_r2v/data/storage.py) share one implementation and cannot drift.
+    """
     img_data = nii_img.get_fdata().astype(np.float32)
     np.nan_to_num(img_data, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
 
@@ -186,6 +206,105 @@ def load_and_resample_nii(path, target_spacing):
     tensor = torch.from_numpy(img_data).unsqueeze(0).unsqueeze(0)
     resampled = resize_array(tensor, current_spacing, target_spacing)[0, 0]
     return resampled
+
+
+def _geometry_of_canonical(nii_img):
+    """Core of read_native_geometry, operating on an already-canonicalized
+    nibabel image, without calling get_fdata(). Split out for the same
+    drift-avoidance reason as _resample_canonical.
+    """
+    x, y, z = nii_img.shape[:3]
+    zx, zy, zz = nii_img.header.get_zooms()[:3]
+    shape = (int(z), int(x), int(y))
+    spacing = (float(zz), float(zx), float(zy))
+    return shape, spacing
+
+
+def _looks_gzipped(data):
+    return len(data) >= 2 and data[0] == 0x1F and data[1] == 0x8B
+
+
+def load_and_resample_nii(path, target_spacing):
+    """Load NIfTI, reorient to canonical RAS, resample to target spacing.
+
+    Returns a float32 numpy array of shape (D, H, W) = (Z, X, Y) in RAS.
+    """
+    nii_img = _canonicalize(nib.load(str(path)))
+    return _resample_canonical(nii_img, target_spacing)
+
+
+def load_and_resample_nii_from_bytes(raw_bytes, target_spacing):
+    """Same as load_and_resample_nii, but from already-read NIfTI bytes
+    (a `.nii.gz` file's exact on-disk bytes, gzip-compressed or not) instead
+    of a filesystem path -- no temporary file is written anywhere. Used by
+    the archive-backed storage backend (mrrate_r2v/data/storage.py) so a series read
+    directly out of an un-extracted archive goes through the identical
+    canonicalize/resample logic as one read from an extracted directory.
+    """
+    payload = gzip.decompress(raw_bytes) if _looks_gzipped(raw_bytes) else raw_bytes
+    nii_img = _canonicalize(nib.Nifti1Image.from_bytes(payload))
+    return _resample_canonical(nii_img, target_spacing)
+
+
+def read_native_geometry(path):
+    """Header-only (D, H, W)-ordered native shape/spacing, no voxel decode.
+
+    Matches load_and_resample_nii's axis convention exactly: (D, H, W) =
+    (S, R, A) after RAS canonicalization, i.e. what target_shape/target_spacing
+    are indexed against everywhere else in this module. Used by generation
+    tooling (mrrate_r2v/data/) that must preserve pre-resample geometry alongside
+    the resampled/cropped tensor; load_and_resample_nii discards this once it
+    resamples, and calling it just for shape/spacing would force a full
+    get_fdata() decode this function deliberately avoids.
+    """
+    nii_img = _canonicalize(nib.load(str(path)))
+    return _geometry_of_canonical(nii_img)
+
+
+def read_native_geometry_from_bytes(raw_bytes):
+    """Same as read_native_geometry, but from already-read NIfTI bytes.
+
+    Unlike the path-based version, this does need a full gzip decompress of
+    the payload (nibabel's from_bytes has no lazy/partial-decompress path
+    the way a real file's header can be read without decoding pixel data) --
+    acceptable for MR-RATE's observed per-series compressed sizes (single-
+    digit to low-hundreds of MB; see docs/design/07_....md), and only ever
+    called lazily at first actual training-time access to a given series
+    (never during archive-backed manifest/index building -- see
+    mrrate_r2v/data/manifest.py's build_manifest_rows_from_* functions), so it never adds an
+    extra decompression beyond the one __getitem__ already pays for.
+    """
+    payload = gzip.decompress(raw_bytes) if _looks_gzipped(raw_bytes) else raw_bytes
+    nii_img = _canonicalize(nib.Nifti1Image.from_bytes(payload))
+    return _geometry_of_canonical(nii_img)
+
+
+def load_all_splits(splits_csv):
+    """study_uid -> split label, for every row in a splits CSV.
+
+    Unlike load_split_uids (below), this keeps every row's split label
+    rather than filtering to one split's allow-set, so a manifest can record
+    each row's split once and be filtered to any split afterward without
+    re-reading the CSV.
+    """
+    mapping = {}
+    with open(splits_csv, 'r') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            mapping[row['study_uid']] = row['split']
+    return mapping
+
+
+def load_split_uids(splits_csv, split):
+    """Study UIDs belonging to `split` in a splits CSV (study_uid, split columns).
+
+    Same allow-set semantics as MRReportDataset._load_splits /
+    MRReportDatasetInfer._load_splits (both private, duplicated between the
+    two files); promoted to a top-level function (built on load_all_splits)
+    so new consumers (mrrate_r2v/data/) can reuse it without depending on either
+    dataset class's internals.
+    """
+    return {uid for uid, s in load_all_splits(splits_csv).items() if s == split}
 
 
 def crop_or_pad(data, target_shape, posterior_shift_voxels):
@@ -237,6 +356,19 @@ def preprocess_nii(path, target_spacing, target_shape, posterior_shift_voxels, n
     dataset and the offline preprocessing script so train/cache stay identical.
     """
     resampled = load_and_resample_nii(path, target_spacing)
+    normalized = normalizer_obj.normalize(resampled)
+    return crop_or_pad(normalized, target_shape, posterior_shift_voxels)
+
+
+def preprocess_nii_from_bytes(raw_bytes, target_spacing, target_shape, posterior_shift_voxels, normalizer_obj):
+    """Same as preprocess_nii, but from already-read NIfTI bytes instead of a
+    path -- mirrors preprocess_nii exactly (load step swapped for
+    load_and_resample_nii_from_bytes), so an archive-backed series and an
+    extracted-file series go through identical normalize/crop_or_pad code.
+    Used by the R2V archive-backed storage path (mrrate_r2v/data/storage.py);
+    never used by preprocess_volumes.py or MRReportDataset.
+    """
+    resampled = load_and_resample_nii_from_bytes(raw_bytes, target_spacing)
     normalized = normalizer_obj.normalize(resampled)
     return crop_or_pad(normalized, target_shape, posterior_shift_voxels)
 
