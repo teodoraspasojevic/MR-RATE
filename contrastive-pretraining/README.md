@@ -138,6 +138,13 @@ contrastive-pretraining/
 │   │   ├── vjepa21_sliding_encoder.py # VJEPA 2.1 sliding window
 │   │   └── optimizer.py               # Optimizer utilities
 │   └── setup.py
+├── mrrate_r2v/               # Report-to-volume pipeline (separate; see ../docs/R2V.md)
+│   ├── cohort.py             # Frozen ground-truth cohort -- the comparability contract
+│   ├── predictions.py        # Its mirror on the prediction side
+│   ├── data/                 # Manifest -> Dataset -> preprocessed volume (own README.md)
+│   ├── eval/                 # Cohort + predictions + task -> metrics (own README.md)
+│   ├── models/nvidia.py      # The only import of vendored NV-Generate-CTMR code
+│   └── cli/                  # preprocess / predict_* / evaluate / build_manifest
 ├── scripts/                  # Training, inference, and evaluation
 │   ├── run_train.py          # Training entry point (all encoder variants)
 │   ├── mr_rate_trainer.py    # Distributed trainer (accelerate, W&B, resume)
@@ -748,14 +755,47 @@ python -m pytest tests/test_fusion_modes.py -v
 python -m pytest --no-cov
 ```
 
-### Test Suite (106 tests)
+### Test Suite
 
 | File | Tests | Coverage |
 |------|-------|----------|
 | `test_imports.py` | Dependency + package import verification | All imports |
 | `test_data.py` | Normalizers (zscore, percentile, minmax), collate_fn | Data pipeline |
+| `test_data_dataset.py` | Manifest build/exclusion/split logic, report stores, geometry policy, `MRReportToVolumeDataset`, `collate_fn_r2v`, geometry bucketing, cache compatibility, orientation correctness | R2V data layer |
+| `test_data_storage.py` | Archive random access, path-traversal rejection, node-local cache budget/LRU | R2V storage layer |
+| `test_cohort_contract.py` | `cohort_id` sensitivity, mismatched-prediction refusal, identifier hygiene | R2V comparability guarantees |
+| `test_eval_tasks_and_runner.py` | Task->metric registry, end-to-end evaluation, exclusion policy | R2V evaluation pipeline |
+| `test_eval_*.py` | Geometry contract, paired metrics, FID/diversity, feature cache, pairing | R2V evaluation internals |
 | `test_preprocess_cache.py` | discover_subjects, preprocess_volumes.py, live↔cache equivalence, manifest guard | `.npz` cache |
 | `test_pooling.py` | SimpleAttnPool, CrossAttnPool, GatedAttnPool | Shapes, masking, gradients |
 | `test_mr_rate_model.py` | MRRATE model init, forward, loss, serialization | 95% of core model |
 | `test_fusion_modes.py` | All 4 fusion modes x all pooling strategies | End-to-end forward pass |
 | `test_vision_encoder.py` | ResidualTemporalDownsample, VJEPA2 preprocessing | CNN shapes, gradients |
+
+## Report-to-Volume pipeline (`mrrate_r2v/`)
+
+A separate pipeline for report-conditioned single-volume generation (e.g. fine-tuning
+`nvidia/NV-Generate-MR-Brain`) and for evaluating VAE reconstruction, unconditional generation, and
+report-to-volume models on identical data.
+
+**Does not affect the contrastive training path above.** The only shared code is `scripts/data.py`'s
+per-volume preprocessing, which `mrrate_r2v` imports unchanged so the two pipelines can never drift
+apart on how a volume is prepared. It also reads directly from un-extracted local archives
+(tar-of-ZIP and WebDataset-style shard layouts) as well as ordinary extracted directories -- no
+archive is ever fully unpacked.
+
+Three stages, each a CLI, with two on-disk contracts holding them together:
+
+```bash
+cd contrastive-pretraining
+python -m mrrate_r2v.cli.preprocess  --out <cohort>          # freeze cases + FOV + count
+python -m mrrate_r2v.cli.predict_vae --cohort <cohort> --out <pred>
+python -m mrrate_r2v.cli.evaluate --task reconstruction --gt <cohort> --pred <pred> --out <results>
+```
+
+A prediction set records which cohort it came from, and the evaluator refuses to score a mismatch --
+so two models' numbers are comparable by construction.
+
+**Full guide: [`../docs/R2V.md`](../docs/R2V.md).** Module-level detail:
+[`mrrate_r2v/data/README.md`](mrrate_r2v/data/README.md) and
+[`mrrate_r2v/eval/README.md`](mrrate_r2v/eval/README.md).
