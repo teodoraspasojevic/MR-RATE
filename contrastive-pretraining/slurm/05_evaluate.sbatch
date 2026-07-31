@@ -3,7 +3,7 @@
 #SBATCH --partition=h200
 #SBATCH --gres=gpu:h200:1
 #SBATCH --cpus-per-task=32
-#SBATCH --time=04:00:00
+#SBATCH --time=12:00:00
 #SBATCH --account=y100dc
 #SBATCH --qos=mq_health
 #SBATCH --export=NONE
@@ -22,15 +22,15 @@
 # runs (drop --distribution-metrics below) are fine on a CPU partition.
 #
 # --cpus-per-task=32 and --workers are load-bearing: per-case scoring is CPU-compute-bound
-# (measured 6.75 s/case at 256^3, of which I/O is 0.5%), and it parallelizes near-linearly.
-# Staging the cohort to node-local $TMPDIR would NOT help -- Lustre already reads these volumes
-# at ~3.4 GB/s, i.e. 39 ms against 6.75 s of compute.
+# (measured 1.6 s/case fidelity + 1.3 s/volume anatomy against 0.11 s to read one) and it
+# parallelizes near-linearly. Staging the cohort to node-local $TMPDIR would NOT help.
 #
-# --skip-metric-groups perceptual drops edge-preservation / Laplacian-variance / HF-energy /
-# per-plane SSIM: ~40% of per-case time. Fidelity (MAE/MSE/PSNR/NCC/SSIM-3D) and the distribution
-# metrics are unaffected. summary.json records this as metric_groups_skipped, so a run with it is
-# never mistaken for a full one -- and two runs are only comparable on the groups both computed.
-# Remove the flag if you want the detail-preservation diagnostics back.
+# Every metric group runs. `perceptual` (edge preservation, Laplacian variance, HF energy,
+# per-plane SSIM) used to be skipped here because it was ~40% of a 6.75 s/case cost at 256^3. At
+# the per-bucket FOVs that cost is 1.6 s/case, so the whole group adds ~40 s across 2000 cases at
+# 32 workers -- and it measures blur, which is a compressive VAE's primary failure mode. To skip
+# it again add `--skip-metric-groups perceptual`; summary.json records the omission either way, so
+# a partial run is never mistaken for a full one.
 
 unset SLURM_EXPORT_ENV
 set -euo pipefail
@@ -55,9 +55,14 @@ run_py mrrate_r2v.cli.evaluate \
     --task "$TASK" --gt "$COHORT" --pred "$PRED" --out "$RESULTS" \
     --distribution-metrics "${MEDICALNET_ARG[@]}" --device cuda \
     --workers "${SLURM_CPUS_PER_TASK:-8}" \
-    --skip-metric-groups perceptual \
+    --save-figures 3 --save-nifti-cases 1 \
     --overwrite
 
 echo
-cat "$RESULTS/summary.json"
+echo "=== metrics_per_bucket.csv (geometry + every metric, one row per bucket) ==="
+column -s, -t < "$RESULTS/metrics_per_bucket.csv" 2>/dev/null || cat "$RESULTS/metrics_per_bucket.csv"
+echo
+echo "=== metrics_summary.csv (per modality, then overall_macro / overall_weighted) ==="
+column -s, -t < "$RESULTS/metrics_summary.csv" 2>/dev/null || cat "$RESULTS/metrics_summary.csv"
+echo
 sacct -j "$SLURM_JOB_ID" --format=JobID,State,Elapsed,MaxRSS 2>&1 || true

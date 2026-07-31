@@ -58,21 +58,21 @@ def parse_args(argv=None):
     dm.add_argument("--device", default="cuda", choices=["cpu", "cuda"])
     dm.add_argument("--fid-bootstrap", type=int, default=30)
     dm.add_argument("--min-subgroup-n", type=int, default=10,
-                    help="skip per-sequence distribution metrics below this many cases -- they are "
+                    help="skip per-bucket distribution metrics below this many cases -- they are "
                          "not stable on small subgroups")
     dm.add_argument("--diversity-k", type=int, default=5)
     p.add_argument("--seed", type=int, default=42)
 
     fig = p.add_argument_group("example figures")
     fig.add_argument("--save-figures", type=int, default=3, metavar="N",
-                     help="orthogonal-slice montages per sequence, written to <out>/figures/ "
+                     help="orthogonal-slice montages per (modality, plane) bucket, written to <out>/figures/ "
                           "(0 to disable). Paired tasks show ground truth / prediction / |diff| "
                           "and pick cases at evenly-spaced metric ranks, so N=3 gives you the "
                           "worst, median and best case -- the worst one is where failure modes "
                           "are visible.")
     fig.add_argument("--save-nifti-cases", type=int, default=0, metavar="N",
                      help="additionally export gt/prediction/absdiff as .nii.gz for the first N "
-                          "figured cases per sequence, to open in a real viewer")
+                          "figured cases per bucket, to open in a real viewer")
     p.add_argument("--skip-metric-groups", nargs="*", default=[],
                    choices=["fidelity", "perceptual", "distribution", "report_alignment"],
                    help="drop metric groups the task would otherwise compute. `perceptual` "

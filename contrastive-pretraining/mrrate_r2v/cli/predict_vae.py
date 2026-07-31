@@ -29,7 +29,8 @@ import torch
 
 from ..cohort import Cohort, sha256_file
 from ..eval import geometry_contract as G
-from ..predictions import PredictionItem, PredictionSet, save_prediction_volume, write_prediction_set
+from ..predictions import PredictionItem, PredictionSet, write_prediction_set
+from ..volumes import VolumeWriter
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("predict_vae")
@@ -100,20 +101,26 @@ def main(argv=None) -> int:
     cases = cohort.cases[:args.limit] if args.limit else cohort.cases
     items, failures = [], []
     t0 = time.time()
-    for n, case in enumerate(cases, start=1):
-        try:
-            recon = reconstruct(autoencoder, cohort.load_volume(case.case_id), divisor, args.device)
-        except Exception as e:  # noqa: BLE001 -- one bad case must not lose the whole run
-            failures.append({"case_id": case.case_id, "error": f"{type(e).__name__}: {e}"})
-            log.warning("case %s failed: %s", case.case_id, e)
-            continue
-        save_prediction_volume(args.out, case.case_id, recon)
-        items.append(PredictionItem(
-            prediction_id=case.case_id, case_id=case.case_id, sequence=case.sequence,
-            shape=list(recon.shape), spacing_mm=list(case.spacing_mm),
-        ))
-        if n % 25 == 0 or n == len(cases):
-            log.info("[%d/%d] %.1fs elapsed", n, len(cases), time.time() - t0)
+    # Cases are visited in cohort order, which is bucket-major, so each bucket's archive is written
+    # in one contiguous stretch.
+    with VolumeWriter(args.out) as writer:
+        for n, case in enumerate(cases, start=1):
+            try:
+                recon = reconstruct(autoencoder, cohort.load_volume(case.case_id), divisor, args.device)
+            except Exception as e:  # noqa: BLE001 -- one bad case must not lose the whole run
+                failures.append({"case_id": case.case_id, "error": f"{type(e).__name__}: {e}"})
+                log.warning("case %s failed: %s", case.case_id, e)
+                continue
+            # Same bucket as the ground truth, by construction: a reconstruction is the same
+            # (modality, plane) at the same geometry as its input.
+            writer.add(case.bucket, case.case_id, recon)
+            items.append(PredictionItem(
+                prediction_id=case.case_id, case_id=case.case_id, sequence=case.sequence,
+                plane=case.acquisition_plane, shape=list(recon.shape),
+                spacing_mm=list(case.spacing_mm),
+            ))
+            if n % 50 == 0 or n == len(cases):
+                log.info("[%d/%d] %.1fs elapsed", n, len(cases), time.time() - t0)
 
     elapsed = time.time() - t0
     pset = PredictionSet(

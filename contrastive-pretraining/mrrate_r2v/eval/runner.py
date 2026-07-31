@@ -25,18 +25,40 @@ from __future__ import annotations
 import csv
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
 
+from ..volumes import VolumeReader
 from . import aggregate as AGG
 from . import geometry_contract as G
 from . import paired as M
+from . import summary_csv as SUM
 from . import tasks as T
 
 log = logging.getLogger("mrrate_r2v.eval")
+
+# One VolumeReader per (pid, artifact root). An NpzFile keeps its zip open, so building a new
+# reader per case would re-read a multi-GB central directory every time.
+#
+# **The pid in the key is load-bearing, not cosmetic.** ProcessPoolExecutor forks, so a child
+# inherits whatever handles the parent had already opened, and concurrent reads through a shared
+# inherited file descriptor corrupt each other -- observed as `BadZipFile: Overlapped entries` and
+# `zlib.error: invalid distance too far back`. Keying on the pid makes a forked child build its own
+# handle instead of reusing the parent's.
+_READERS: dict = {}
+
+
+def _reader(root: str) -> VolumeReader:
+    key = (os.getpid(), root)
+    r = _READERS.get(key)
+    if r is None:
+        r = VolumeReader(root)
+        _READERS[key] = r
+    return r
 
 EVALUATION_VERSION = "mr_rate_evaluation_v2"
 
@@ -46,6 +68,9 @@ RESULT_FILES = {
     "distribution_metrics.json": "population-level metrics (FID, diversity), when computed",
     "excluded_cases.json": "every case that was NOT scored, with the reason",
     "run_manifest.json": "exactly what was run: cohort_id, task, model provenance, versions",
+    "anatomy_metrics.json": "anatomical plausibility of the produced population vs the real one",
+    "metrics_per_bucket.csv": "THE summary: one row per (modality, plane) with its geometry",
+    "metrics_summary.csv": "aggregates: per modality, overall_macro, overall_weighted",
     "figures/": "example orthogonal-slice montages (and optional .nii.gz) for visual inspection",
 }
 
@@ -141,6 +166,7 @@ class _ScoreJob:
     item: object          # predictions.PredictionItem (dataclass)
     groups: tuple
     needs_report: bool
+    report_text: str = ""   # carried in the job: a worker must not re-read reports.json per case
 
 
 def _score_one(job: _ScoreJob, report_image_model=None):
@@ -151,8 +177,11 @@ def _score_one(job: _ScoreJob, report_image_model=None):
     serially -- parallelism here is purely a wall-clock concern.
     """
     case, item = job.case, job.item
-    gt = np.load(f"{job.cohort_root}/volumes/{case.case_id}.npy").astype(np.float32, copy=False)
-    pred = np.load(f"{job.pred_root}/volumes/{item.prediction_id}.npy").astype(np.float32, copy=False)
+    # Bucket comes from the case (ground truth) and the item (prediction) independently. If a
+    # prediction were filed under the wrong bucket this read fails loudly rather than silently
+    # scoring the wrong pair.
+    gt = _reader(job.cohort_root).read(case.bucket, case.case_id)
+    pred = _reader(job.pred_root).read(item.bucket, item.prediction_id)
 
     ok, comparison = _check_geometry(case, item, pred.shape)
     if not ok:
@@ -163,15 +192,13 @@ def _score_one(job: _ScoreJob, report_image_model=None):
         }
 
     row = {"case_id": case.case_id, "sequence": case.sequence,
-           "acquisition_plane": case.acquisition_plane,
+           "acquisition_plane": case.acquisition_plane, "bucket": case.bucket,
            "prediction_id": item.prediction_id, "shape": list(case.shape)}
     row.update(compute_paired_metrics(gt, pred, job.groups))
     if job.needs_report:
-        report_path = Path(job.cohort_root) / "reports" / f"{case.case_id}.txt"
-        text = report_path.read_text(encoding="utf-8") if report_path.is_file() else ""
-        # In a worker this is always None -- a real model may not pickle, so supplying one forces
-        # serial execution (see _score_all), where it IS passed through.
-        sim = report_image_similarity(text, pred, report_image_model)
+        # In a worker report_image_model is always None -- a real model may not pickle, so
+        # supplying one forces serial execution (see _score_all), where it IS passed through.
+        sim = report_image_similarity(job.report_text, pred, report_image_model)
         row["report_image_similarity_available"] = sim["available"]
         row["report_image_similarity_score"] = sim["score"]
         row["report_image_similarity_unavailable_reason"] = sim["reason"]
@@ -302,9 +329,11 @@ def run_evaluation(inputs: EvaluationInputs) -> dict:
 
     # ---- paired metrics
     if task.paired:
+        needs_report = "report_alignment" in groups
         jobs = [_ScoreJob(cohort_root=str(cohort.root), pred_root=str(predictions.root),
                           case=case, item=item, groups=tuple(groups),
-                          needs_report="report_alignment" in groups)
+                          needs_report=needs_report,
+                          report_text=cohort.load_report(case.case_id) if needs_report else "")
                 for case, item in paired_items]
         for outcome, payload in _score_all(jobs, inputs):
             (metric_rows if outcome == "row" else excluded).append(payload)
@@ -314,6 +343,11 @@ def run_evaluation(inputs: EvaluationInputs) -> dict:
     if "distribution" in groups:
         distribution_result = _run_distribution_metrics(inputs, paired_items)
 
+    # ---- anatomical plausibility (population-level, so it works for unpaired tasks too)
+    anatomy_result = None
+    if "anatomy" in groups:
+        anatomy_result = _run_anatomy_metrics(inputs, paired_items)
+
     elapsed = time.time() - t0
 
     # ---- example figures (and optional NIfTI exports) for visual inspection
@@ -322,6 +356,7 @@ def run_evaluation(inputs: EvaluationInputs) -> dict:
     # ---- write results
     paired_names = T.paired_metric_names(groups)
     per_sequence = AGG.aggregate_metric_rows(metric_rows, lambda r: r["sequence"], paired_names) if metric_rows else {}
+    per_bucket = AGG.aggregate_metric_rows(metric_rows, lambda r: r["bucket"], paired_names) if metric_rows else {}
 
     summary = {
         "task": task.name,
@@ -336,16 +371,25 @@ def run_evaluation(inputs: EvaluationInputs) -> dict:
         "n_scored": len(metric_rows),
         "n_excluded": len(excluded),
         "paired_metrics": per_sequence,
+        "paired_metrics_per_bucket": per_bucket,
+        "bucket_geometry": {b: cohort.bucket_geometry(b) for b in cohort.buckets},
         "distribution_metrics": distribution_result,
+        "anatomy": anatomy_result,
         "elapsed_sec": round(elapsed, 1),
         "figures": figures_written,
     }
 
     _write_csv(out / "per_case_metrics.csv", metric_rows)
+    # The clean, human-readable summary: per bucket, then per modality, then two overall rows.
+    csv_written = SUM.write_summary_csv(out, cohort, metric_rows, paired_names,
+                                       distribution_result, anatomy_result)
+    summary["csv_files"] = csv_written
     (out / "excluded_cases.json").write_text(json.dumps(excluded, indent=2))
     (out / "summary.json").write_text(json.dumps(summary, indent=2))
     if distribution_result is not None:
         (out / "distribution_metrics.json").write_text(json.dumps(distribution_result, indent=2))
+    if anatomy_result is not None:
+        (out / "anatomy_metrics.json").write_text(json.dumps(anatomy_result, indent=2))
 
     run_manifest = {
         "evaluation_version": EVALUATION_VERSION,
@@ -391,11 +435,11 @@ def _save_examples(inputs: EvaluationInputs, out: Path, metric_rows, paired_item
             # Rank by the primary fidelity metric when it was computed; otherwise fall back to
             # cohort order so figures still appear for a fidelity-skipped run.
             metric = "psnr_fg" if any("psnr_fg" in r for r in metric_rows) else None
-            per_sequence: dict = {}
+            per_bucket: dict = {}
             for row in metric_rows:
-                per_sequence.setdefault(row["sequence"], []).append(row)
+                per_bucket.setdefault(row["bucket"], []).append(row)
 
-            for sequence, rows in sorted(per_sequence.items()):
+            for bucket, rows in sorted(per_bucket.items()):
                 chosen = (F.select_ranked(rows, metric, inputs.save_figures) if metric
                           else sorted(rows, key=lambda r: r["case_id"])[:inputs.save_figures])
                 for rank, row in enumerate(chosen):
@@ -405,28 +449,29 @@ def _save_examples(inputs: EvaluationInputs, out: Path, metric_rows, paired_item
                     gt = cohort.load_volume(case.case_id)
                     pred = predictions.load_volume(row["prediction_id"])
                     caption = (f"{metric}={row[metric]:.3f}" if metric and metric in row else "")
-                    name = f"{sequence}_rank{rank}_{case.case_id}.png"
+                    name = f"{bucket}_rank{rank}_{case.case_id}.png"
                     F.save_paired_figure(gt, pred, fig_dir / name, case_id=case.case_id,
-                                         sequence=sequence, plane=case.acquisition_plane,
+                                         sequence=case.sequence, plane=case.acquisition_plane,
                                          caption=caption)
                     written.append(f"{F.FIGURES_DIR}/{name}")
                     if rank < inputs.save_nifti_cases:
-                        stem = f"{sequence}_rank{rank}_{case.case_id}"
+                        stem = f"{bucket}_rank{rank}_{case.case_id}"
                         for tag, arr in (("gt", gt), ("pred", pred), ("absdiff", np.abs(gt - pred))):
                             F.save_example_nifti(arr, case.spacing_mm,
                                                  fig_dir / f"{stem}_{tag}.nii.gz")
                             written.append(f"{F.FIGURES_DIR}/{stem}_{tag}.nii.gz")
         else:
-            # Unconditional generation: no counterpart, so show a real volume alongside for scale.
-            for sequence in cohort.sequences:
-                gen_items = [i for i in predictions.items if i.sequence == sequence]
-                real = cohort.cases_for_sequence(sequence)
+            # Unconditional generation: no counterpart, so show a real volume from the same bucket
+            # alongside for scale -- same modality AND plane, or the comparison misleads.
+            for bucket in cohort.buckets:
+                gen_items = [i for i in predictions.items if i.bucket == bucket]
+                real = cohort.cases_for_bucket(bucket)
                 for rank, item in enumerate(gen_items[:inputs.save_figures]):
                     reference = (cohort.load_volume(real[rank % len(real)].case_id) if real else None)
-                    name = f"{sequence}_gen{rank}_{item.prediction_id}.png"
+                    name = f"{bucket}_gen{rank}_{item.prediction_id}.png"
                     F.save_unpaired_figure(predictions.load_volume(item.prediction_id), reference,
                                            fig_dir / name, prediction_id=item.prediction_id,
-                                           sequence=sequence)
+                                           sequence=bucket)
                     written.append(f"{F.FIGURES_DIR}/{name}")
     except Exception as e:  # noqa: BLE001 - figures are a convenience, metrics are the result
         log.warning("example figure generation failed (%s: %s) -- metrics are unaffected",
@@ -437,14 +482,67 @@ def _save_examples(inputs: EvaluationInputs, out: Path, metric_rows, paired_item
     return written
 
 
+def _run_anatomy_metrics(inputs: EvaluationInputs, paired_items):
+    """Anatomical plausibility, real population vs produced population.
+
+    Unpaired by construction (a KS test between two distributions), so it is meaningful for
+    unconditional generation as well as for paired tasks. Parallelised with the same worker count
+    as the paired scoring -- the measures are pure functions of one volume.
+    """
+    from . import anatomy as A
+
+    cohort, predictions, task = inputs.cohort, inputs.predictions, inputs.task
+    real_refs = [(str(cohort.root), c.bucket, c.case_id) for c in cohort.cases]
+    if task.paired:
+        prod_refs = [(str(predictions.root), i.bucket, i.prediction_id) for _c, i in paired_items]
+    else:
+        prod_refs = [(str(predictions.root), i.bucket, i.prediction_id) for i in predictions.items]
+
+    workers = max(1, int(inputs.workers or 1))
+    if workers > 1:
+        from concurrent.futures import ProcessPoolExecutor
+
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            real = list(pool.map(_measure_one, real_refs, chunksize=1))
+            prod = list(pool.map(_measure_one, prod_refs, chunksize=1))
+    else:
+        real = [_measure_one(r) for r in real_refs]
+        prod = [_measure_one(r) for r in prod_refs]
+
+    out = {"overall": A.compare_populations(real, prod)}
+    # Per bucket and per sequence, using the same grouping every other metric family uses.
+    prod_keys = ([(i.bucket, i.sequence) for _c, i in paired_items] if task.paired
+                 else [(i.bucket, i.sequence) for i in predictions.items])
+    for level, real_key, prod_key in ((0, lambda c: c.bucket, lambda k: k[0]),
+                                      (1, lambda c: c.sequence, lambda k: k[1])):
+        g_real, g_prod = {}, {}
+        for c, m in zip(cohort.cases, real):
+            g_real.setdefault(real_key(c), []).append(m)
+        for k, m in zip(prod_keys, prod):
+            g_prod.setdefault(prod_key(k), []).append(m)
+        for name in sorted(set(g_real) & set(g_prod)):
+            out[name] = A.compare_populations(g_real[name], g_prod[name])
+    return out
+
+
+def _measure_one(ref) -> dict:
+    """Anatomical measures for one volume. `ref` is (root, bucket, volume_id); module-level and
+    tuple-argument so a ProcessPoolExecutor can map over it."""
+    from . import anatomy as A
+
+    root, bucket, volume_id = ref
+    return A.measure(_reader(root).read(bucket, volume_id))
+
+
 def _run_distribution_metrics(inputs: EvaluationInputs, paired_items):
     """Population-level metrics. Imported lazily: this is the only part of the evaluator that
     needs torch and a MedicalNet checkpoint, so a fidelity-only run stays lightweight.
 
     For paired tasks the real/produced populations are the matched pairs. For generation there
-    is no pairing, so the real population is the whole cohort and the produced population is
-    every prediction item, truncated to `min(n_real, n_gen)` per sequence -- Frechet distance
-    needs two populations of comparable size, not a correspondence.
+    is no pairing, so real and produced volumes are lined up **within a bucket**, truncated to
+    `min(n_real, n_gen)` -- Frechet distance needs two populations of comparable size, not a
+    correspondence. Bucket, not sequence: only within a bucket do all volumes share a geometry,
+    and pairing across planes would compare an axial real volume with a sagittal generated one.
     """
     from . import distribution as DM
 
@@ -453,19 +551,21 @@ def _run_distribution_metrics(inputs: EvaluationInputs, paired_items):
         if inputs.medicalnet_checkpoint else None
     inception = DM.InceptionFeatureExtractor(inputs.device)
 
-    def features_for(case_id_or_none, sequence, real_arr, gen_arr):
-        cf = DM.CaseFeatures(case_id=case_id_or_none or "gen", sequence=sequence)
+    def features_for(case_id_or_none, sequence, bucket, real_arr, gen_arr):
+        cf = DM.CaseFeatures(case_id=case_id_or_none or "gen", sequence=sequence, bucket=bucket)
         if real_arr is not None:
             if medicalnet is not None:
                 cf.medicalnet_real = medicalnet.extract(real_arr)
             cf.inception_2p5d_real = DM.extract_2p5d_inception_features(real_arr, inception)
-            _, p = inception.extract_batch(DM.mid_slice(real_arr, axis=2)[None])
+            cf.mid_slice_real = DM.mid_slice(real_arr, axis=2)
+            _, p = inception.extract_batch(cf.mid_slice_real[None])
             cf.inception_mid_probs_real = p[0]
         if gen_arr is not None:
             if medicalnet is not None:
                 cf.medicalnet_gen = medicalnet.extract(gen_arr)
             cf.inception_2p5d_gen = DM.extract_2p5d_inception_features(gen_arr, inception)
-            _, p = inception.extract_batch(DM.mid_slice(gen_arr, axis=2)[None])
+            cf.mid_slice_gen = DM.mid_slice(gen_arr, axis=2)
+            _, p = inception.extract_batch(cf.mid_slice_gen[None])
             cf.inception_mid_probs_gen = p[0]
         return cf
 
@@ -473,20 +573,23 @@ def _run_distribution_metrics(inputs: EvaluationInputs, paired_items):
     if task.paired:
         for case, item in paired_items:
             all_features.append(features_for(
-                case.case_id, case.sequence,
+                case.case_id, case.sequence, case.bucket,
                 cohort.load_volume(case.case_id), predictions.load_volume(item.prediction_id),
             ))
     else:
-        for seq in cohort.sequences:
-            real_cases = cohort.cases_for_sequence(seq)
-            gen_items = [i for i in predictions.items if i.sequence == seq]
+        gen_by_bucket: dict = {}
+        for item in predictions.items:
+            gen_by_bucket.setdefault(item.bucket, []).append(item)
+        for bucket in cohort.buckets:
+            real_cases = cohort.cases_for_bucket(bucket)
+            gen_items = gen_by_bucket.get(bucket, [])
             n = min(len(real_cases), len(gen_items))
-            if n < len(real_cases) or n < len(gen_items):
-                log.info("sequence=%s: %d real vs %d generated -- using min(%d) for "
-                         "population metrics", seq, len(real_cases), len(gen_items), n)
+            if n < max(len(real_cases), len(gen_items)):
+                log.info("%s: %d real vs %d generated -- using min(%d) for population metrics",
+                         bucket, len(real_cases), len(gen_items), n)
             for i in range(n):
                 all_features.append(features_for(
-                    f"{seq}_{i}", seq,
+                    f"{bucket}_{i}", real_cases[i].sequence, bucket,
                     cohort.load_volume(real_cases[i].case_id),
                     predictions.load_volume(gen_items[i].prediction_id),
                 ))
@@ -497,6 +600,7 @@ def _run_distribution_metrics(inputs: EvaluationInputs, paired_items):
     return DM.compute_distribution_metrics(
         all_features, cohort.sequences, min_subgroup_n=inputs.min_subgroup_n,
         n_bootstrap=inputs.fid_bootstrap, seed=inputs.seed, k_diversity=inputs.diversity_k,
+        buckets=cohort.buckets,
     )
 
 

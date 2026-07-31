@@ -23,6 +23,8 @@ COHORT_ROOT="$WORKSPACE/cache/r2v/cohorts"
 PRED_ROOT="$WORKSPACE/cache/r2v/predictions"
 RESULT_ROOT="$WORKSPACE/cache/r2v/results"
 VAE_CHECKPOINT="$WORKSPACE/models/autoencoder_v1.pt"
+# NVIDIA stores this path relative to cwd in its env config, so it must be given absolutely.
+UNET_CHECKPOINT="$WORKSPACE/models/diff_unet_3d_rflow-mr-brain_v0.pt"
 MEDICALNET_CHECKPOINT="$WORKSPACE/pretrained/medicalnet/resnet_10_23dataset_statedict.pth"
 
 preflight() {

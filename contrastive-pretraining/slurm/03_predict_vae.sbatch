@@ -3,7 +3,7 @@
 #SBATCH --partition=h200
 #SBATCH --gres=gpu:h200:1
 #SBATCH --cpus-per-task=8
-#SBATCH --time=04:00:00
+#SBATCH --time=08:00:00
 #SBATCH --account=y100dc
 #SBATCH --qos=mq_health
 #SBATCH --export=NONE

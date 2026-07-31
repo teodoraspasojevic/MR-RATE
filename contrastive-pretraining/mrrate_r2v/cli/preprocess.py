@@ -10,39 +10,39 @@ nowhere else.
         --manifest-csv  <manifest.csv> \\
         --report-index-csv <report_index.csv> \\
         --split test --sequences T1w T2w FLAIR SWI \\
-        --n-per-sequence 200 \\
+        --n-per-bucket 200 \\
         --out <workspace>/cohorts/test_v1
 
 Sampling and FOV, the two things you will actually tune:
 
-  --n-per-sequence N     N cases per sequence (omit for every eligible case). Selection is
-                         deterministic given --seed, and picking one sequence yields the same
-                         cases as picking four -- see `cohort.select_cohort`.
+  --n-per-bucket N       N cases per (modality, plane) bucket -- 10 buckets exist in the real
+                         test split, so N=200 gives 2000 cases. Per *bucket* rather than per
+                         sequence so every bucket has equal statistical power: the real plane
+                         mix is ~81% axial, which would leave coronal buckets too small for a
+                         stable per-bucket FID. Deterministic given --seed, and which buckets
+                         you request never shifts another bucket's draw.
   --series-selection     which series of a study may be picked. Default
-                         one_per_study_per_sequence: one independent observation per (study,
-                         sequence) -- what you want for a multi-sequence evaluation. `all`
-                         keeps every series, which pseudo-replicates near-duplicates from one
-                         session (measured mean 1.96, max 13 per study-sequence on the real
-                         test split) and biases means toward multi-series studies.
-                         `one_per_study_deterministic` picks one series per *study* across all
-                         sequences, and because the preferred series is the T1w center
-                         modality it collapses a 4-sequence request to ~99% T1w -- only use it
-                         for a single-sequence cohort.
-  --geometry-mode fixed  (default) every volume on one grid -- required for comparing models,
-                         and required for `--task generation` to mean anything, since the
-                         NVIDIA diffusion model emits ONLY 256^3 @ 1mm. `--fixed-shape` /
-                         `--fixed-spacing-mm` set it; the default is read from that model's
-                         config so a cohort and its output share a grid.
-  --geometry-mode per_modality_plane
-                         each (modality, plane) gets its own tighter FOV from NVIDIA's
-                         published median training FOVs. Anatomically snugger and fine for
-                         training or a VAE-only study, but every bucket differs from the
-                         generator's fixed output shape, so a generation evaluation against
-                         such a cohort compares populations on different grids. Numbers are
-                         also not comparable with a fixed-geometry cohort.
+                         one_per_study_per_bucket: one independent observation per (study,
+                         modality, plane). `one_per_study_per_sequence` looks equivalent but is
+                         not -- it prefers the T1w center-modality series, which collapses the
+                         PLANES (measured: T2w SAGITTAL fell to 6 cases). `all`
+                         pseudo-replicates near-duplicate series from one session (measured mean
+                         1.96, max 13); `one_per_study_deterministic` collapses a 4-sequence
+                         request to ~99% T1w.
+  --geometry-mode per_modality_plane   (default)
+                         Each bucket is resampled to NVIDIA's published recommended FOV for
+                         that (modality, plane) *exactly*: shape is the nearest multiple of 32
+                         (the diffusion UNet's constraint, verified empirically) and spacing is
+                         derived as FOV/shape. Spacing is a real conditioning input to the
+                         model, so generation can then be asked for the same geometry -- which
+                         is what makes the real and generated populations comparable.
+  --geometry-mode fixed  One grid for everything, from `--fixed-shape`/`--fixed-spacing-mm`.
+                         Only useful for a deliberate single-geometry study.
+  --posterior-shift-mm   Defacing compensation. Default 0 -- see the flag's help.
 
-Disk cost is about `prod(shape) * 4` bytes per case: ~67 MB at 256^3, so ~54 GB for 800 cases.
-Write cohorts to a workspace, never to git or your home directory.
+Volumes are stored as one compressed archive per bucket (see `volumes.py`), which is both ~2.9x
+smaller than raw and ~10 files instead of ~2000 -- `/hnvme` has a file-count quota. Expect ~14 MB
+per case on disk at the per-bucket FOVs. Write cohorts to a workspace, never to git or `$HOME`.
 """
 from __future__ import annotations
 
@@ -58,9 +58,8 @@ from ..cohort import (
     CohortCase,
     CohortSpec,
     case_id_for,
-    save_report,
-    save_volume,
-    select_cohort,
+    population_bucket_counts,
+    select_cohort_buckets,
     sha256_file,
     write_cohort,
 )
@@ -70,9 +69,11 @@ from ..data import (
     SentenceJSONLReportStore,
     ShardReportStore,
     StructuredReportStore,
+    dhw_to_xyz,
     read_manifest_csv,
     xyz_to_dhw,
 )
+from ..volumes import VolumeWriter
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("preprocess")
@@ -130,23 +131,40 @@ def parse_args(argv=None):
     coh = p.add_argument_group("cohort")
     coh.add_argument("--split", default="test", choices=["train", "val", "test"])
     coh.add_argument("--sequences", nargs="+", default=DEFAULT_SEQUENCES)
-    coh.add_argument("--n-per-sequence", type=int, default=None,
-                     help="cases per sequence; omit for every eligible case")
-    coh.add_argument("--series-selection", default="one_per_study_per_sequence",
-                     choices=["all", "one_per_study_per_sequence",
+    coh.add_argument("--n-per-bucket", type=int, default=200,
+                     help="cases per (modality, plane) bucket; 0 means every eligible case. "
+                          "Sampling per bucket rather than per sequence gives every bucket equal "
+                          "statistical power -- the real plane mix is ~81%% axial, which would "
+                          "leave coronal buckets too small for a stable per-bucket FID. Because "
+                          "the cohort is balanced, a frequency-weighted aggregate is weighted by "
+                          "the eligible-population counts recorded in cohort.json, not by these.")
+    coh.add_argument("--series-selection", default="one_per_study_per_bucket",
+                     choices=["all", "one_per_study_per_bucket", "one_per_study_per_sequence",
                               "one_per_study_deterministic", "one_per_study_random"],
-                     help="default one_per_study_per_sequence: one independent observation per "
-                          "(study, sequence). 'all' pseudo-replicates near-duplicate series; "
+                     help="default one_per_study_per_bucket: one independent observation per "
+                          "(study, modality, plane). 'one_per_study_per_sequence' prefers the "
+                          "T1w center-modality series and so collapses the planes. "
+                          "'all' pseudo-replicates near-duplicate series; "
                           "'one_per_study_deterministic' collapses a multi-sequence request to "
                           "almost entirely T1w -- see MRReportToVolumeDataset._select_series")
     coh.add_argument("--seed", type=int, default=42)
 
     geo = p.add_argument_group("geometry / FOV")
-    geo.add_argument("--geometry-mode", default="fixed", choices=["fixed", "per_modality_plane"])
+    geo.add_argument("--geometry-mode", default="per_modality_plane",
+                     choices=["per_modality_plane", "fixed"],
+                     help="per_modality_plane (default): each bucket gets NVIDIA's published "
+                          "recommended FOV exactly, at a shape the diffusion UNet accepts. "
+                          "`fixed` forces one grid for everything -- only useful for a "
+                          "single-geometry study.")
     geo.add_argument("--fixed-shape", type=int, nargs=3, default=None, metavar=("X", "Y", "Z"))
     geo.add_argument("--fixed-spacing-mm", type=float, nargs=3, default=None, metavar=("X", "Y", "Z"))
     geo.add_argument("--normalizer", default="percentile", choices=["percentile", "zscore", "minmax"])
-    geo.add_argument("--posterior-shift-mm", type=float, default=15.0)
+    geo.add_argument("--posterior-shift-mm", type=float, default=0.0,
+                     help="defacing compensation, in mm. Default 0: measured against real "
+                          "generated volumes, 8 of 10 buckets align better at 0 than at 15 mm, "
+                          "two of them to within 0.1 mm. The 15 mm value exists to protect a "
+                          "fixed oversized FOV in the contrastive pipeline and is not what this "
+                          "model expects.")
     geo.add_argument("--env-config", type=Path, default=None)
     geo.add_argument("--model-config", type=Path, default=None)
     geo.add_argument("--network-config", type=Path, default=None)
@@ -202,45 +220,65 @@ def main(argv=None) -> int:
     if len(dataset) == 0:
         raise SystemExit("0 samples after report filtering + series selection -- check the report source")
 
-    selection = select_cohort(dataset, args.sequences, args.n_per_sequence, args.seed)
-    indices = [(seq, i) for seq in args.sequences for i in selection.get(seq, [])]
-    log.info("cohort: %s (total %d)", {s: len(v) for s, v in selection.items()}, len(indices))
-    if not indices:
+    # 0 means "no cap" -- take every eligible case in each bucket.
+    n_per_bucket = args.n_per_bucket or None
+    selection = select_cohort_buckets(dataset, args.sequences, n_per_bucket, args.seed)
+    selection = {k: v for k, v in selection.items() if v}
+    total = sum(len(v) for v in selection.values())
+    log.info("cohort: %d buckets, %d cases", len(selection), total)
+    for (mod, plane), idxs in selection.items():
+        spec_g = dataset.geometry.resolve(mod, plane)
+        log.info("   %-6s %-9s n=%-5d shape=%s spacing=%s mm",
+                 mod, plane, len(idxs), dhw_to_xyz(spec_g.target_shape),
+                 tuple(round(x, 4) for x in dhw_to_xyz(spec_g.target_spacing)))
+    if not selection:
         raise SystemExit("cohort selection produced 0 cases -- check --sequences against the manifest")
 
     if args.dry_run:
-        example = dataset.samples[indices[0][1]]
-        log.info("--dry-run: would write %d cases to %s", len(indices), args.out)
-        log.info("--dry-run: first case modality=%s plane=%s backend=%s",
-                 example.modality, example.plane, example.backend)
+        log.info("--dry-run: would write %d cases to %s (nothing written)", total, args.out)
         return 0
 
-    cases = []
+    # One archive per bucket, so iterate bucket by bucket. Memory stays at one volume: the writer
+    # streams each array into its bucket's zip rather than accumulating the bucket.
+    cases, reports = [], {}
+    n = 0
     t0 = time.time()
-    for n, (seq, idx) in enumerate(indices, start=1):
-        sample = dataset[idx]
-        case = CohortCase(
-            case_id=case_id_for(sample["study_key"], sample["series_key"]),
-            study_key=sample["study_key"], series_key=sample["series_key"],
-            sequence=sample["modality"], acquisition_plane=sample["acquisition_plane"],
-            shape=tuple(int(x) for x in sample["target_shape"].tolist()),
-            spacing_mm=tuple(float(x) for x in sample["target_spacing_mm"].tolist()),
-        )
-        save_volume(args.out, case.case_id, sample["image"][0].numpy())
-        save_report(args.out, case.case_id, sample["report_text"])
-        cases.append(case)
-        if n % 25 == 0 or n == len(indices):
-            log.info("[%d/%d] %.1fs elapsed", n, len(indices), time.time() - t0)
+    with VolumeWriter(args.out) as writer:
+        for (mod, plane), idxs in selection.items():
+            for idx in idxs:
+                sample = dataset[idx]
+                case = CohortCase(
+                    case_id=case_id_for(sample["study_key"], sample["series_key"]),
+                    study_key=sample["study_key"], series_key=sample["series_key"],
+                    sequence=sample["modality"], acquisition_plane=sample["acquisition_plane"],
+                    shape=tuple(int(x) for x in sample["target_shape"].tolist()),
+                    spacing_mm=tuple(float(x) for x in sample["target_spacing_mm"].tolist()),
+                )
+                # Guard against a silent bucket/geometry mismatch: the sample's own reported
+                # geometry must be the one this bucket's archive is supposed to hold.
+                if (case.sequence, case.acquisition_plane) != (mod, plane):
+                    raise SystemExit(
+                        f"bucket mismatch: selection said ({mod}, {plane}) but the sample reports "
+                        f"({case.sequence}, {case.acquisition_plane}) -- refusing to file it wrongly"
+                    )
+                writer.add(case.bucket, case.case_id, sample["image"][0].numpy())
+                reports[case.case_id] = sample["report_text"]
+                cases.append(case)
+                n += 1
+                if n % 50 == 0 or n == total:
+                    log.info("[%d/%d] %.1fs elapsed", n, total, time.time() - t0)
 
     spec = CohortSpec(
         split=args.split, sequences=list(args.sequences),
-        series_selection=args.series_selection, n_per_sequence=args.n_per_sequence,
+        series_selection=args.series_selection, n_per_bucket=args.n_per_bucket,
         seed=args.seed, geometry=config.geometry_fingerprint(),
         manifest_csv=str(args.manifest_csv), manifest_sha256=manifest_sha,
         report_source=report_source,
+        population_bucket_counts=population_bucket_counts(rows, args.sequences),
     )
-    cohort_json = write_cohort(args.out, spec, cases)
-    log.info("cohort written: %d cases, cohort_id=%s -> %s", len(cases), spec.cohort_id(), cohort_json)
+    cohort_json = write_cohort(args.out, spec, cases, reports)
+    log.info("cohort written: %d cases in %d buckets, cohort_id=%s -> %s",
+             len(cases), len(selection), spec.cohort_id(), cohort_json)
     log.info("pass --cohort %s to every predict and evaluate run for this experiment set", args.out)
     return 0
 

@@ -35,7 +35,8 @@ from pathlib import Path
 import numpy as np
 
 from ..cohort import Cohort, sha256_file
-from ..predictions import PredictionItem, PredictionSet, save_prediction_volume, write_prediction_set
+from ..predictions import PredictionItem, PredictionSet, write_prediction_set
+from ..volumes import VolumeWriter
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("predict_r2v")
@@ -93,21 +94,23 @@ def main(argv=None) -> int:
     cases = cohort.cases[:args.limit] if args.limit else cohort.cases
     items, failures = [], []
     t0 = time.time()
-    for n, case in enumerate(cases, start=1):
-        seed = stable_seed(args.seed, case.case_id)
-        try:
-            volume = generate_one(model, cohort.load_report(case.case_id), case, seed)
-        except Exception as e:  # noqa: BLE001
-            failures.append({"case_id": case.case_id, "error": f"{type(e).__name__}: {e}"})
-            log.warning("case %s failed: %s", case.case_id, e)
-            continue
-        save_prediction_volume(args.out, case.case_id, volume)
-        items.append(PredictionItem(
-            prediction_id=case.case_id, case_id=case.case_id, sequence=case.sequence,
-            shape=list(volume.shape), spacing_mm=list(case.spacing_mm), seed=seed,
-        ))
-        if n % 25 == 0 or n == len(cases):
-            log.info("[%d/%d] %.1fs elapsed", n, len(cases), time.time() - t0)
+    with VolumeWriter(args.out) as writer:
+        for n, case in enumerate(cases, start=1):
+            seed = stable_seed(args.seed, case.case_id)
+            try:
+                volume = generate_one(model, cohort.load_report(case.case_id), case, seed)
+            except Exception as e:  # noqa: BLE001
+                failures.append({"case_id": case.case_id, "error": f"{type(e).__name__}: {e}"})
+                log.warning("case %s failed: %s", case.case_id, e)
+                continue
+            writer.add(case.bucket, case.case_id, volume)
+            items.append(PredictionItem(
+                prediction_id=case.case_id, case_id=case.case_id, sequence=case.sequence,
+                plane=case.acquisition_plane, shape=list(volume.shape),
+                spacing_mm=list(case.spacing_mm), seed=seed,
+            ))
+            if n % 50 == 0 or n == len(cases):
+                log.info("[%d/%d] %.1fs elapsed", n, len(cases), time.time() - t0)
 
     elapsed = time.time() - t0
     pset = PredictionSet(

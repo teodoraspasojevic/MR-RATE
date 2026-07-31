@@ -3,7 +3,7 @@
 #SBATCH --partition=h200
 #SBATCH --gres=gpu:h200:1
 #SBATCH --cpus-per-task=8
-#SBATCH --time=12:00:00
+#SBATCH --time=24:00:00
 #SBATCH --account=y100dc
 #SBATCH --qos=mq_health
 #SBATCH --export=NONE
@@ -13,7 +13,12 @@
 # Unconditional generation. Diffusion sampling is slow -- time a small run first and scale
 # --time from its measured rate rather than guessing.
 #
-#   sbatch slurm/04_predict_generation.sbatch <cohort_name> [n_per_sequence] [run_tag]
+#   sbatch slurm/04_predict_generation.sbatch <cohort_name> [n_per_bucket] [run_tag]
+#
+# Each bucket is generated at ITS OWN shape and spacing -- the cohort's, i.e. NVIDIA's published
+# recommended FOV for that (modality, plane). Omit n_per_bucket (or pass 0) to match the cohort's
+# own per-bucket counts exactly, which is what makes a per-bucket FID compare distributions
+# rather than sample sizes.
 
 unset SLURM_EXPORT_ENV
 set -euo pipefail
@@ -23,15 +28,19 @@ set -euo pipefail
 R2V_REPO="${R2V_REPO:-/home/hpc/y100dc/y100dc19/VLM3D-MRI-R2V-MICCAI-26/MR-RATE}"
 source "$R2V_REPO/contrastive-pretraining/slurm/_common.sh"
 setup
-NAME="${1:?usage: sbatch 04_predict_generation.sbatch <cohort_name> [n_per_sequence] [run_tag]}"
-N="${2:-100}"
+NAME="${1:?usage: sbatch 04_predict_generation.sbatch <cohort_name> [n_per_bucket] [run_tag]}"
+N="${2:-0}"
 TAG="${3:-generation_$(date +%Y%m%d)}"
 COHORT="$COHORT_ROOT/$NAME"
-preflight "$COHORT/cohort.json" "$VAE_CHECKPOINT"
+preflight "$COHORT/cohort.json" "$VAE_CHECKPOINT" "$UNET_CHECKPOINT"
+
+N_ARG=(--n-per-bucket "$N")
+[[ "$N" == "0" ]] && N_ARG=()   # omitting the flag means "match the cohort's own counts"
 
 run_py mrrate_r2v.cli.predict_generation \
-    --cohort "$COHORT" --checkpoint "$VAE_CHECKPOINT" --device cuda \
-    --n-per-sequence "$N" --seed 42 \
+    --cohort "$COHORT" --checkpoint "$VAE_CHECKPOINT" \
+    --unet-checkpoint "$UNET_CHECKPOINT" --device cuda \
+    "${N_ARG[@]}" --seed 42 \
     --out "$PRED_ROOT/$TAG" --overwrite
 
 echo "Now: sbatch slurm/05_evaluate.sbatch generation $NAME $TAG"

@@ -36,7 +36,8 @@ All code lives in one package: `contrastive-pretraining/mrrate_r2v/`. Run everyt
                                                                      │
                                                                      ▼
                                                               RESULTS DIRECTORY
-                                                              summary.json + 4 more
+                                                              metrics_per_bucket.csv
+                                                              metrics_summary.csv + 5 more
 ```
 
 Three properties follow from this shape, and they are the reason it exists:
@@ -75,7 +76,7 @@ python -m mrrate_r2v.cli.build_manifest --source shards_parquet \
 python -m mrrate_r2v.cli.preprocess \
     --manifest-csv     .../manifest_shards_native.csv \
     --report-index-csv .../report_index_shards_native.csv \
-    --split test --sequences T1w T2w FLAIR SWI --n-per-sequence 200 \
+    --split test --sequences T1w T2w FLAIR SWI --n-per-bucket 200 \
     --out /hnvme/workspace/y100dc19-nvidia-mri-brain/cache/r2v/cohorts/test_v1
 ```
 
@@ -93,15 +94,15 @@ python -m mrrate_r2v.cli.evaluate --task reconstruction \
     --gt $COHORT --pred .../predictions/vae_v1 --out .../results/vae_v1
 ```
 
-Read `.../results/vae_v1/summary.json`.
+Read `.../results/vae_v1/metrics_per_bucket.csv` and `metrics_summary.csv`.
 
 ### On the cluster
 
 ```bash
 sbatch slurm/01_smoke_test.sbatch                        # whole pipeline, 2 cases. Do this first.
-sbatch slurm/02_preprocess.sbatch test_v1 200            # cohort: 200 per sequence
+sbatch slurm/02_preprocess.sbatch test_v1 200            # cohort: 200 per (modality, plane)
 sbatch slurm/03_predict_vae.sbatch test_v1 vae_v1
-sbatch slurm/04_predict_generation.sbatch test_v1 100 gen_v1
+sbatch slurm/04_predict_generation.sbatch test_v1 0 gen_v1   # 0 = match the cohort's counts
 sbatch slurm/05_evaluate.sbatch reconstruction test_v1 vae_v1
 sbatch slurm/05_evaluate.sbatch generation     test_v1 gen_v1
 ```
@@ -142,68 +143,105 @@ silently mixed.
 ### How many samples
 
 ```bash
---n-per-sequence 200      # 200 cases per sequence
-                          # (omit entirely for every eligible case)
+--n-per-bucket 200        # 200 cases per (modality, plane) bucket -> 10 buckets = 2000 cases
+                          # 0 = every eligible case
 --sequences T1w T2w FLAIR SWI
 --split test              # train | val | test
 --seed 42
 ```
 
-Selection is deterministic given `--seed`, and asking for one sequence picks exactly the same cases
-as asking for four — sequence order can never shift a draw. See `cohort.select_cohort`.
+**A bucket is one (modality, plane) pair** — `T1w__AXIAL`, `FLAIR__SAGITTAL`, and so on. It is the
+unit of everything downstream: one geometry, one archive on disk, one row in the results CSV, one
+FID. Sampling per bucket rather than per sequence is what makes that work: the real plane mix is
+~81% axial, so a per-sequence draw would leave the coronal buckets with a handful of cases and an
+unusable per-bucket FID.
+
+The price is that the cohort no longer mirrors the real plane distribution — which is why the
+results carry **two** overall numbers (see §5), and why `cohort.json` separately records
+`population_bucket_counts`, the *eligible-population* frequencies used as weights.
+
+Selection is deterministic given `--seed`, and asking for one bucket picks exactly the same cases as
+asking for ten — bucket order can never shift another bucket's draw. See
+`cohort.select_cohort_buckets`.
 
 ### Which series of a study
 
 ```bash
---series-selection one_per_study_per_sequence   # default
+--series-selection one_per_study_per_bucket   # default
 ```
 
 | Value | One sample per… | Use it for | Cases on the real test split |
 |---|---|---|---|
-| `one_per_study_per_sequence` | **(study, sequence)** | **evaluation** — one independent observation per sequence | 17,583 (T1w 4863 · T2w 4795 · FLAIR 4550 · SWI 3375) |
+| `one_per_study_per_bucket` | **(study, modality, plane)** | **evaluation** — one independent observation per bucket | 21,148, every bucket populated |
+| `one_per_study_per_sequence` | (study, sequence) | a single-plane study only | 17,583, but the planes collapse — see below |
 | `all` | eligible series | training, where you want maximum data | 34,453 |
 | `one_per_study_deterministic` | study, across all sequences | a single-sequence cohort only | 4,893, but **4,861 of them T1w** |
 | `one_per_study_random` | study, redrawn each epoch | training | 4,893/epoch, same modality skew |
 
-Two traps this table exists to prevent:
+Three traps this table exists to prevent:
 
+- **`one_per_study_per_sequence` collapses the PLANES.** It looks equivalent to the default, and is
+  not: when a study has the same sequence in several planes it prefers the center-modality series,
+  which on MR-RATE is axial T1w. Measured on a 200-per-bucket request it produced T2w SAGITTAL = 6
+  cases and T1w CORONAL = 16 — silently, since a per-sequence count still looks healthy.
 - **`all` pseudo-replicates.** Near-duplicate series from one session are not independent
   observations — measured mean 1.96, max 13 per (study, sequence). Plain means overweight
   multi-series studies and plain std/CIs come out falsely narrow, because the aggregation does not
   model clustering. It also biases FID by shrinking the real distribution's apparent spread.
 - **`one_per_study_deterministic` collapses to T1w.** It picks one series per *study*, preferring the
-  center-modality series, which on MR-RATE is the T1w one. A 4-sequence request therefore yields
-  ~99% T1w and leaves T2w/FLAIR/SWI essentially unevaluated — silently.
+  center-modality series. A 4-sequence request therefore yields ~99% T1w and leaves T2w/FLAIR/SWI
+  essentially unevaluated — silently.
 
-### What `--n-per-sequence` counts
+### What `--n-per-bucket` counts
 
-A **case** = one (study, sequence) pair = exactly one series. So `cases == series` always, while
-distinct *studies* is smaller because one patient contributes one case per sequence they have:
+A **case** = one (study, modality, plane) triple = exactly one series. `cases == series` always,
+while distinct *studies* is smaller: one patient contributes one case per bucket they have.
 
-| `--n-per-sequence` | cases (= series) | distinct studies |
+| `--n-per-bucket` | buckets | cases (= series) |
 |---|---|---|
-| 200 | 800 | 746 |
-| 500 | 2,000 | 1,726 |
-| 1000 | 4,000 | 2,940 |
-| omitted | 17,589 | 4,893 |
+| 200 | 10 | 2,000 |
+| 0 (all) | 10 | 21,148 |
 
-At 500/sequence, ~14% of cases share a patient with another case, so quote the **per-sequence**
-numbers as primary — the `overall` row is mildly clustered.
+Some patients contribute to more than one bucket, so quote the **per-bucket** rows as primary — the
+two overall rows are mildly clustered.
 
 ### Field of view
 
 ```bash
---geometry-mode fixed                            # default
---fixed-shape 256 256 256 --fixed-spacing-mm 1 1 1
+--geometry-mode per_modality_plane               # default
+--geometry-mode fixed --fixed-shape 256 256 256 --fixed-spacing-mm 1 1 1
 ```
 
 | Mode | What you get | Use when |
 |---|---|---|
-| `fixed` | every volume on one grid | **comparing models.** Batching works, and generated volumes share the grid. |
-| `per_modality_plane` | a per-(modality, plane) grid sized from NVIDIA's published median FOVs | training, or studying one model at each anatomy's natural FOV |
+| `per_modality_plane` | each bucket on NVIDIA's published recommended FOV for that (modality, plane) | **the default, and what you want.** Both the cohort and the generator use each anatomy's natural FOV. |
+| `fixed` | every volume on one grid | a deliberate single-geometry study only |
 
-With `fixed` and no explicit shape, the default is read from the NVIDIA model config, so a cohort
-and that generator's output land on the same grid without a hardcoded constant that could drift.
+**How a bucket's grid is derived.** NVIDIA publishes a recommended *field of view* per (modality,
+plane). The shape is the nearest multiple of **32** to that FOV, and the spacing is then
+`FOV / shape`. So the FOV matches NVIDIA's exactly, and the spacing — which is a real conditioning
+input to the diffusion UNet, not just metadata — comes out as whatever makes it so.
+
+Why 32 and not 16: the UNet has 4 levels, the latent is `shape / 4`, and the latent must be
+divisible by 8. A div-16-but-not-32 shape raises a skip-connection size mismatch mid-sampling
+(verified: `(240, 240, 176)` fails with "Expected size 14 but got size 15"). `cli.predict_generation`
+refuses such a shape up front rather than padding, since padding would change the FOV.
+
+| Bucket | shape (X, Y, Z) | spacing (mm) | FOV (mm, = NVIDIA's) |
+|---|---|---|---|
+| T1w AXIAL | 256 × 256 × 160 | 0.9375 · 0.9375 · 1.0875 | 240 × 240 × 174 |
+| T1w SAGITTAL | 192 × 256 × 256 | 0.9167 · 0.9766 · 0.9766 | 176 × 250 × 250 |
+| T1w CORONAL | 256 × 192 × 256 | 0.9375 · 1.0417 · 0.9375 | 240 × 200 × 240 |
+| T2w AXIAL | 256 × 256 × 160 | 0.9375 · 0.9375 · 0.9875 | 240 × 240 × 158 |
+| T2w SAGITTAL | 160 × 256 × 256 | 1.0125 · 0.9375 · 0.9375 | 162 × 240 × 240 |
+| T2w CORONAL | 192 × 192 × 192 | 1.0417 · 0.9375 · 1.0417 | 200 × 180 × 200 |
+| FLAIR AXIAL | 256 × 256 × 160 | 0.9766 · 0.9766 · 1.0938 | 250 × 250 × 175 |
+| FLAIR SAGITTAL | 192 × 256 × 256 | 0.9167 · 0.9766 · 0.9766 | 176 × 250 × 250 |
+| FLAIR CORONAL | 256 × 192 × 256 | 0.9766 · 1.0417 · 0.9766 | 250 × 200 × 250 |
+| SWI AXIAL | 224 × 224 × 160 | 1.0268 · 1.0268 · 0.9062 | 230 × 230 × 145 |
+
+This replaced a single 256³ @ 1 mm grid, which padded a measured **52%** of each volume with
+background; at the per-bucket FOVs it is **9.7%**.
 
 **`--fixed-shape` and `--fixed-spacing-mm` are `(X, Y, Z)`** = (Right-Left, Anterior-Posterior,
 Superior-Inferior) — the same order the Dataset returns, the cohort records, and the NVIDIA model
@@ -211,19 +249,19 @@ uses. Internally the preprocessing works in `(D, H, W)`; `cli.preprocess` conver
 via `geometry.xyz_to_dhw`. You never see `(D, H, W)` from outside the package: every file in a
 cohort directory is `(X, Y, Z)`.
 
-The cost of `fixed`: a sagittal scan is naturally taller and narrower than an axial one, so forcing
-one cube pads some volumes with extra background. That is a real trade-off, taken deliberately —
-without it, two experiments' fidelity numbers do not live in the same space.
-
-With `per_modality_plane`, shapes differ between buckets. Use `GeometryBucketBatchSampler` for
-batch_size > 1, and do not compare the numbers with a fixed-mode run.
+Because shapes differ between buckets, use `GeometryBucketBatchSampler` for batch_size > 1, and
+never compare a per-bucket run's numbers with a fixed-mode run's.
 
 ### Intensities
 
 ```bash
 --normalizer percentile          # percentile (default) | zscore | minmax
---posterior-shift-mm 15.0
+--posterior-shift-mm 0           # default 0 for R2V cohorts
 ```
+
+`--posterior-shift-mm` compensates for defacing, which removes anterior tissue and so pulls the
+intensity centroid backwards. It belongs to the contrastive pipeline; for R2V the default is **0**,
+measured: shifting by 15 mm lost on 8 of the 10 buckets.
 
 Heads up: the default percentile normalizer does **not** clip. Values above the 99.5th percentile
 exceed 1.0. PSNR's `data_range=1.0` is therefore a fixed reference scale, not a true ceiling —
@@ -242,19 +280,41 @@ text is used every time — never truncated or randomly subsampled.
 
 ## 5. Reading the results
 
-Five files, same five for every task:
+Same layout for every task:
 
 | File | What it is |
 |---|---|
-| `summary.json` | **read this first.** Per-sequence and overall means, plus which metric groups ran and why. |
+| `metrics_per_bucket.csv` | **read this first.** One row per (modality, plane): the shape and spacing it was scored at, the sample counts, and every metric. |
+| `metrics_summary.csv` | the aggregates — one row per modality, then `overall_macro` and `overall_weighted` |
 | `per_case_metrics.csv` | one row per scored case |
+| `summary.json` | the same numbers machine-readably, plus which metric groups ran and why |
 | `distribution_metrics.json` | FID and diversity metrics, when computed |
+| `anatomy_metrics.json` | anatomical plausibility of the produced population against the real one |
 | `excluded_cases.json` | every case that was *not* scored, with a specific reason |
 | `run_manifest.json` | exactly what ran: `cohort_id`, task, checkpoint hashes, versions |
 | `figures/` | example slice montages (ground truth / prediction / difference), worth a look before trusting any number |
 
-Always check `n_scored` against `n_cohort_cases` in `summary.json`. If they differ,
-`excluded_cases.json` says why for every case. Nothing is ever silently dropped.
+### The two overall rows
+
+`metrics_summary.csv` ends with two rows that will not agree, deliberately:
+
+| Row | What it means |
+|---|---|
+| `overall_macro` | unweighted mean across buckets — every anatomy counts equally |
+| `overall_weighted` | weighted by `population_bucket_counts`, i.e. what the real test split looks like |
+
+The cohort is sampled to **equal size per bucket**, so cohort counts carry no information about how
+common a bucket is and must never be used as weights — that would silently turn the weighted
+aggregate back into the macro one. Quote `overall_macro` when comparing models, `overall_weighted`
+when claiming what a clinical population would see.
+
+`metrics_per_bucket.csv` also carries `nvidia_train_n` — NVIDIA's own published count of training
+images for that bucket — and an `nvidia_low_train_n` flag. Three T2w buckets were trained on
+195/125/551 images and NVIDIA states quality is not guaranteed there. They are **kept** in every
+aggregate; the column is there so a weak number can be read as coverage rather than failure.
+
+Always check `n_scored` against `n_cohort` per bucket. If they differ, `excluded_cases.json` says
+why for every case. Nothing is ever silently dropped.
 
 ### The metrics
 
@@ -268,13 +328,16 @@ Always check `n_scored` against `n_cohort_cases` in `summary.json`. If they diff
 | 2.5D Inception FID | same idea, on 2D slices across all three planes | lower | not comparable in scale to the MedicalNet number | Inception-v3 has never seen a medical image |
 | Inception Score | generic "confident and diverse" | higher | not very informative for brain MRI | prefer precision/recall below |
 | Precision / Recall / Density / Coverage | precision = do outputs look real; recall/coverage = do they span the real range | higher | high precision + low recall = mode collapse | needs 50+ per group to be stable |
+| Intra-set SSIM (real vs produced) | mode collapse, the standard generation-literature probe | compare the two, not the absolute value | produced clearly **above** real = less variety than the data | mid-axial slices only, capped at 200 pairs per bucket |
+| Anatomy (L-R symmetry, intracranial fraction, tissue contrast, background purity) | does the output look like a brain at all | closer to the real column | a large KS statistic means the populations differ on that measure | heuristic masks, not a segmentation |
 | Report-image similarity | does the volume match the report | higher | **unavailable** | no validated MRI image-text model exists in this project; recorded as unavailable with a reason, never faked |
 
 ### Speed
 
-Evaluation is CPU-compute-bound: reading both 67 MB volumes takes 39 ms against ~6.7 s of metric
-compute, so I/O is 0.5% of the work. **Staging a cohort to node-local `$TMPDIR` is therefore not
-worth doing** — Lustre already delivers 3.4 GB/s here, well past what the metrics can consume.
+Evaluation is CPU-compute-bound: decompressing and reading both volumes takes ~0.3 s against
+~6.7 s of metric compute, so I/O is a few percent of the work. **Staging a cohort to node-local
+`$TMPDIR` is therefore not worth doing** — the filesystem already delivers 3.4 GB/s here, well past
+what the metrics can consume.
 
 Use `--workers` instead. Per-case scoring is embarrassingly parallel and scales near-linearly
 (measured 7.32× at 8 workers), with byte-identical results at any worker count.
@@ -391,8 +454,15 @@ to the contrastive model and is untouched by this pipeline.
 
 ## 10. Storage and hygiene
 
-Cohorts and prediction sets are large: **~67 MB per volume at 256³ float32**. A 4-sequence,
-200-per-sequence cohort is ~54 GB, and each prediction set the same again.
+Cohorts and prediction sets are large, but bundled and compressed: **~14 MB per volume** at the
+per-bucket FOVs (2.91× lossless, since a padded volume is ~50% exact zeros). A 10-bucket,
+200-per-bucket cohort is ~28 GB, and each prediction set the same again.
+
+Volumes live in **one archive per bucket** (`volumes/<modality>__<plane>.npz`), so a cohort is ~10
+files rather than ~2,000. That is not cosmetic: `/hnvme` enforces a **file-count** quota (61k soft),
+and one file per volume put three artifact directories over it. An `.npz` is a zip of `.npy`
+members and zip members are individually readable, so random access is still
+`VolumeReader(root).read(bucket, case_id)` with nothing to unpack first.
 
 - Write them to a workspace (`/hnvme/workspace/...`), never to git or `$HOME`.
 - `cohort.json` and every results file are identifier-free and safe to copy or share.

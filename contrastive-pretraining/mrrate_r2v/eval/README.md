@@ -65,7 +65,10 @@ compute them in `runner.compute_paired_metrics`. The runner and CLI pick it up w
 | `paired.py` | voxelwise + detail metrics on one pair | numpy, scipy (skimage for SSIM, lazily) |
 | `distribution.py` | FID, Inception Score, precision/recall/density/coverage | torch, torchvision |
 | `features.py` | fingerprint-gated feature cache | numpy |
-| `aggregate.py` | per-sequence and overall means | numpy |
+| `aggregate.py` | per-bucket, per-sequence and overall means | numpy |
+| `summary_csv.py` | the CSV deliverable: per bucket, per modality, two overall rows | numpy |
+| `anatomy.py` | anatomical plausibility, real population vs produced | numpy, scipy |
+| `figures.py` | example slice montages, optional NIfTI export | PIL, nibabel |
 | `pairing.py` | identifier matching, for importing external NIfTIs | stdlib |
 | `wandb_logging.py` | optional W&B, degrades to a no-op | — |
 
@@ -108,6 +111,93 @@ recorded amount after decoding, so the reconstruction returns on the cohort's ow
 
 ---
 
+## What each metric requires of its input
+
+Every metric assumes something about intensity range, spatial extent, and background. Where those
+assumptions are violated the number is still *computed* — it is just not measuring what its name
+says. This table is the contract; the two sections after it record what our volumes actually look
+like and where the mismatches are.
+
+| Metric | Needs | Why | Our volumes satisfy it? |
+|---|---|---|---|
+| `mae`, `mse` | same grid; any range | scale-dependent, so only comparable within one intensity convention | yes |
+| `psnr` | **a true peak equal to `data_range`** | `10·log₁₀(range²/MSE)` — a wrong peak biases the result | **no** — see below |
+| `ncc` | same grid | scale/offset invariant by construction | yes |
+| `ssim_3d`, `ssim_2d_mean` | `data_range` ≈ true peak; **non-degenerate local variance** | SSIM's luminance/contrast terms collapse on constant regions | **no** — padding is constant |
+| `edge_preservation`, `laplacian_variance`, `hf_energy` | same grid; comparable sharpness convention | ratios of derivative energy | yes |
+| MedicalNet 3D FID | **per-volume z-score over positive voxels** (Med3D's own preprocessing), foreground-cropped | trained in that domain; GAP dilutes over shared empty space | **no** — see the failure section |
+| 2.5D Inception FID | ImageNet mean/std, 299×299, 3-channel | Inception-v3's training domain | **yes** — `to_inception_input` does exactly this |
+| Inception Score | same as above | softmax over ImageNet classes | yes |
+| precision/recall/density/coverage | a feature space where between-sample distance exceeds within-sample perturbation | k-NN balls must be wider than the effect being measured | **no** on MedicalNet features |
+| anatomical plausibility | brain foreground identifiable; L-R axis known | symmetry/ICV need the anatomy, not the padding | yes |
+
+### What our volumes actually are
+
+Measured on the real `test_v1` cohort (40–60 volumes sampled, `--geometry-mode fixed`):
+
+| | GT (cohort) | VAE reconstruction | Diffusion generated |
+|---|---|---|---|
+| shape / dtype | 256³ float32 | 256³ float32 | 256³ float32 |
+| p50 | 0.0000 | **0.0583** | 0.0000 |
+| p99.5 | 0.906 | 0.865 | 1.012 |
+| max (mean) | 1.913 | 1.804 | 1.905 |
+| max (range over volumes) | **[1.21, 4.34]** | [1.17, 4.54] | [1.59, 2.27] |
+| % voxels > 1.0 | 0.16 | 0.08 | 0.61 |
+| % voxels < 0 | 15.8 (all ≈ −1e-8, fp noise) | 0.25 | 0.00 |
+| **% bit-exact 0** | **52.0** | **0.0** | **64.8** |
+
+Three mismatches follow from this table:
+
+1. **`data_range=1.0` is not the peak.** The normalizer is percentile `[0, 99.5] → [0, 1]` with
+   `clip=False`, so 1.0 is where the 99.5th percentile lands, not a ceiling. True maxima average
+   1.91 and reach 4.34. Because the assumed range is too *small*, **reported PSNR is pessimistic by
+   ~5.8 dB on average** (per-volume 1.7–12.8 dB). It is still a valid *relative* measure — every
+   volume uses the same convention — but do not compare it to a published PSNR computed on clipped
+   [0,1] data. To make it absolute, set `clip=True` in the normalizer, which is a new `cohort_id`.
+2. **The VAE does not reproduce the zero background.** GT background is bit-exact 0 over 52% of the
+   volume; the reconstruction's is ≈0.058 with 0% exact zeros. That is a global offset over half
+   the volume, and it inflates every whole-volume metric.
+3. **The generated volumes are *more* empty than the GT** (64.8% vs 52.0% exact zeros) and have a
+   higher upper tail (0.61% of voxels above 1.0 vs 0.16%).
+
+### Where the foreground mask is used, and where it is not
+
+There are two independent masking mechanisms, easily confused:
+
+| Mechanism | Where | What it does |
+|---|---|---|
+| `foreground_mask_from_intensity(gt, percentile=1.0)` | `runner.compute_paired_metrics`, computed **once per case from the ground truth** | a boolean mask, `gt > p1(gt)`. Passed to `mae/mse/psnr/ncc/relative_intensity_error/edge_preservation/laplacian_variance` → these are the `_fg` columns. Covers ~34% of the volume. |
+| `min_fg_frac` slice filter | `ssim_2d_mean` and `distribution.non_empty_slices` | drops whole 2D *slices* whose foreground fraction is below 1%. Not a voxel mask. |
+
+**It is always derived from the ground truth, never the prediction** — otherwise a degenerate
+prediction could select its own easier evaluation region (`test_foreground_mask_comes_from_ground_truth_only`).
+
+Metrics with **no** mask at all: `mae_whole`, `mse_whole`, `psnr_whole`, `ncc_whole`,
+`ssim3d_whole`, `hf_energy_ratio` (FFT is not meaningfully maskable), and every distribution metric
+(feature extractors see the whole volume).
+
+Note the mask is an intensity heuristic, **not** a brain mask — the R2V cohort carries no
+per-sample HD-BET mask. It excludes padding and air, but also includes skull, scalp and neck fat.
+
+### Does padding affect every metric? No — here is exactly which
+
+`crop_or_pad` pads with **bit-exact 0**. Native air after normalization is ≈1e-4, so the two are
+distinguishable. Padding averages **52% of a cohort volume**, and for axial acquisitions (81% of the
+cohort) **103 of 256 Z-slices** are pure padding (range 6–116).
+
+| Metric | Affected? | How |
+|---|---|---|
+| `*_fg` variants | **no** | the mask excludes padding by construction |
+| `mae_whole`, `mse_whole`, `psnr_whole` | **yes, mildly** | padding is trivially easy, but the VAE's non-zero background partly cancels the free win: PSNR 25.35 dB whole vs 26.21 dB non-padded (+0.9 dB) |
+| `ssim3d_whole` | **yes, severely** | SSIM's local windows have zero variance on bit-constant regions, so any prediction noise drives local SSIM to ~0 across half the volume. **Treat `ssim3d_whole` as uninformative on this data** and prefer `ncc_fg` / per-plane `ssim2d_*` |
+| `ssim_2d_mean` | **no** | background-only slices are excluded by `min_fg_frac` |
+| `hf_energy_ratio` | **yes, mildly** | zero regions contribute no high-frequency energy to either side |
+| MedicalNet FID / PRDC | **yes, strongly** | GAP over a region every subject shares dilutes between-subject variation (~4× in feature spread) |
+| 2.5D Inception FID | **no** | `non_empty_slices` skips empty slices before feature extraction |
+| anatomical plausibility | **no** | computed on the foreground only |
+
+---
+
 ## The metrics
 
 ### Fidelity — how close, voxel by voxel
@@ -136,6 +226,29 @@ Per-plane SSIM excludes background-only slices — an empty slice's SSIM is unin
 bias the mean toward whatever a near-constant comparison scores. Check `n_slices_used` alongside the
 mean.
 
+### Anatomical plausibility — does it look like a *brain*
+
+[`anatomy.py`](anatomy.py). FID and PSNR can both look acceptable for a volume that is
+anatomically wrong. These five measures check properties that hold for essentially every real head
+MRI, and are compared **real population vs produced population** with a two-sample KS test — so the
+group is valid for unconditional generation as well as for paired tasks.
+
+| Measure | Real brains | Catches |
+|---|---|---|
+| `lr_symmetry_ncc` | ~0.85–0.95 | implausible asymmetry, e.g. a missing hemisphere. Evaluated over the **union** of foreground and its mirror — the intersection would be blind to exactly this failure |
+| `intracranial_fraction` | stable per (modality, plane) | heads too large or small for the FOV |
+| `tissue_contrast_separation` | > ~1.0 | grey/white matter at indistinguishable intensities (2-component 1-D GMM on foreground) |
+| `foreground_compactness` | ~0.5–0.8 | scattered noise or disconnected fragments |
+| `background_purity` | ~1.0 | haze in the air. **The VAE here scores low: it fills the background with ~0.058 instead of 0** |
+
+Requires no model weights and no torch — numpy + scipy only, so it runs on CPU and stays available
+with `--skip-metric-groups distribution` for a cheap sanity pass on a generator.
+
+**Named "anatomical plausibility", not "clinical".** Every measure is computed from voxel
+intensities with no segmentation network and no radiologist input. None of them can tell you whether
+a volume shows the pathology its report describes — that needs the image-text model this project
+does not have, or a validated segmentation model. Calling them clinical would oversell them.
+
 ### Distribution — do the populations match
 
 | Metric | Reads as |
@@ -144,6 +257,13 @@ mean.
 | 2.5D Inception FID | lower is better, computed on slices across all three planes. Not comparable in scale to the MedicalNet number — different feature space. Inception-v3 has never seen a medical image. |
 | Inception Score | higher is better, but not very informative for brain MRI. Prefer the next row. |
 | Precision / Recall / Density / Coverage | precision = do outputs look real; recall/coverage = do they span the real range. High precision + low recall is classic mode collapse. Needs 50+ per group to be stable. |
+
+> **Known failure: MedicalNet FID and PRDC are not trustworthy on this data.** Measured on the real
+> cohort, `FID(T1w real, T2w real) = 0.0009` while `FID(T1w real, its own VAE reconstruction) =
+> 0.0111` — the features rank two grossly different contrasts as **12× more similar** than a volume
+> versus its own reconstruction. The same collapse makes reconstruction PRDC come out exactly 0.
+> The 2.5D Inception backbone passes the same test (138.2 vs 78.8, ratio 1.75×). Read the 2.5D
+> numbers; treat MedicalNet's as diagnostic only. Full analysis in the section below.
 
 The Fréchet distance is computed in `distribution.frechet_distance` — float64 throughout, with
 epsilon regularization retried on a near-singular covariance product (routine when the sample is
@@ -154,9 +274,25 @@ It is computed here rather than via `monai.metrics.FIDMetric`: that path passes 
 scipy removed in 1.17, so it raises on any current scipy. Keeping it in-package also means an
 evaluation run needs no monai.
 
-For `generation` there is no pairing, so the real population is the whole cohort and the produced
-population is every prediction item, truncated to `min(n_real, n_gen)` per sequence — Fréchet
-distance needs two populations of comparable size, not a correspondence. The truncation is logged.
+For `generation` there is no pairing, so real and produced volumes are lined up **within a bucket**
+and truncated to `min(n_real, n_gen)` — Fréchet distance needs two populations of comparable size,
+not a correspondence. The truncation is logged.
+
+Bucket, not sequence, and this matters: only within a (modality, plane) bucket do all volumes share
+a geometry. Grouping by sequence would compare an axial real volume against a sagittal generated
+one and attribute the difference to the model.
+
+### Intra-set SSIM — the mode-collapse probe
+
+Mean pairwise SSIM *within* each population, reported separately for real and produced. The number
+that matters is the **difference**: a generator whose intra-set SSIM sits clearly above the real
+data's is producing less variety than the data it was trained on. This is the convention the 3D
+brain-MRI generation literature uses (average pairwise MS-SSIM over generated samples).
+
+Implemented on mid-axial slices with 2D SSIM rather than a true 3D MS-SSIM: pairwise over N volumes
+is O(N²), and at 200 volumes per bucket a full 3D pass would dominate the whole evaluation.
+`max_pairs=200` bounds it with a deterministic sample of pairs. Mixed shapes are refused, not
+averaged — compare within a bucket.
 
 ### Report alignment
 
@@ -218,14 +354,26 @@ rebuilt per volume — three 134 MB float64 arrays, 239 ms each time).
 
 | File | What it is |
 |---|---|
-| `summary.json` | **start here.** Per-sequence and overall means, which metric groups ran, how many cases were scored and excluded. |
+| `metrics_per_bucket.csv` | **start here.** One row per (modality, plane): the shape and spacing it was scored at, the sample counts, and every metric. |
+| `metrics_summary.csv` | per modality, then `overall_macro` and `overall_weighted` |
 | `per_case_metrics.csv` | one row per scored case |
+| `summary.json` | the same numbers machine-readably, plus which metric groups ran and why |
 | `distribution_metrics.json` | population metrics, when computed |
+| `anatomy_metrics.json` | anatomical plausibility, real population vs produced |
 | `excluded_cases.json` | every unscored case, with a specific reason |
 | `run_manifest.json` | `cohort_id`, task, checkpoint hashes, contract versions |
 | `figures/` | example orthogonal-slice montages -- **look at these**; a number tells you a volume is worse, a picture tells you how |
 
-Always compare `n_scored` with `n_cohort_cases`. Exclusion categories you may see:
+### Why two overall rows
+
+`overall_macro` is the unweighted mean across buckets; `overall_weighted` weights by
+`population_bucket_counts`, the eligible-population frequencies recorded in `cohort.json`. The
+cohort is sampled to equal size per bucket so that per-bucket FID is stable, which means cohort
+counts are a sampling artefact and must never be used as weights -- doing so would silently turn
+the weighted aggregate back into the macro one. Quote macro when comparing models, weighted when
+claiming what a clinical population would see.
+
+Always compare `n_scored` with `n_cohort` per bucket. Exclusion categories you may see:
 
 | Category | Meaning |
 |---|---|
@@ -242,26 +390,80 @@ report-conditioned model will score well — each stage measures something diffe
 
 ## Example figures
 
-`--save-figures N` (default 3) writes N montages per sequence into `<results>/figures/`, rendered
+`--save-figures N` (default 3) writes N montages per **bucket** into `<results>/figures/`, rendered
 by [`figures.py`](figures.py) with PIL:
 
     paired tasks   rows = ground truth / prediction / |difference|
-    generation     rows = generated / an unpaired real reference (captioned as NOT a counterpart)
+    generation     rows = generated / an unpaired real reference from the SAME bucket
+                          (captioned as NOT a counterpart)
     columns        sagittal / coronal / axial mid-slices, superior up
 
 Cases are chosen at evenly-spaced *metric ranks*, not arbitrarily, so `N=3` gives you the worst,
 median, and best case by `psnr_fg` -- the worst one is where failure modes are visible. Filenames
-are `{sequence}_rank{0..N}_{case_id}.png`, so rank0 is always the worst.
+are `{modality}__{plane}_rank{0..N}_{case_id}.png`, so rank0 is always the worst.
 
 Ground truth and prediction share one intensity window so the rows are genuinely comparable; the
 difference row is scaled to its own max, which is printed in the label (an auto-scaled difference
 image with no stated range is easy to misread).
 
 `--save-nifti-cases N` additionally exports gt/prediction/absdiff as `.nii.gz` for the first N
-figured cases per sequence, to open in a real viewer. The affine is synthesized from spacing -- it
+figured cases per bucket, to open in a real viewer. The affine is synthesized from spacing -- it
 carries orientation and voxel size but no true patient-space origin.
 
 Figure generation is never fatal: a rendering failure is logged and the metrics still get written.
+
+## Why MedicalNet FID fails here — and how to check any FID backbone
+
+**Validity test.** A feature space usable for FID must rank a *different modality* as further away
+than *a volume versus its own reconstruction*. Measured on the real cohort, 30 volumes per group:
+
+| Backbone | FID(T1w, T2w) | FID(T1w, T1w recon) | ratio | verdict |
+|---|---|---|---|---|
+| MedicalNet, as shipped | 0.0009 | 0.0111 | **0.09×** | **invalid** |
+| MedicalNet + Med3D z-score | 0.1052 | 2.3648 | **0.04×** | **still invalid** |
+| 2.5D Inception (control) | 138.2 | 78.8 | **1.75×** | valid |
+
+Three causes, in order of size:
+
+1. **The VAE's background floor dominates the measurement.** The reconstruction fills the air with
+   ~0.055 where ground truth is bit-exact 0 over 52% of the volume. Forcing that background back to
+   zero drops the "reconstruction distance" from 0.0111 to **0.0018 — an 84% reduction**. Most of
+   what MedicalNet FID was reporting is that one global offset, not image quality.
+2. **The features barely discriminate at all.** Between-subject std is 0.0015 against a mean
+   magnitude of 0.166 — a relative spread of **1.08%** — with **160 of 512 dims exactly
+   zero-variance** (dead units).
+3. **No input normalization.** Med3D z-scores each volume over its strictly-positive voxels; we fed
+   raw percentile-normalized volumes. Fixing this raises relative spread to 9.49% (8.8×) and
+   cropping the padding adds ~4× more — but **it does not make the ratio pass**, because cause 1
+   scales up with it.
+
+The weights load correctly (MONAI's `_resnet` uses `strict=True`); this was never a loading bug.
+
+`MedicalNetFeatureExtractor` now applies Med3D's normalization and foreground cropping by default
+(`normalize=`, `crop_to_foreground=`), which is strictly better than before. **That alone does not
+make the metric valid** — the honest fixes are to give the VAE a zero background, or to use a
+backbone that passes the validity test above. Run that test against any new backbone before
+trusting a single FID number from it.
+
+## How this compares to published protocols
+
+Surveyed against current 3D brain-MRI generation papers
+([Conditional Diffusion Models for Semantic 3D Brain MRI Synthesis](https://arxiv.org/html/2305.18453v5),
+[3D MedDiffusion](https://arxiv.org/html/2412.13059v1)):
+
+| Standard practice | Here |
+|---|---|
+| 3D-FID from a 3D ResNet pretrained on medical data | yes — but our backbone fails the validity test above, so read the 2.5D variant |
+| MS-SSIM, **intra-set** (mean pairwise similarity *among generated samples*) as a mode-collapse probe | **missing** — we have paired SSIM and PRDC, not intra-set MS-SSIM. The closest published convention we do not implement |
+| MMD with a Gaussian kernel on medical features | **missing** |
+| LPIPS | missing (2D, perceptual) |
+| Intensity normalized to a bounded range ([-1,1] or [0,1]) before metrics | **we do not clip** — see the PSNR caveat above. Most papers clip; our numbers are not directly comparable to theirs |
+| Fixed isotropic resample (commonly 128³ @ 1.5 mm) | 256³ @ 1.0 mm — higher resolution than the common convention |
+| Downstream-task validation (segmentation Dice on synthetic data) | missing; would need a segmentation model |
+| Anatomical/clinical consistency metrics | **rare in the literature** — most papers report none. Our `anatomy` group goes beyond the surveyed protocols |
+
+Two gaps worth closing if you want protocol comparability: **intra-set MS-SSIM** and **clipped
+intensities**. The second changes the cohort, so it is a new `cohort_id`.
 
 ## Privacy
 

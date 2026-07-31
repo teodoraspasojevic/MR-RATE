@@ -124,6 +124,53 @@ def ssim_2d_mean(a: np.ndarray, b: np.ndarray, axis: int, data_range: float = 1.
     return {"mean": float(np.mean(scores)) if scores else None, "n_slices_used": len(scores), "n_slices_total": n}
 
 
+def intra_set_ms_ssim(volumes, max_pairs: int = 200, seed: int = 42) -> dict:
+    """Mean pairwise SSIM *within* one set of volumes -- the standard mode-collapse probe.
+
+    High intra-set similarity means the samples resemble each other, i.e. reduced diversity;
+    low means varied. Reported for the real and produced populations separately, so the number
+    that matters is the *difference*: a generator whose intra-set SSIM sits well above the real
+    data's is producing less variety than the data it was trained on.
+
+    This is the convention used by the 3D brain-MRI generation literature (average pairwise
+    MS-SSIM over generated samples) and was the main protocol gap in this package. Implemented on
+    mid-axial slices with 2D SSIM rather than a true multi-scale 3D MS-SSIM: pairwise over N
+    volumes is O(N^2), and at 200 volumes per bucket a full 3D pass would dominate the whole
+    evaluation. `max_pairs` bounds the work with a deterministic sample of pairs.
+    """
+    vols = [np.asarray(v, dtype=np.float32) for v in volumes]
+    # mid-axial slice of each volume, in the (X, Y, Z) order this package returns
+    return intra_set_ms_ssim_slices([v[:, :, v.shape[2] // 2] for v in vols], max_pairs, seed)
+
+
+def intra_set_ms_ssim_slices(slices, max_pairs: int = 200, seed: int = 42) -> dict:
+    """`intra_set_ms_ssim` on pre-extracted 2D slices.
+
+    The evaluator already loads every volume once for feature extraction, so it keeps the mid
+    slices from that pass and calls this -- reading all 200 volumes of a bucket a second time
+    just to take one slice each would double the I/O for nothing.
+    """
+    slices = [np.asarray(s, dtype=np.float32) for s in slices]
+    if len(slices) < 2:
+        return {"n_volumes": len(slices), "n_pairs": 0, "mean": None,
+                "skipped": "fewer than 2 volumes"}
+    ssim = _sk_ssim()
+    vols = slices
+    shapes = {s.shape for s in slices}
+    if len(shapes) > 1:
+        return {"n_volumes": len(vols), "n_pairs": 0, "mean": None,
+                "skipped": f"volumes have {len(shapes)} different shapes; compare within a bucket"}
+
+    pairs = [(i, j) for i in range(len(slices)) for j in range(i + 1, len(slices))]
+    if len(pairs) > max_pairs:
+        rng = np.random.RandomState(seed)
+        chosen = sorted(rng.choice(len(pairs), size=max_pairs, replace=False).tolist())
+        pairs = [pairs[p] for p in chosen]
+    scores = [ssim(slices[i], slices[j], data_range=1.0) for i, j in pairs]
+    return {"n_volumes": len(vols), "n_pairs": len(pairs),
+            "mean": float(np.mean(scores)), "std": float(np.std(scores))}
+
+
 def gradient_magnitude(volume: np.ndarray) -> np.ndarray:
     gx, gy, gz = np.gradient(volume)
     return np.sqrt(gx**2 + gy**2 + gz**2)

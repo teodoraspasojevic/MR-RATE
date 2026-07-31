@@ -9,7 +9,8 @@ On disk:
 
     <pred_dir>/
       predictions.json      task, cohort_id, model provenance (checkpoint sha256), item list
-      volumes/<prediction_id>.npy   float32 [X, Y, Z]
+      volumes/<modality>__<plane>.npz   one compressed archive per bucket, members keyed by
+                            prediction_id (same layout as a cohort -- see volumes.py)
 
 `prediction_id` equals the ground-truth `case_id` for paired tasks (reconstruction,
 report2volume) and is `gen_<sequence>_<NNN>` for unconditional generation, which has no
@@ -26,10 +27,13 @@ from pathlib import Path
 
 import numpy as np
 
-PREDICTIONS_SCHEMA_VERSION = "1.0"
+from .volumes import VolumeReader, VolumeWriter, bucket_name
+
+# 2.0: volumes bundled per (modality, plane) bucket, and PredictionItem carries `plane` so its
+# bucket is derivable without a cohort lookup (unconditional generation has no case_id).
+PREDICTIONS_SCHEMA_VERSION = "2.0"
 
 PREDICTIONS_JSON = "predictions.json"
-VOLUMES_DIR = "volumes"
 
 
 @dataclass
@@ -40,9 +44,14 @@ class PredictionItem:
     sequence: str
     shape: list
     spacing_mm: list
+    plane: str = "unknown"          # with `sequence`, determines which archive holds this volume
     case_id: str | None = None      # None for unconditional generation
     seed: int | None = None
     extra: dict = field(default_factory=dict)
+
+    @property
+    def bucket(self) -> str:
+        return bucket_name(self.sequence, self.plane)
 
 
 @dataclass
@@ -69,16 +78,10 @@ class PredictionSet:
         return d
 
 
-def save_prediction_volume(root, prediction_id: str, volume: np.ndarray) -> None:
-    path = Path(root) / VOLUMES_DIR / f"{prediction_id}.npy"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    np.save(path, np.ascontiguousarray(volume, dtype=np.float32))
-
-
 def write_prediction_set(root, pset: PredictionSet) -> Path:
+    """Write `predictions.json`. Volumes are written separately by a `volumes.VolumeWriter`."""
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
-    (root / VOLUMES_DIR).mkdir(exist_ok=True)
     out = root / PREDICTIONS_JSON
     out.write_text(json.dumps(pset.to_dict(), indent=2, sort_keys=True))
     return out
@@ -105,6 +108,7 @@ class PredictionReader:
             )
         self.items = [PredictionItem(**{k: v for k, v in i.items() if k in PredictionItem.__dataclass_fields__})
                       for i in self.spec.get("items", [])]
+        self._volumes = VolumeReader(self.root)
 
     @property
     def task(self) -> str:
@@ -118,13 +122,19 @@ class PredictionReader:
     def model(self) -> dict:
         return dict(self.spec.get("model", {}))
 
+    def item_by_id(self, prediction_id: str) -> PredictionItem | None:
+        return next((i for i in self.items if i.prediction_id == prediction_id), None)
+
     def load_volume(self, prediction_id: str) -> np.ndarray:
-        return np.load(self.root / VOLUMES_DIR / f"{prediction_id}.npy").astype(np.float32, copy=False)
+        item = self.item_by_id(prediction_id)
+        if item is None:
+            raise KeyError(f"prediction_id {prediction_id!r} is not in this prediction set")
+        return self._volumes.read(item.bucket, prediction_id)
 
     def verify_complete(self) -> list:
-        """Prediction ids whose volume file is missing."""
+        """Prediction ids missing from their bucket archive."""
         return [i.prediction_id for i in self.items
-                if not (self.root / VOLUMES_DIR / f"{i.prediction_id}.npy").is_file()]
+                if not self._volumes.has(i.bucket, i.prediction_id)]
 
     def assert_matches_cohort(self, cohort) -> None:
         """Hard-fail unless this prediction set was produced against exactly `cohort`.

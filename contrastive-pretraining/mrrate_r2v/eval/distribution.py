@@ -105,7 +105,13 @@ class MedicalNetFeatureExtractor:
     inherited, not re-derived, since nothing about this repository changes that classification.
     """
 
-    def __init__(self, checkpoint_path: Path, device: str):
+    # Class-level defaults so the attributes always exist even for an instance built without
+    # __init__ (tests do this to inject a fake network rather than load 200 MB of weights).
+    normalize = True
+    crop_to_foreground = True
+
+    def __init__(self, checkpoint_path: Path, device: str, normalize: bool = True,
+                 crop_to_foreground: bool = True):
         from monai.networks.nets import resnet10
 
         if not Path(checkpoint_path).is_file():
@@ -113,10 +119,44 @@ class MedicalNetFeatureExtractor:
         self.model = resnet10(pretrained=str(checkpoint_path), spatial_dims=3, n_input_channels=1, feed_forward=False, shortcut_type="B", bias_downsample=False)
         self.model.eval().to(device)
         self.device = device
+        self.normalize = normalize
+        self.crop_to_foreground = crop_to_foreground
+
+    @staticmethod
+    def preprocess(volume: np.ndarray, normalize: bool = True, crop_to_foreground: bool = True) -> np.ndarray:
+        """Put a volume into the intensity domain Med3D was trained on.
+
+        **This is not optional.** Med3D's own pipeline z-scores each volume using its
+        strictly-positive voxels (Tencent/MedicalNet `__itensity_normalize_one_volume__`). Feeding
+        this repo's percentile-normalized [0, ~2] volumes raw leaves the features almost
+        information-free: measured on the real cohort, FID(T1w real, T2w real) came out 12x
+        *smaller* than FID(T1w real, its own VAE reconstruction) -- i.e. the features could not
+        tell two grossly different contrasts apart. See `mrrate_r2v/eval/README.md`.
+
+        `crop_to_foreground` additionally trims the bit-exact zero padding (~52% of a 256^3 cohort
+        volume). Global average pooling over a region every subject shares dilutes between-subject
+        variation; cropping recovers a further ~4x in feature spread.
+        """
+        v = np.asarray(volume, dtype=np.float32)
+        if crop_to_foreground:
+            m = np.abs(v) > 1e-6
+            if m.any():
+                sl = []
+                for ax in range(3):
+                    proj = m.any(axis=tuple(i for i in range(3) if i != ax))
+                    idx = np.where(proj)[0]
+                    sl.append(slice(int(idx[0]), int(idx[-1]) + 1))
+                v = np.ascontiguousarray(v[tuple(sl)])
+        if normalize:
+            pos = v[v > 0]
+            if pos.size:
+                v = ((v - pos.mean()) / max(float(pos.std()), 1e-8)).astype(np.float32)
+        return v
 
     @torch.no_grad()
     def extract(self, volume: np.ndarray) -> np.ndarray:
-        x = torch.from_numpy(volume).float().unsqueeze(0).unsqueeze(0).to(self.device)
+        v = self.preprocess(volume, self.normalize, self.crop_to_foreground)
+        x = torch.from_numpy(v).float().unsqueeze(0).unsqueeze(0).to(self.device)
         return self.model(x).squeeze(0).float().cpu().numpy()
 
 
@@ -311,12 +351,18 @@ def precision_recall_density_coverage(features_real: np.ndarray, features_gen: n
 class CaseFeatures:
     case_id: str
     sequence: str
+    bucket: str = ""      # "<modality>__<plane>" -- the primary grouping key (see compute_distribution_metrics)
     medicalnet_real: np.ndarray | None = None
     medicalnet_gen: np.ndarray | None = None
     inception_2p5d_real: dict | None = None  # {"sagittal": vec, "coronal": vec, "axial": vec} -- volume-weighted mean-pooled
     inception_2p5d_gen: dict | None = None
     inception_mid_probs_real: np.ndarray | None = None
     inception_mid_probs_gen: np.ndarray | None = None
+    # Mid-axial slices, kept from the same volume load the features came from, so the intra-set
+    # diversity probe costs no extra I/O. Not written to the feature cache (they are pixels, not
+    # features, and would inflate it ~100x).
+    mid_slice_real: np.ndarray | None = None
+    mid_slice_gen: np.ndarray | None = None
 
 
 _PLANE_NAMES = tuple(name for name, _ in PLANE_AXES)
@@ -393,11 +439,18 @@ def compute_2p5d_fid(all_features: list, n_bootstrap: int = 30, seed: int = 42) 
     return out
 
 
-def compute_distribution_metrics(all_features: list, sequences: list, min_subgroup_n: int = 10, n_bootstrap: int = 30, seed: int = 42, k_diversity: int = 5) -> dict:
-    """Per-sequence + overall aggregation, grouping the same way for every metric family so
-    results line up in one report.
+def compute_distribution_metrics(all_features: list, sequences: list, min_subgroup_n: int = 10, n_bootstrap: int = 30, seed: int = 42, k_diversity: int = 5, buckets=None) -> dict:
+    """Per-bucket + per-sequence + overall aggregation, grouping the same way for every metric
+    family so results line up in one report.
+
+    `buckets` is the primary grouping: a (modality, plane) bucket is the only level at which every
+    volume shares a geometry, so it is the only level at which a Frechet distance compares
+    like with like. Per-sequence and overall groups mix geometries and are kept as a coarse
+    summary only.
     """
     groups = {"overall": all_features}
+    for b in (buckets or []):
+        groups[b] = [f for f in all_features if getattr(f, "bucket", None) == b]
     for seq in sequences:
         groups[seq] = [f for f in all_features if f.sequence == seq]
 
@@ -417,6 +470,16 @@ def compute_distribution_metrics(all_features: list, sequences: list, min_subgro
 
         if any(f.inception_2p5d_real for f in feats) and any(f.inception_2p5d_gen for f in feats):
             entry["inception_2p5d_fid"] = compute_2p5d_fid(feats, n_bootstrap, seed)
+
+        sl_real = [f.mid_slice_real for f in feats if f.mid_slice_real is not None]
+        sl_gen = [f.mid_slice_gen for f in feats if f.mid_slice_gen is not None]
+        if sl_real and sl_gen:
+            from .paired import intra_set_ms_ssim_slices
+            entry["intra_set_ms_ssim_real"] = intra_set_ms_ssim_slices(sl_real, seed=seed)
+            entry["intra_set_ms_ssim_produced"] = intra_set_ms_ssim_slices(sl_gen, seed=seed)
+            entry["intra_set_ms_ssim_note"] = ("mean pairwise SSIM within each population. Compare "
+                                               "produced against real: clearly higher = less variety "
+                                               "than the data, i.e. mode collapse.")
 
         probs_real = [f.inception_mid_probs_real for f in feats if f.inception_mid_probs_real is not None]
         probs_gen = [f.inception_mid_probs_gen for f in feats if f.inception_mid_probs_gen is not None]

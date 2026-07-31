@@ -45,8 +45,8 @@ from ._preprocess_ops import (
     validate_cache_manifest,
 )
 from .geometry import (
-    DEFAULT_GEOMETRY_SPACING_MM,
     GEOMETRY_MODES,
+    UNET_SPATIAL_MULTIPLE,
     GeometryPolicy,
     GeometrySpec,
     build_geometry_table,
@@ -62,7 +62,7 @@ from .storage import (
     resolve_node_local_root,
 )
 
-SERIES_SELECTION_MODES = ("all", "one_per_study_per_sequence",
+SERIES_SELECTION_MODES = ("all", "one_per_study_per_bucket", "one_per_study_per_sequence",
                           "one_per_study_deterministic", "one_per_study_random")
 ARCHIVE_ACCESS_MODES = ("stream", "node_local_cache")
 
@@ -90,8 +90,6 @@ class R2VDatasetConfig:
     split: str = "train"
     report_sections: tuple = ("findings", "impression")
     geometry_mode: str = "per_modality_plane"
-    geometry_spacing_mm: tuple = DEFAULT_GEOMETRY_SPACING_MM
-    geometry_divisible_by: int = 16
     # geometry_mode="fixed" only. **Both are (D, H, W)-ordered**, like every other internal
     # geometry parameter -- NOT the (X, Y, Z) order the Dataset *returns*. If your value came from
     # outside this package (a CLI flag, NVIDIA's dim/spacing config), convert it with
@@ -143,8 +141,7 @@ class R2VDatasetConfig:
         """
         return {
             "geometry_mode": self.geometry_mode,
-            "geometry_spacing_mm_dhw": list(self.geometry_spacing_mm),
-            "geometry_divisible_by": self.geometry_divisible_by,
+            "unet_spatial_multiple": UNET_SPATIAL_MULTIPLE,
             "fixed_target_shape_xyz": list(dhw_to_xyz(self.fixed_target_shape)) if self.geometry_mode == "fixed" else None,
             "fixed_target_spacing_mm_xyz": list(dhw_to_xyz(self.fixed_target_spacing_mm)) if self.geometry_mode == "fixed" else None,
             "posterior_shift_mm": self.posterior_shift_mm,
@@ -175,11 +172,10 @@ class MRReportToVolumeDataset(Dataset):
                                          self.config.fixed_target_spacing_mm),
             )
         else:
-            self.geometry = GeometryPolicy(
-                mode="per_modality_plane",
-                table=build_geometry_table(self.config.geometry_spacing_mm,
-                                          self.config.geometry_divisible_by),
-            )
+            # No spacing/divisor arguments: the table now derives spacing from NVIDIA's published
+            # FOV and fixes the shape at a multiple of the UNet's constraint. See build_geometry_table.
+            self.geometry = GeometryPolicy(mode="per_modality_plane",
+                                           table=build_geometry_table())
 
         self.preprocessed_dir = preprocessed_dir
         self.use_preprocessed = bool(use_preprocessed)
@@ -238,9 +234,16 @@ class MRReportToVolumeDataset(Dataset):
           observations, so plain means over them overweight multi-series studies and plain
           std/CIs come out falsely narrow (this package's aggregation does not model clustering).
 
+        "one_per_study_per_bucket" -- one sample per (study, sequence, plane). **Use this for a
+          per-bucket cohort.** Beware the subtler trap: "one_per_study_per_sequence" prefers the
+          center-modality series, which on MR-RATE is the *axial* T1w, so it collapses PLANES
+          within a sequence -- measured on the real test split it leaves T1w CORONAL with 16 cases
+          and T2w SAGITTAL with 6, because those planes only survive for studies that happen to
+          have no axial series of that modality.
+
         "one_per_study_per_sequence" -- one sample per (study, sequence), preferring the
-          center-modality series, else the series_id-sorted first. **This is the one to use for a
-          multi-sequence evaluation**: every sequence gets one independent observation per study.
+          center-modality series, else the series_id-sorted first. Right for a per-sequence
+          cohort, wrong for a per-bucket one (see above).
 
         "one_per_study_deterministic" -- one sample per *study*, across all requested sequences.
           Beware: the preferred series is the center modality, which on MR-RATE is the T1w
@@ -258,10 +261,14 @@ class MRReportToVolumeDataset(Dataset):
             return list(rows)
 
         # Group key: what "one per" means for this mode.
+        keys = {
+            "one_per_study_per_bucket": lambda r: (r.study_uid, r.modality, r.plane),
+            "one_per_study_per_sequence": lambda r: (r.study_uid, r.modality),
+        }
+        key_of = keys.get(mode, lambda r: r.study_uid)
         groups = {}
         for r in rows:
-            key = (r.study_uid, r.modality) if mode == "one_per_study_per_sequence" else r.study_uid
-            groups.setdefault(key, []).append(r)
+            groups.setdefault(key_of(r), []).append(r)
 
         selected = []
         for key, group in groups.items():

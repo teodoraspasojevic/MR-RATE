@@ -14,7 +14,6 @@ internal convention. `dhw_to_xyz` converts to the (X, Y, Z) = (R, A, S) order th
 actually returns -- see `dataset.py`'s docstring for why the conversion happens exactly
 once, at the end.
 """
-import math
 from dataclasses import dataclass
 
 # Median training FOV per (modality, plane) for nvidia/NV-Generate-MR-Brain
@@ -53,6 +52,17 @@ DEFAULT_FALLBACK_FOV_MM = (256.0, 256.0, 256.0)
 # 256x384x384 grid rather than this model's FOV distribution.
 DEFAULT_GEOMETRY_SPACING_MM = (1.0, 1.0, 1.0)
 
+# Every axis of a volume handed to the diffusion UNet must be a multiple of this.
+#
+# Verified empirically (job 662720): every div-32 shape generates, every div-16-but-not-32 shape
+# raises `RuntimeError: Sizes of tensors must match ... Expected size 14 but got size 15` from the
+# UNet's skip connections. The arithmetic: the UNet has 4 levels (3 downsamples) so its latent must
+# be divisible by 8, and the latent is `output_size // 4`, hence 32.
+#
+# Note this is STRICTER than the VAE's own requirement of 16 (`required_spatial_divisor`). Checking
+# only 16 is necessary but not sufficient -- it passes the autoencoder and fails the UNet.
+UNET_SPATIAL_MULTIPLE = 32
+
 GEOMETRY_MODES = ("per_modality_plane", "fixed")
 
 FIXED_GEOMETRY_KEY = ("__fixed__", "__fixed__")
@@ -80,14 +90,9 @@ def xyz_to_dhw(t):
     return (t[2], t[0], t[1])
 
 
-def _ceil_to_multiple(value_mm, spacing_mm, divisible_by):
-    """Smallest voxel count >= value_mm/spacing_mm that is a multiple of divisible_by.
-
-    Rounds up, never to nearest, so the grid's physical FOV is always at least the median
-    FOV it derives from -- a geometry baseline should not truncate anatomy.
-    """
-    voxels = math.ceil(value_mm / spacing_mm)
-    return int(math.ceil(voxels / divisible_by) * divisible_by)
+def _round_to_multiple(value, multiple):
+    """Nearest positive multiple of `multiple`."""
+    return max(multiple, int(round(value / multiple)) * multiple)
 
 
 @dataclass(frozen=True)
@@ -102,16 +107,27 @@ class GeometrySpec:
         return tuple(s * p for s, p in zip(self.target_shape, self.target_spacing))
 
 
-def build_geometry_table(spacing_mm=DEFAULT_GEOMETRY_SPACING_MM, divisible_by=16,
-                         fov_table=None, fallback_fov_mm=DEFAULT_FALLBACK_FOV_MM):
-    """{(modality, plane): GeometrySpec} from a median-FOV table, plus a fallback entry."""
+def build_geometry_table(fov_table=None, unet_multiple=UNET_SPATIAL_MULTIPLE,
+                         fallback_fov_mm=DEFAULT_FALLBACK_FOV_MM):
+    """{(modality, plane): GeometrySpec} realising NVIDIA's published FOV table exactly.
+
+    For each bucket: pick the shape as the nearest multiple of `unet_multiple` (the diffusion
+    UNet's hard constraint), then derive `spacing = FOV / shape`. The physical field of view
+    therefore equals NVIDIA's recommendation **exactly**, and the resulting spacing -- which lands
+    within about +/-10% of 1 mm for every published bucket -- is what the model is conditioned on.
+
+    Why derive spacing instead of fixing it at 1 mm: `spacing` is a real conditioning input to the
+    UNet (it reaches the network as `spacing_tensor`), and the FOV table is the quantity NVIDIA
+    actually validated. Fixing spacing at 1 mm and rounding the shape up instead would over-cover
+    the recommended FOV by up to 30 mm on an axis. Non-1 mm spacing conditioning was verified to
+    run (job 662720).
+    """
     fov_table = fov_table if fov_table is not None else NV_BRAIN_FOV_MM
     table = {}
-    for key, fov in fov_table.items():
-        shape = tuple(_ceil_to_multiple(fov[i], spacing_mm[i], divisible_by) for i in range(3))
-        table[key] = GeometrySpec(target_shape=shape, target_spacing=tuple(spacing_mm))
-    fallback_shape = tuple(_ceil_to_multiple(fallback_fov_mm[i], spacing_mm[i], divisible_by) for i in range(3))
-    table[FALLBACK_GEOMETRY_KEY] = GeometrySpec(target_shape=fallback_shape, target_spacing=tuple(spacing_mm))
+    for key, fov in list(fov_table.items()) + [(FALLBACK_GEOMETRY_KEY, fallback_fov_mm)]:
+        shape = tuple(_round_to_multiple(f, unet_multiple) for f in fov)
+        spacing = tuple(f / s for f, s in zip(fov, shape))
+        table[key] = GeometrySpec(target_shape=shape, target_spacing=spacing)
     return table
 
 

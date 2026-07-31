@@ -44,7 +44,7 @@ echo
 echo "=== 1. preprocess: 2 T1w cases -> frozen cohort ==="
 run_py mrrate_r2v.cli.preprocess \
     --manifest-csv "$MANIFEST_CSV" --report-index-csv "$REPORT_INDEX_CSV" \
-    --split test --sequences T1w --n-per-sequence 2 \
+    --split test --sequences T1w --n-per-bucket 2 \
     --out "$COHORT" --overwrite
 
 echo
@@ -61,12 +61,13 @@ run_py mrrate_r2v.cli.evaluate \
 
 echo
 echo "=== output check ==="
-for f in summary.json per_case_metrics.csv excluded_cases.json run_manifest.json; do
+for f in summary.json per_case_metrics.csv excluded_cases.json run_manifest.json \
+         metrics_per_bucket.csv metrics_summary.csv; do
     [[ -f "$RESULTS/$f" ]] && echo "OK: $f" || { echo "MISSING: $f"; exit 1; }
 done
 N=$(python3 -c "import json;print(json.load(open('$RESULTS/summary.json'))['n_scored'])")
 echo "scored cases: $N"
-cat "$RESULTS/summary.json"
+column -s, -t < "$RESULTS/metrics_per_bucket.csv" || cat "$RESULTS/metrics_per_bucket.csv"
 
 sacct -j "$SLURM_JOB_ID" --format=JobID,JobName,State,Elapsed,MaxRSS,AllocTRES 2>&1 || true
 

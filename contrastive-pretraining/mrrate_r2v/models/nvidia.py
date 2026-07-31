@@ -67,15 +67,32 @@ def load_autoencoder(checkpoint_path, env_config=DEFAULT_ENV_CONFIG, model_confi
     return autoencoder, cfg_args, required_spatial_divisor(autoencoder, cfg_args)
 
 
-def load_autoencoder_and_unet(env_config=DEFAULT_ENV_CONFIG, model_config=DEFAULT_MODEL_CONFIG, network_config=DEFAULT_NETWORK_CONFIG, device: str = "cuda", autoencoder_checkpoint_override=None):
-    """For unconditional-generation evaluation (needs both). Returns (autoencoder, unet,
-    scale_factor, cfg_args) via NVIDIA's own `load_models`, unmodified.
+def load_autoencoder_and_unet(env_config=DEFAULT_ENV_CONFIG, model_config=DEFAULT_MODEL_CONFIG,
+                              network_config=DEFAULT_NETWORK_CONFIG, device: str = "cuda",
+                              autoencoder_checkpoint_override=None, unet_checkpoint_override=None):
+    """For generation (needs both nets). Returns (autoencoder, unet, scale_factor, cfg_args) via
+    NVIDIA's own `load_models`, unmodified.
+
+    **Both checkpoint paths must be overridden with absolute paths.** NVIDIA's shipped env config
+    stores them relative -- `model_dir="./models"`, `trained_autoencoder_path="models/..."` -- and
+    `load_models` resolves them against the *current working directory*. Running from anywhere
+    other than a directory that happens to contain `models/` then fails with a bare
+    FileNotFoundError. `unet_checkpoint_override` is split into the `model_dir`/`model_filename`
+    pair `load_models` actually reads, and `existing_ckpt_filepath` is kept consistent with it.
     """
     import logging
+    from pathlib import Path as _Path
 
     cfg_args = load_config(str(env_config), str(model_config), str(network_config))
     if autoencoder_checkpoint_override is not None:
         cfg_args.trained_autoencoder_path = str(autoencoder_checkpoint_override)
+    if unet_checkpoint_override is not None:
+        unet_path = _Path(unet_checkpoint_override).resolve()
+        if not unet_path.is_file():
+            raise FileNotFoundError(f"diffusion UNet checkpoint not found: {unet_path}")
+        cfg_args.model_dir = str(unet_path.parent)
+        cfg_args.model_filename = unet_path.name
+        cfg_args.existing_ckpt_filepath = str(unet_path)
     logger = logging.getLogger("nvidia_model")
     autoencoder, unet, scale_factor = load_models(cfg_args, device, logger)
     autoencoder.eval()
@@ -83,8 +100,18 @@ def load_autoencoder_and_unet(env_config=DEFAULT_ENV_CONFIG, model_config=DEFAUL
     return autoencoder, unet, scale_factor, cfg_args
 
 
+def default_unet_filename(env_config=DEFAULT_ENV_CONFIG) -> str:
+    """The UNet checkpoint filename NVIDIA's env config expects, so a caller can look for it next
+    to the autoencoder checkpoint instead of hardcoding the name."""
+    import json
+
+    return json.loads(Path(env_config).read_text()).get(
+        "model_filename", "diff_unet_3d_rflow-mr-brain_v0.pt")
+
+
 __all__ = [
     "VENDORED_NVIDIA_ROOT", "DEFAULT_ENV_CONFIG", "DEFAULT_MODEL_CONFIG", "DEFAULT_NETWORK_CONFIG",
     "load_models", "prepare_tensors", "run_inference", "set_random_seed", "load_config", "define_instance",
     "required_spatial_divisor", "load_autoencoder", "load_autoencoder_and_unet",
+    "default_unet_filename",
 ]

@@ -37,7 +37,8 @@ import numpy as np
 
 from ..cohort import Cohort, case_id_for
 from ..eval.pairing import load_predictions_csv, pair_predictions_to_targets, target_rows_from_cohort
-from ..predictions import PredictionItem, PredictionSet, save_prediction_volume, write_prediction_set
+from ..predictions import PredictionItem, PredictionSet, write_prediction_set
+from ..volumes import VolumeWriter
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("import_predictions")
@@ -69,6 +70,7 @@ def main(argv=None) -> int:
     log.info("pairing: %s", result.summary())
 
     items, failures = [], []
+    writer = VolumeWriter(args.out)
     for paired in result.paired:
         case_id = case_id_for(paired.target.study_key, paired.target.series_key)
         case = cohort.case_by_id(case_id)
@@ -86,12 +88,14 @@ def main(argv=None) -> int:
             failures.append({"prediction_path": paired.prediction.prediction_path,
                              "category": "unreadable", "reason": f"{type(e).__name__}: {e}"})
             continue
-        save_prediction_volume(args.out, case_id, volume)
+        writer.add(case.bucket, case_id, volume)
         items.append(PredictionItem(
             prediction_id=case_id, case_id=case_id, sequence=case.sequence,
-            shape=list(volume.shape), spacing_mm=list(spacing),
+            plane=case.acquisition_plane, shape=list(volume.shape), spacing_mm=list(spacing),
             extra={"source_file": paired.prediction.prediction_path, "source_orientation": orientation},
         ))
+
+    writer.close()
 
     for rejected in result.rejected:
         failures.append({"prediction_path": rejected.prediction.prediction_path,

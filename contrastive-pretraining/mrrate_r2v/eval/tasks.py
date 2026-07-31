@@ -43,6 +43,12 @@ METRIC_GROUPS = {
         "needs_pair": True,
         "what": "does the volume match what the report says",
     },
+    "anatomy": {
+        "needs_pair": False,
+        "what": "anatomical plausibility of the produced population vs the real one "
+                "(left-right symmetry, intracranial fraction, tissue contrast separation, "
+                "foreground compactness, background purity) -- see anatomy.py",
+    },
 }
 
 
@@ -79,14 +85,14 @@ TASKS = {
     "reconstruction": TaskSpec(
         name="reconstruction",
         paired=True,
-        metric_groups=("fidelity", "perceptual", "distribution"),
+        metric_groups=("fidelity", "perceptual", "distribution", "anatomy"),
         summary="A model encoded a real volume and decoded it back. The ground truth is that "
                 "exact input, so every metric applies.",
     ),
     "report2volume": TaskSpec(
         name="report2volume",
         paired=True,
-        metric_groups=("fidelity", "perceptual", "distribution", "report_alignment"),
+        metric_groups=("fidelity", "perceptual", "distribution", "report_alignment", "anatomy"),
         summary="A model generated a volume from a report. The ground truth is the real series "
                 "that report describes, so paired metrics apply -- but expect much weaker "
                 "voxelwise agreement than reconstruction, since nothing constrains anatomy "
@@ -95,7 +101,7 @@ TASKS = {
     "generation": TaskSpec(
         name="generation",
         paired=False,
-        metric_groups=("distribution",),
+        metric_groups=("distribution", "anatomy"),
         summary="A model generated volumes from a modality label alone. Only population-level "
                 "metrics are meaningful.",
         unpaired_reason="unconditional generation -- no real patient corresponds to any "
