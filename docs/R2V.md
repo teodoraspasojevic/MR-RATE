@@ -436,6 +436,9 @@ contrastive-pretraining/
     data/              manifest -> Dataset -> preprocessed volume   (README.md)
     eval/              cohort + predictions + task -> metrics       (README.md)
     models/nvidia.py   the only place vendored NVIDIA code is imported
+    models/report_conditioned_unet.py
+                       the pretrained diffusion UNet + report cross-attention adapters,
+                       and the strict pretrained-checkpoint loader (no CLI uses it yet)
     cli/               the seven entry points
   scripts/             the contrastive-pretraining pipeline (separate; see its own README)
   slurm/               _common.sh + five numbered job scripts
