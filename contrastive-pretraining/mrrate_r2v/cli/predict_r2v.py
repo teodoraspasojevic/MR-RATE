@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """Stage 2: report-to-volume inference. Computes no metrics.
 
-No report-conditioned checkpoint exists in this project yet, so this script has nothing to
-load. It is written now because everything *around* the model is already fixed: it reads a
-cohort, generates one volume per case from that case's report text, and writes a prediction
-set that `python -m mrrate_r2v.cli.evaluate --task report2volume` scores. When a checkpoint
-appears, implement `load_r2v_model` and `generate_one` below and the rest of the pipeline works
-unchanged.
+Reads a cohort, generates one volume per case from that case's report text, and writes a
+prediction set that `python -m mrrate_r2v.cli.evaluate --task report2volume` scores. The model
+is a frozen NVIDIA base UNet plus a trained report adapter (`cli.train_r2v`); it is assembled
+by `cli.generate_r2v.build_sampler`, which is also what the free-form single-report script uses.
 
     python -m mrrate_r2v.cli.predict_r2v \\
         --cohort <workspace>/cohorts/test_v1 \\
-        --checkpoint <your_checkpoint> \\
+        --checkpoint <workspace>/runs/r2v_adapter_v1/adapter_last.pt \\
+        --base-checkpoint <workspace>/models/diff_unet_3d_rflow-mr-brain_v0.pt \\
+        --vae-checkpoint <workspace>/models/autoencoder_v1.pt \\
+        --text-checkpoint <workspace>/pretrained/RadBERT-RoBERTa-4m \\
         --out <workspace>/predictions/r2v_v1
 
 To score a checkpoint that already saved `.nii.gz` files elsewhere, you do not need this
@@ -47,34 +48,51 @@ def stable_seed(base_seed: int, case_id: str) -> int:
     return int(h[:8], 16)
 
 
-def load_r2v_model(checkpoint: Path, device: str):
-    """Load a report-conditioned generator. Not implemented -- no such checkpoint exists yet.
+def load_r2v_model(args):
+    """Load the report-conditioned generator described by `args`.
 
-    A model returned here must expose `generate(report_text, shape, spacing_mm, seed) ->
-    np.ndarray[X, Y, Z]`. Wire in the real loader when a checkpoint exists; do not substitute
-    a different model, because the resulting numbers would be attributed to a report-to-volume
-    system that was never run.
+    Delegates to `cli.generate_r2v.build_sampler`, so this script and the free-form single-report
+    script cannot diverge on how a model is assembled. `--checkpoint` is the *adapter*: the frozen
+    base UNet, the VAE and the text encoder are separate artefacts.
     """
-    raise SystemExit(
-        "predict_r2v: no report-to-volume checkpoint is implemented yet.\n"
-        "Implement load_r2v_model() and generate_one() in mrrate_r2v/cli/predict_r2v.py, or -- if "
-        "your checkpoint already wrote .nii.gz files -- use\n"
-        "    python -m mrrate_r2v.cli.import_predictions --cohort <cohort> "
-        "--predictions-csv <csv> --out <pred_dir>"
-    )
+    from types import SimpleNamespace
+
+    from .generate_r2v import build_sampler
+
+    sampler, _embedder, _payload = build_sampler(SimpleNamespace(
+        base_checkpoint=args.base_checkpoint, vae_checkpoint=args.vae_checkpoint,
+        adapter=args.checkpoint, network_config=args.network_config,
+        text_encoder=None, text_checkpoint=args.text_checkpoint, max_report_tokens=None,
+        device=args.device, latent_only=False,
+        report_guidance_scale=args.report_guidance_scale,
+        modality_guidance_scale=args.modality_guidance_scale,
+        num_inference_steps=args.num_inference_steps, seed=args.seed,
+        batched_guidance=True, allow_base_mismatch=args.allow_base_mismatch,
+    ))
+    return sampler
 
 
-def generate_one(model, report_text: str, case, seed: int) -> np.ndarray:
+def generate_one(model, report_text: str, case, seed: int, modality: str = "T1w") -> np.ndarray:
     """One report in, one volume out on the case's own grid."""
-    return model.generate(report_text, tuple(case.shape), tuple(case.spacing_mm), seed)
+    return model.generate(report_text, tuple(case.shape), tuple(case.spacing_mm), seed, modality=modality)
 
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--cohort", type=Path, required=True)
     p.add_argument("--out", type=Path, required=True)
-    p.add_argument("--checkpoint", type=Path, required=True)
+    p.add_argument("--checkpoint", type=Path, required=True, help="adapter checkpoint (cli.train_r2v)")
+    p.add_argument("--base-checkpoint", type=Path, required=True, help="frozen NVIDIA diffusion UNet")
+    p.add_argument("--vae-checkpoint", type=Path, required=True, help="frozen NVIDIA autoencoder")
+    p.add_argument("--text-checkpoint", type=Path, default=None,
+                   help="text encoder directory; default = whatever the adapter recorded")
+    p.add_argument("--network-config", type=Path, default=None)
     p.add_argument("--model-name", default="report2volume", help="recorded in the prediction set's provenance")
+    p.add_argument("--modality", default="T1w", choices=["T1w", "T2w", "FLAIR", "SWI", "unknown"])
+    p.add_argument("--num-inference-steps", type=int, default=30)
+    p.add_argument("--report-guidance-scale", type=float, default=4.0)
+    p.add_argument("--modality-guidance-scale", type=float, default=10.0)
+    p.add_argument("--allow-base-mismatch", action="store_true")
     p.add_argument("--device", default="cuda", choices=["cpu", "cuda"])
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--limit", type=int, default=None)
@@ -89,7 +107,7 @@ def main(argv=None) -> int:
 
     cohort = Cohort(args.cohort)
     log.info("cohort %s", cohort.summary())
-    model = load_r2v_model(args.checkpoint, args.device)  # raises until implemented
+    model = load_r2v_model(args)
 
     cases = cohort.cases[:args.limit] if args.limit else cohort.cases
     items, failures = [], []
@@ -98,7 +116,8 @@ def main(argv=None) -> int:
         for n, case in enumerate(cases, start=1):
             seed = stable_seed(args.seed, case.case_id)
             try:
-                volume = generate_one(model, cohort.load_report(case.case_id), case, seed)
+                volume = generate_one(model, cohort.load_report(case.case_id), case, seed,
+                                      modality=args.modality)
             except Exception as e:  # noqa: BLE001
                 failures.append({"case_id": case.case_id, "error": f"{type(e).__name__}: {e}"})
                 log.warning("case %s failed: %s", case.case_id, e)

@@ -15,9 +15,7 @@ from mrrate_r2v.data import (MRReportToVolumeDataset, R2VDatasetConfig,
                              ShardReportStore, read_manifest_csv)
 
 rows   = read_manifest_csv("manifest_shards_native.csv")
-config = R2VDatasetConfig(split="train", geometry_mode="fixed",
-                          fixed_target_shape=(256, 256, 256),
-                          fixed_target_spacing_mm=(1.0, 1.0, 1.0))
+config = R2VDatasetConfig(split="train")          # geometry_mode="per_modality_plane" by default
 dataset = MRReportToVolumeDataset(rows, ShardReportStore("report_index.csv"), config)
 sample  = dataset[0]
 ```
@@ -26,14 +24,16 @@ sample  = dataset[0]
 
 ```python
 sample["image"]              # torch.Tensor [1, X, Y, Z] -- preprocessed, model-ready
+                             # dtype = config.dtype (default torch.bfloat16)
 sample["report_text"]        # str -- the conditioning text
-sample["modality"]           # "T1w" | "T2w" | "FLAIR" | "SWI"
-sample["acquisition_plane"]  # "AXIAL" | "SAGITTAL" | "CORONAL" | ...
+sample["modality"]           # "T1w" | "T2w" | "FLAIR" | "SWI" | "unknown"
+                             # ("MRA" only if you override --excluded-modalities)
+sample["acquisition_plane"]  # "AXIAL" | "SAGITTAL" | "CORONAL" | "OBLIQUE" | "unknown"
 sample["contrast_state"]     # "unknown" -- not derivable from the release
 sample["skull_state"]        # "defaced_not_stripped"
-sample["target_shape"]       # the grid it was resampled onto      [X, Y, Z]
-sample["target_spacing_mm"]  #                                     [X, Y, Z]
-sample["native_shape"]       # pre-resample geometry, for provenance
+sample["target_shape"]       # the grid it was resampled onto   int64  tensor [X, Y, Z]
+sample["target_spacing_mm"]  #                                  float32 tensor [X, Y, Z]
+sample["native_shape"]       # pre-resample geometry, for provenance   (also [X, Y, Z])
 sample["native_spacing_mm"]
 sample["native_fov_mm"]
 sample["study_key"]          # identifiers -- for matching, never to log verbatim
@@ -42,30 +42,61 @@ sample["series_key"]
 
 `sample["image"].shape[-3:] == tuple(sample["target_shape"].tolist())` always holds.
 
-### The axis order, and why it is what it is
+---
 
-**X = Right-Left, Y = Anterior-Posterior, Z = Superior-Inferior**, after RAS canonicalization.
+## Axis order: what `(X, Y, Z)`, `(D, H, W)` and `(R, A, S)` actually mean
 
-That is NV-Generate-CTMR's own array order, which it never permutes internally — so what this
-Dataset returns goes straight into the model with no further reshaping.
+Three notations, **two of them are array-index orders and one is a set of anatomical
+direction names**. That is the whole confusion, so read this before anything else.
 
-It is deliberately *not* the `(D, H, W) = (S, R, A)` order the contrastive `MRReportDataset` uses.
-That ordering exists because the VJEPA video encoders hardcode "the axis after channel is the slice
+`(R, A, S)` is not a shape. It names *anatomical directions* — Right, Anterior, Superior —
+and is what "RAS canonicalization" (`nibabel.as_closest_canonical`) guarantees: after it, each
+array axis increases toward one of those three directions. Every volume in this package is
+RAS-canonical. What differs between the two shape notations below is only **which array index
+holds which anatomical axis** — never the physical orientation of the anatomy.
+
+| Notation | index 0 | index 1 | index 2 | Where it is used |
+|---|---|---|---|---|
+| `(X, Y, Z)` | **R** (→ Right) | **A** (→ Anterior) | **S** (→ Superior) | everything crossing the package boundary |
+| `(D, H, W)` | **S** (→ Superior) | **R** (→ Right) | **A** (→ Anterior) | everything internal to preprocessing |
+
+So `(X, Y, Z) = (R, A, S) = (H, W, D)` and `(D, H, W) = (S, R, A)`: same volume, same anatomy, axes
+permuted. `X/Y/Z` are the NIfTI axis names (a NIfTI file natively stores `dim0=R, dim1=A,
+dim2=S`, which is why this is also NVIDIA's `dim`/`spacing` order). `D/H/W`
+("depth/height/width") is borrowed video-tensor vocabulary and carries **no** anatomical
+meaning of its own — here `D` happens to be the superior-inferior slice axis.
+
+Convert only with the two helpers, never by hand:
+
+```python
+from mrrate_r2v.data.geometry import dhw_to_xyz, xyz_to_dhw
+dhw_to_xyz(t)   # (D, H, W) -> (H, W, D)
+xyz_to_dhw(t)   # (X, Y, Z) -> (Z, X, Y)
+```
+
+### Why two orders at all
+
+`(X, Y, Z)` is NV-Generate-CTMR's own array order, which it never permutes internally — so
+what this Dataset returns goes straight into the model with no further reshaping.
+
+It is deliberately *not* the `(D, H, W)` order the contrastive `MRReportDataset` uses. That
+ordering exists because the VJEPA video encoders hardcode "the axis after channel is the slice
 axis" (asymmetric Conv3d kernels, tubelet embedding, depth chunking). That constraint belongs to
 those encoders, not to the generative model this Dataset targets.
 
-So: preprocessing runs in `(D, H, W)` using `scripts/data.py`'s shared code, and `__getitem__`
-converts to `(X, Y, Z)` exactly once as its last step (`image.permute(0, 2, 3, 1)`), reindexing every
+So: preprocessing runs in `(D, H, W)` using `scripts/data.py`'s shared code (its
+`transpose(2, 0, 1)` is where `(X, Y, Z)` becomes `(D, H, W)`), and `__getitem__` converts back
+to `(X, Y, Z)` exactly once as its last step (`image.permute(0, 2, 3, 1)`), reindexing every
 geometry field the same way. The manifest on disk stays `(D, H, W)`.
 
 ### The one place this can bite you
 
-`R2VDatasetConfig.fixed_target_shape` and `fixed_target_spacing_mm` are **`(D, H, W)`**, like every
-other internal geometry parameter — *not* the `(X, Y, Z)` the Dataset returns. Anything arriving from
-outside the package (a CLI flag, NVIDIA's `dim`/`spacing`) is `(X, Y, Z)` and must be converted:
+`R2VDatasetConfig.fixed_target_shape` and `fixed_target_spacing_mm` are **`(D, H, W)`**, like
+every other internal geometry parameter — *not* the `(X, Y, Z)` the Dataset returns. Anything
+arriving from outside the package (a CLI flag, NVIDIA's `dim`/`spacing`) is `(X, Y, Z)` and must
+be converted:
 
 ```python
-from mrrate_r2v.data.geometry import xyz_to_dhw
 R2VDatasetConfig(geometry_mode="fixed",
                  fixed_target_shape=xyz_to_dhw((256, 176, 240)),        # user thinks XYZ
                  fixed_target_spacing_mm=xyz_to_dhw((0.8, 0.9, 1.2)))   # config stores DHW
@@ -78,15 +109,25 @@ anterior-posterior spacing in `(D, H, W)` but the superior-inferior spacing in `
 FOV gets shifted along the wrong axis by the wrong amount. `cli.preprocess` converts correctly;
 `test_cohort_selection.py::test_preprocess_converts_cli_xyz_geometry_into_internal_dhw` guards it.
 
-The Dataset's *own* defaults (`(256, 384, 384)` @ `(1.0, 0.5, 0.5)`) are already `(D, H, W)`,
-inherited from the contrastive loader — leave them alone.
+One exception, by design: `R2VDatasetConfig.geometry_fingerprint()` reports these two fields in
+`(X, Y, Z)` under `*_xyz` names, because everything else written into a cohort directory
+(`CohortCase.shape`, the stored `.npy` volumes) is `(X, Y, Z)`.
+
+`R2VDatasetConfig`'s fixed-mode fallback values (`(256, 384, 384)` @ `(1.0, 0.5, 0.5)`) are
+already `(D, H, W)`, inherited from the contrastive loader. They only apply when you set
+`geometry_mode="fixed"` without passing your own grid — leave them alone.
 
 ### The `.npz` cache is `(D, H, W)` too
 
-`use_preprocessed=True` reads `preprocess_volumes.py`'s cache, which stores `preprocess_nii` output
-verbatim as `[N, D, H, W]`. So the unconditional `permute(0, 2, 3, 1)` in `__getitem__` is correct
-for all three read paths — live NIfTI, archive stream, and cache. If you ever add a fourth read
-path, it must also yield `(D, H, W)`, or move the permute into the branch.
+`use_preprocessed=True` reads `preprocess_volumes.py`'s cache, which stores `preprocess_nii`
+output verbatim as `[N, D, H, W]`. So the unconditional `permute(0, 2, 3, 1)` in `__getitem__` is
+correct for all three read paths — live NIfTI, archive stream, and cache. If you ever add a fourth
+read path, it must also yield `(D, H, W)`, or move the permute into the branch.
+
+`use_preprocessed=True` additionally **requires `geometry_mode="fixed"`** (the constructor raises
+otherwise): one `.npz` directory carries a single shape/spacing, while `per_modality_plane` needs
+a different shape per bucket. Per-bucket caching is not implemented — the cohort stage
+(`cli.preprocess`) is what materializes per-bucket volumes.
 
 ---
 
@@ -101,7 +142,8 @@ path, it must also yield `(D, H, W)`, or move the permute into the branch.
 | `dataset.py` | assembling all of it into tensors | torch |
 
 Only `dataset.py` imports torch. That is on purpose: it lets a pyarrow-only interpreter build a
-manifest, which is why there is no duplicate standalone builder script.
+manifest, which is why there is no duplicate standalone builder script. `__init__.py`'s re-exports
+are lazy (PEP 562) to keep that true.
 
 Volume preprocessing itself — RAS reorient → resample → crop/pad → normalize — is
 `scripts/data.py`'s code imported unchanged via `_preprocess_ops.py`. Both pipelines therefore
@@ -113,37 +155,60 @@ prepare a volume identically, by construction rather than by discipline.
 
 Two modes, set by `R2VDatasetConfig.geometry_mode`.
 
-**`"fixed"`** — one shape and spacing for everything. Batching just works, and volumes are
-comparable across models. This is what evaluation cohorts use.
+**`"per_modality_plane"`** (the default, and what evaluation cohorts use) — each
+(modality, plane) bucket gets its own grid, built from NVIDIA's published median training FOV for
+that pair (`NV_BRAIN_FOV_MM`):
 
-**`"per_modality_plane"`** (the Dataset's own default) — each (modality, plane) gets a shape sized
-from NVIDIA's published median training FOVs, rounded *up* to a multiple of 16 so anatomy is never
-truncated below the distribution it targets. Tighter fit per anatomy, but:
+- `shape` = FOV rounded to the **nearest multiple of 32** (`UNET_SPATIAL_MULTIPLE`) — the
+  diffusion UNet's hard constraint: 4 levels, latent = shape/4, latent must be divisible by 8.
+  Note this is stricter than the VAE's own divisor of 16; a div-16-but-not-32 shape passes the
+  autoencoder and then fails the UNet's skip connections.
+- `spacing` = `FOV / shape`, i.e. **derived, not fixed at 1 mm**. The physical FOV therefore
+  equals NVIDIA's recommendation *exactly*, and the resulting spacing lands within ±10% of 1 mm
+  for every published bucket. Spacing is a real conditioning input to the UNet
+  (`spacing_tensor`), and the FOV table is the quantity NVIDIA actually validated — fixing
+  spacing at 1 mm and rounding the shape up instead would over-cover the recommended FOV by up
+  to 30 mm on an axis.
+
+Tighter fit per anatomy, but:
 
 - shapes differ between buckets, so `batch_size > 1` needs `GeometryBucketBatchSampler` as the
   DataLoader's `batch_sampler` — otherwise `collate_fn_r2v` raises (with an actionable message, not
   a raw `torch.stack` traceback);
 - numbers from it are not comparable with a fixed-mode run.
 
-Anything not in the table — unknown modality, OBLIQUE plane, missing plane metadata — falls back to
-256³ at 1 mm.
+**`"fixed"`** — one shape and spacing for everything, from `fixed_target_shape` /
+`fixed_target_spacing_mm`. Batching just works and volumes share one grid, but it puts every
+bucket on the same FOV regardless of anatomy. Keep it for a deliberate single-grid study; it is
+not the default anywhere.
+
+Anything not in the FOV table — unknown modality, OBLIQUE plane, missing plane metadata — falls
+back to 256³ at 1 mm (`DEFAULT_FALLBACK_FOV_MM`, NVIDIA's own shipped default inference
+geometry), reachable as `FALLBACK_GEOMETRY_KEY`.
 
 ```python
 from mrrate_r2v.data import build_geometry_table
-build_geometry_table()[("T1w", "SAGITTAL")]   # GeometrySpec(shape=(256,176,256), spacing=(1,1,1))
+build_geometry_table()[("T1w", "SAGITTAL")]
+# GeometrySpec(target_shape=(256, 192, 256),                       # (D, H, W), all div-32
+#              target_spacing=(0.9766, 0.9167, 0.9766))            # = FOV (250, 176, 250) / shape
 ```
+
+The table is keyed on the 15 published (modality, plane) pairs — including MRA, even though
+`manifest.py` excludes MRA series by default — plus the fallback entry.
 
 ---
 
 ## Sampling: how many times does a study appear?
 
-`R2VDatasetConfig.series_selection`:
+`R2VDatasetConfig.series_selection` — five modes, and the choice is not cosmetic:
 
-| Value | Samples per study | Trade-off |
+| Value | Samples per study | Use / trade-off |
 |---|---|---|
-| `"all"` (default) | one per eligible series | full granularity; big studies count more |
-| `"one_per_study_deterministic"` | 1, preferring the center-modality series | no overrepresentation; non-preferred series never seen |
-| `"one_per_study_random"` | 1, redrawn each epoch | no overrepresentation, full coverage over many epochs |
+| `"all"` (config default) | one per eligible series | training; full granularity. For *evaluation* it is pseudo-replication — near-duplicate series from one session are not independent, so means overweight multi-series studies and CIs come out falsely narrow |
+| `"one_per_study_per_bucket"` | one per (study, modality, plane) | **the right choice for a per-bucket cohort** — and `cli.preprocess`'s default |
+| `"one_per_study_per_sequence"` | one per (study, modality) | right for a per-sequence cohort, wrong for a per-bucket one: it prefers the center-modality series, which on MR-RATE is the *axial* T1w, so it collapses **planes** — measured on the real test split, T1w CORONAL keeps 16 cases and T2w SAGITTAL 6 |
+| `"one_per_study_deterministic"` | 1, preferring the center-modality series | collapses **modalities** too (measured: 4861 T1w vs 25 FLAIR, 7 T2w, 0 SWI). Only for a single-sequence cohort, or one representative volume per study |
+| `"one_per_study_random"` | 1, redrawn each epoch | training only; full coverage over many epochs, same modality-collapse caveat within any single epoch |
 
 For `"one_per_study_random"`, call `dataset.set_epoch(epoch)` each epoch. All of this Dataset's
 randomness lives in that one call — nothing is drawn from the global RNG inside `__getitem__`, so a
@@ -174,8 +239,10 @@ and yours works too.
 tar, then reads content lazily and caches it. That matters: eager reads measured ~91 studies/s, so a
 90,000-study split would cost 15+ minutes of Dataset construction.
 
-Pick sections with `report_sections=("findings", "impression")`. The full selected text is used every
-call — never truncated, never randomly subsampled.
+Pick sections with `report_sections=(...)`, from `"raw"`, `"clinical_information"`, `"technique"`,
+`"findings"`, `"impression"` (default: `("findings", "impression")`). Each selected section is
+prefixed with its own name; the full selected text is used every call — never truncated, never
+randomly subsampled.
 
 ---
 
@@ -191,7 +258,7 @@ R2VDatasetConfig(archive_access_mode="node_local_cache")  # materialize onto $TM
 Use `node_local_cache` when you want OS page-cache reuse across epochs. It resolves `$TMPDIR` at
 first real use and **fails loudly** if no valid node-local root exists, rather than quietly filling a
 shared workspace. Budget defaults to 200 GB / 20,000 files; override with
-`cache_max_bytes`/`cache_max_files`.
+`cache_max_bytes`/`cache_max_files`. Both settings apply only to `backend="archive"` manifest rows.
 
 Why seeking is safe: every outer archive is a plain uncompressed tar (`getmembers()` on a 592 GB tar
 takes ~1s; reading an arbitrary member 27-50 ms, independent of file size), and per-study inner zips
@@ -213,16 +280,21 @@ Three sources: `shards_parquet` (needs pyarrow, no torch), `data_path_archive` (
 splits CSV), `extracted_dir` (needs torch + nibabel). The two archive sources open no archives at
 all — they build locators from each root's own index, so a full build takes seconds.
 
-**Always pass `--verify-sample`.** It resolves N random rows for real and confirms the filename
-convention still holds; the build aborts if any fail.
+**Keep `--verify-sample` on** (default 20). It resolves N random rows for real and confirms the
+filename convention still holds; the build aborts if any fail.
+
+A manifest records only *where* a series is and *what* it is (modality, plane, split) plus its
+native geometry — never a geometry policy, report source, or sampling mode. Changing
+`geometry_mode`, `series_selection`, or the report store therefore costs nothing; only a change of
+underlying storage needs a rebuild.
 
 ### Two traps worth knowing
 
 **Don't trust the metadata CSV's `array_shape`/`array_spacing_mm` columns.** They come from a plain
 `nib.load()` with no RAS reorientation — raw on-disk axis order, despite once being named
 `ras_array_shape`. Native geometry is always derived independently via `read_native_geometry`, which
-does reorient. Series.parquet's analogous columns are left unread for the same reason (its build code
-isn't available to verify), and resolved lazily instead.
+does reorient and returns `(D, H, W)`. Series.parquet's analogous columns are left unread for the
+same reason (its build code isn't available to verify), and resolved lazily instead.
 
 **`series.parquet` uses abbreviated plane codes** (`axi`/`sag`/`cor`), not `AXIAL`/`SAGITTAL`/
 `CORONAL`. `manifest.py` normalizes them. Without that, every shards row silently falls back to the

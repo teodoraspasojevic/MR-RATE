@@ -385,24 +385,50 @@ other prediction set.
 
 ---
 
-## 7. Implementing a report-to-volume model
+## 7. The report-to-volume model
 
-Two functions in
-[`cli/predict_r2v.py`](../contrastive-pretraining/mrrate_r2v/cli/predict_r2v.py):
+A frozen NV-Generate-MR-Brain denoiser plus a trained report adapter. Two extra stages:
 
-```python
-def load_r2v_model(checkpoint, device):      # return an object with .generate(...)
-def generate_one(model, report_text, case, seed) -> np.ndarray   # [X, Y, Z]
+```
+cli.train_r2v     →  adapter_*.pt        (frozen base + RadBERT; only the adapter learns)
+cli.generate_r2v  →  volume + manifest   (one report, or a whole cohort)
+cli.predict_r2v   →  PREDICTION dir      (a cohort, in the format cli.evaluate scores)
 ```
 
-Everything else already works. Honor two things:
+`slurm/06_train_r2v.sbatch` and `slurm/07_generate_r2v.sbatch` are the runnable versions of both.
+They use `$SIF_IMAGE_TEXT` (`nvidia+redbert.sif`), not the base image, because the base image has no
+transformers.
 
-- **Output on the cohort's grid** (`case.shape`, `case.spacing_mm`). A different grid is allowed but
-  those cases get excluded rather than resized.
-- **Seed from `stable_seed(args.seed, case.case_id)`** so a rerun reproduces the same volumes.
+What is trainable: `context_proj`, the five cross-attention adapters, and `null_context` — **8,080,000
+of 188,580,868 parameters (4.28%)**. `models/adapter.py` asserts that before the first optimizer step
+and refuses to start otherwise; the counts are logged every run.
 
-For training, use the Dataset directly — see the
-[data README](../contrastive-pretraining/mrrate_r2v/data/README.md).
+Three things worth knowing before changing anything here:
+
+- **The loss is NVIDIA's**: `torch.nn.L1Loss()` on the rectified-flow velocity target `x0 − ε`
+  (`diff_model_train.py:328,478`). Not MSE, not EDM-weighted, and no auxiliary report/image
+  alignment term. The adapter earns its keep on the original generative objective.
+- **`scale_factor` comes from the base checkpoint** (0.970450), not from `1/std(z)` of the first
+  batch. Official recomputes it because it trains from scratch; a frozen denoiser cannot follow a
+  rescaled latent space. `--scale-factor recompute` restores the official behaviour.
+- **There is no EMA**, because there is none in the official code — a search for `ema` across
+  `NV-Generate-CTMR/scripts/*.py` and `configs/*.json` returns nothing, and the released checkpoint
+  carries only `unet_state_dict`/`optimizer_state_dict`/`scheduler_state_dict`. Adding one would be
+  inventing a behaviour to preserve, so nothing here does.
+
+Guidance is hierarchical, with the report as an increment on top of NVIDIA's modality term:
+
+```
+D_guided = D_00 + s_modality * (D_m0 − D_00) + s_report * (D_mr − D_m0)
+```
+
+`--report-guidance-scale 0` collapses this to `diff_model_infer.py:207` exactly — that equality is
+asserted numerically in `tests/test_r2v_conditioning.py`, so report guidance cannot silently change
+what the original model does.
+
+For a different text encoder, add it to `TEXT_EMBEDDERS` in
+[`text.py`](../contrastive-pretraining/mrrate_r2v/text.py) and pass `--text-encoder <name>`. The
+trainable projection is built from `embedder.output_dim`, so no other file changes.
 
 ---
 
@@ -438,7 +464,12 @@ contrastive-pretraining/
     models/nvidia.py   the only place vendored NVIDIA code is imported
     models/report_conditioned_unet.py
                        the pretrained diffusion UNet + report cross-attention adapters,
-                       and the strict pretrained-checkpoint loader (no CLI uses it yet)
+                       and the strict pretrained-checkpoint loader
+    models/adapter.py  what is trainable (asserted, not assumed) + the adapter checkpoint format
+    text.py            the replaceable text-encoder seam: RadBERT, a test mock, one registry
+    conditioning.py    modality ids, NVIDIA's own modality dropout, report dropout, CFG
+    training.py        adapter training; mirrors NV-Generate-CTMR/scripts/diff_model_train.py
+    sampling.py        report-to-volume sampling; mirrors scripts/diff_model_infer.py
     cli/               the seven entry points
   scripts/             the contrastive-pretraining pipeline (separate; see its own README)
   slurm/               _common.sh + five numbered job scripts

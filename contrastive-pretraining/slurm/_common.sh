@@ -15,6 +15,10 @@ CP_ROOT="$REPO_ROOT/contrastive-pretraining"
 WORKSPACE="${R2V_WORKSPACE:-/hnvme/workspace/y100dc19-nvidia-mri-brain}"
 DATA_WORKSPACE="${R2V_DATA_WORKSPACE:-/hnvme/workspace/y100dc19-MR-Rate-raw}"
 SIF_IMAGE="$WORKSPACE/containers/nvidia_mri_vae_dmvae.sif"
+# Same image plus transformers/safetensors, for the report-conditioning jobs (the base image has no
+# text-encoder stack). Its torch is >= 2.6, so RadBERT's pytorch_model.bin loads directly.
+SIF_IMAGE_TEXT="$WORKSPACE/containers/nvidia+redbert.sif"
+RADBERT_CHECKPOINT="$WORKSPACE/pretrained/RadBERT-RoBERTa-4m"
 
 # Persistent artifacts. Cohorts and predictions are large -- workspace only, never git or $HOME.
 MANIFEST_CSV="$DATA_WORKSPACE/r2v_manifest/manifest_shards_native.csv"
@@ -62,4 +66,10 @@ run_py() {
 run_sh() {
     [[ -n "${APPTAINER_ARGS+x}" ]] || { echo "run_sh called before setup()" >&2; exit 1; }
     apptainer exec "${APPTAINER_ARGS[@]}" "$SIF_IMAGE" "$@"
+}
+
+# run_py_text <module> [args...] -- like run_py, in the image that also has the text encoder stack.
+run_py_text() {
+    [[ -n "${APPTAINER_ARGS+x}" ]] || { echo "run_py_text called before setup()" >&2; exit 1; }
+    apptainer exec "${APPTAINER_ARGS[@]}" "$SIF_IMAGE_TEXT" python3 -m "$@"
 }
