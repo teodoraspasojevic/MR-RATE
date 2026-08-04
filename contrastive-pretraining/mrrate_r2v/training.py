@@ -108,6 +108,28 @@ def build_scheduler(optimizer, total_steps: int):
     return torch.optim.lr_scheduler.PolynomialLR(optimizer, total_iters=max(int(total_steps), 1), power=2.0)
 
 
+def set_loader_epoch(train_loader, epoch: int) -> None:
+    """Propagate `epoch` to every component of a DataLoader that reseeds on it.
+
+    **The Dataset must come first.** `MRReportToVolumeDataset.set_epoch` *replaces* its `samples`
+    list under `series_selection="one_per_study_random"`, and `GeometryBucketBatchSampler` groups
+    those samples into shape-compatible buckets. Reseeding only the batch sampler -- what this
+    loop did before -- left `one_per_study_random` frozen at its epoch-0 draw for the whole run.
+    Reseeding only the Dataset leaves the sampler's bucket index pointing at the previous epoch's
+    samples, which yields batches spanning two geometry buckets and a `collate_fn_r2v` shape
+    error; the sampler now rebuilds off `dataset.samples_version`, so both orders are safe, but
+    this one also gets the sampler's `__len__` right.
+
+    `sampler` is included for a future `DistributedSampler`, which needs the same call. Anything
+    without a `set_epoch` (a plain list of batches, as `--dry-run` uses) is skipped.
+    """
+    for component in (getattr(train_loader, "dataset", None),
+                      getattr(train_loader, "batch_sampler", None),
+                      getattr(train_loader, "sampler", None)):
+        if hasattr(component, "set_epoch"):
+            component.set_epoch(epoch)
+
+
 def wrap_distributed(model, device):
     """`diff_model_train.py:155-159`. `find_unused_parameters=True` matters more here than there:
     with report dropout, an adapter can go unused within a step."""
@@ -332,8 +354,7 @@ class MRRateAdapterTrainer:
         start = time.time()
         for epoch in range(self.config.n_epochs):
             self.epoch = epoch
-            if hasattr(getattr(train_loader, "batch_sampler", None), "set_epoch"):
-                train_loader.batch_sampler.set_epoch(epoch)
+            set_loader_epoch(train_loader, epoch)
             for batch in train_loader:
                 metrics = self.train_step(batch)
                 history.append(metrics)
@@ -482,6 +503,7 @@ __all__ = [
     "official_target",
     "official_timesteps",
     "resolve_scale_factor",
+    "set_loader_epoch",
     "sha256_file",
     "wrap_distributed",
 ]

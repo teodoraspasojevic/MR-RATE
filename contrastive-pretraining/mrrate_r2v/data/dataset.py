@@ -203,6 +203,7 @@ class MRReportToVolumeDataset(Dataset):
         n_dropped = n_before_report_filter - len(self.rows)
 
         self._epoch = 0
+        self._samples_version = 0
         self.samples = self._select_series(self.rows)
 
         if verbose:
@@ -214,16 +215,31 @@ class MRReportToVolumeDataset(Dataset):
         if self.use_preprocessed:
             self._check_cache_manifest()
 
+    @property
+    def samples_version(self):
+        """Bumped every time `samples` is replaced, so anything holding a derived index into
+        it (`GeometryBucketBatchSampler`'s bucket lists) can tell that it went stale.
+
+        Only `series_selection="one_per_study_random"` ever replaces `samples`; for every
+        other mode this stays 0 for the dataset's whole life.
+        """
+        return self._samples_version
+
     def set_epoch(self, epoch):
         """Reseed `series_selection="one_per_study_random"` for this epoch.
 
         All of this Dataset's randomness lives here, so calling this fixes the whole epoch's
         selection deterministically from (config.seed, epoch). Nothing is drawn from the
         process-global RNG inside `__getitem__`.
+
+        **Call this before iterating the DataLoader, not during.** It rebinds `samples`, so an
+        in-flight iteration would mix two epochs' selections. `training.set_loader_epoch` is the
+        supported way to call it -- it also reseeds the batch sampler, in the right order.
         """
         self._epoch = epoch
         if self.config.series_selection == "one_per_study_random":
             self.samples = self._select_series(self.rows)
+            self._samples_version += 1
 
     def _select_series(self, rows):
         """How many samples a study contributes, and how they are chosen:
@@ -420,43 +436,115 @@ def collate_fn_r2v(batch):
     return out
 
 
+BUCKET_ORDERS = ("interleave", "shuffle")
+
+
 class GeometryBucketBatchSampler(Sampler):
-    """Yields batches from a single (modality, plane) bucket at a time, so
-    `collate_fn_r2v`'s stack always sees matching shapes under
-    geometry_mode="per_modality_plane".
+    """Yields batches drawn from a single (modality, plane) bucket at a time.
 
     Pass as a DataLoader's `batch_sampler` (not `sampler` -- it yields lists of indices).
-    Under geometry_mode="fixed" everything is one bucket, so this degenerates to plain
-    shuffled batching; harmless but unnecessary.
+
+    **Grouping key is the raw `(modality, plane)` pair, not `geometry.bucket_key`.** Shape is a
+    pure function of that pair, so this is always at least as fine as the geometry bucket and
+    therefore always shape-safe for `collate_fn_r2v`. It is *strictly* finer in two places, both
+    deliberate: under geometry_mode="fixed" the geometry key is a single constant, so grouping by
+    it would let a batch mix modalities; and under "per_modality_plane" every pair missing from
+    the FOV table collapses onto `FALLBACK_GEOMETRY_KEY`, which would put e.g. an OBLIQUE T1w and
+    a plane-less SWI in one batch. One batch is now one modality in every configuration.
+
+    **Ordering** (`bucket_order`), both of which use every sample exactly once per epoch and
+    never resample a bucket -- the per-epoch count of each bucket is exactly its natural size:
+
+    - `"interleave"` (default) -- each bucket's batches are spaced evenly across the epoch at its
+      natural rate (see `_interleave`). Consecutive batches therefore carry different modalities,
+      no bucket clumps, and no epoch ends with a single-modality tail. That also makes gradient
+      accumulation accumulate *across* modalities: with bucket-pure micro-batches, drawing the
+      bucket per optimiser step instead would make every update single-modality.
+    - `"shuffle"` -- one flat shuffle over all batches. The pre-2026-08 behaviour; same epoch
+      contents, but nothing stops a run of same-bucket batches.
+
+    Neither mode applies frequency weighting or temperature: a bucket's share of the epoch is
+    its share of the data, and the 2-series SWI SAGITTAL bucket contributes 2 series.
     """
 
-    def __init__(self, dataset, batch_size, drop_last=False, seed=0):
+    def __init__(self, dataset, batch_size, drop_last=False, seed=0, bucket_order="interleave"):
+        if bucket_order not in BUCKET_ORDERS:
+            raise ValueError(f"Unknown bucket_order '{bucket_order}'. Choose from: {BUCKET_ORDERS}")
         self.dataset = dataset
-        self.batch_size = batch_size
+        self.batch_size = int(batch_size)
         self.drop_last = drop_last
         self.seed = seed
+        self.bucket_order = bucket_order
         self.epoch = 0
-        self.buckets = {}
-        for i, sample in enumerate(dataset.samples):
-            key = dataset.geometry.bucket_key(sample.modality, sample.plane)
-            self.buckets.setdefault(key, []).append(i)
+        self._buckets = None
+        self._buckets_version = None
+
+    @property
+    def buckets(self):
+        """{(modality, plane): [dataset index, ...]}, rebuilt whenever `dataset.samples` is
+        replaced. Built lazily rather than in `__init__` because
+        `series_selection="one_per_study_random"` redraws `samples` on every `set_epoch`: a
+        snapshot taken at construction goes stale on the first epoch boundary and then hands out
+        batches spanning two buckets, which `collate_fn_r2v` rejects on shape.
+        """
+        version = getattr(self.dataset, "samples_version", None)
+        if self._buckets is None or version is None or version != self._buckets_version:
+            buckets = {}
+            for i, sample in enumerate(self.dataset.samples):
+                buckets.setdefault((sample.modality, sample.plane), []).append(i)
+            self._buckets, self._buckets_version = buckets, version
+        return self._buckets
 
     def set_epoch(self, epoch):
         self.epoch = epoch
 
-    def __iter__(self):
-        rng = random.Random(f"{self.seed}:{self.epoch}")
-        batches = []
-        for indices in self.buckets.values():
+    def _batches_per_bucket(self, rng):
+        """{bucket: [batch, ...]} -- every index used exactly once, `drop_last` aside."""
+        per_bucket = {}
+        for key, indices in self.buckets.items():
             indices = list(indices)
             rng.shuffle(indices)
-            for start in range(0, len(indices), self.batch_size):
-                chunk = indices[start:start + self.batch_size]
-                if len(chunk) < self.batch_size and self.drop_last:
-                    continue
-                batches.append(chunk)
-        rng.shuffle(batches)
-        return iter(batches)
+            batches = [indices[s:s + self.batch_size] for s in range(0, len(indices), self.batch_size)]
+            if self.drop_last and batches and len(batches[-1]) < self.batch_size:
+                batches.pop()
+            if batches:
+                per_bucket[key] = batches
+        return per_bucket
+
+    @staticmethod
+    def _interleave(per_bucket, rng):
+        """Stride-schedule the buckets: a bucket holding `n` of the epoch's `total` batches claims
+        virtual times `(k + phase) * total / n`, and batches are emitted in virtual-time order.
+
+        So a bucket's batches land evenly spaced across the whole epoch, at its natural rate --
+        one batch every `total / n`. Two consecutive batches share a bucket only where the
+        pigeonhole forces it (a bucket holding more than about half the epoch); on MR-RATE's
+        train split the largest bucket is 16% of batches, so consecutive batches essentially
+        always differ in modality. The random per-bucket `phase` is the only stochastic part, and
+        it is what stops every epoch from replaying an identical bucket sequence.
+
+        The rejected alternative was a greedy draw weighted by *remaining* batches that simply
+        banned repeating the previous bucket. Measured: with two buckets at 3:1 it forces strict
+        alternation, draining the smaller bucket at twice its natural rate and leaving the epoch's
+        whole tail single-modality. Spacing by construction beats constraining after the fact.
+        """
+        total = sum(len(batches) for batches in per_bucket.values())
+        schedule = []
+        for batches in per_bucket.values():
+            stride = total / len(batches)
+            phase = rng.random()
+            schedule.extend(((k + phase) * stride, batch) for k, batch in enumerate(batches))
+        schedule.sort(key=lambda item: item[0])
+        return [batch for _virtual_time, batch in schedule]
+
+    def __iter__(self):
+        rng = random.Random(f"{self.seed}:{self.epoch}")
+        per_bucket = self._batches_per_bucket(rng)
+        if self.bucket_order == "shuffle":
+            batches = [b for bucket_batches in per_bucket.values() for b in bucket_batches]
+            rng.shuffle(batches)
+            return iter(batches)
+        return iter(self._interleave(per_bucket, rng))
 
     def __len__(self):
         n = 0

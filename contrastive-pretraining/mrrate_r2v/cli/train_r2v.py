@@ -49,6 +49,10 @@ def parse_args(argv=None):
     data.add_argument("--split", default="train")
     data.add_argument("--report-sections", nargs="+", default=["findings", "impression"])
     data.add_argument("--geometry-mode", default="per_modality_plane", choices=["per_modality_plane", "fixed"])
+    data.add_argument("--bucket-order", default="interleave", choices=["interleave", "shuffle"],
+                      help="'interleave': consecutive batches carry different modalities; "
+                           "'shuffle': one flat shuffle. Both use every series exactly once per "
+                           "epoch, with no frequency weighting")
     data.add_argument("--num-workers", type=int, default=4)
     data.add_argument("--dry-run", action="store_true",
                      help="synthetic latents and reports; no manifest, VAE or dataset needed")
@@ -132,6 +136,10 @@ def build_dataloader(args, log):
         split=args.split,
         report_sections=tuple(args.report_sections),
         geometry_mode=args.geometry_mode,
+        # "all": every eligible series is a training sample, so a study's report is paired with
+        # each of its ~7 series. That contrast -- one report, several modalities, distinguished
+        # only by class_labels/spacing_tensor -- is what stops the report adapter from absorbing
+        # modality. The one-per-study modes exist for cohort construction, not for training.
         series_selection="all",
         dtype=torch.float32,
         seed=args.seed,
@@ -140,7 +148,10 @@ def build_dataloader(args, log):
         str(args.manifest), ShardReportStore(str(args.report_index)), config=config
     )
     log.info("dataset: %d (report, volume) pairs in split '%s'", len(dataset), args.split)
-    sampler = GeometryBucketBatchSampler(dataset, batch_size=args.batch_size, drop_last=True, seed=args.seed)
+    sampler = GeometryBucketBatchSampler(dataset, batch_size=args.batch_size, drop_last=True,
+                                         seed=args.seed, bucket_order=args.bucket_order)
+    log.info("batching: %d batches/epoch over %d (modality, plane) buckets, order=%s",
+             len(sampler), len(sampler.buckets), args.bucket_order)
     return DataLoader(dataset, batch_sampler=sampler, num_workers=args.num_workers, collate_fn=collate_fn_r2v)
 
 

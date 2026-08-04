@@ -21,6 +21,7 @@ import importlib
 _EXPORTS = {
     # dataset.py (torch)
     "ARCHIVE_ACCESS_MODES": "dataset",
+    "BUCKET_ORDERS": "dataset",
     "SERIES_SELECTION_MODES": "dataset",
     "GeometryBucketBatchSampler": "dataset",
     "MRReportToVolumeDataset": "dataset",

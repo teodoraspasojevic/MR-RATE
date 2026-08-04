@@ -177,6 +177,42 @@ Tighter fit per anatomy, but:
   a raw `torch.stack` traceback);
 - numbers from it are not comparable with a fixed-mode run.
 
+### Batching: `GeometryBucketBatchSampler`
+
+**One batch is one `(modality, plane)` bucket, in every geometry mode.** The sampler groups on the
+raw pair rather than on `geometry.bucket_key`, which is always at least as fine — so it stays
+shape-safe for `collate_fn_r2v` — and is strictly finer in the two places where the geometry key
+would let a batch mix modalities: `geometry_mode="fixed"` (one key for everything) and the
+`FALLBACK_GEOMETRY_KEY` collapse under `per_modality_plane`.
+
+Enforcement lives in the sampler, not in `collate_fn_r2v`. The collate function only *checks*
+shapes, so a plain `DataLoader(batch_size=N)` over a fixed-geometry dataset stays legal.
+
+`bucket_order` picks the order the buckets come out in. Both settings use every series exactly
+once per epoch, apply no frequency weighting or temperature, and never resample a bucket — a
+bucket's share of the epoch is its share of the data, so the train split's 2-series
+`(SWI, SAGITTAL)` bucket contributes 2 series:
+
+- **`"interleave"`** (default) — stride scheduling: a bucket holding `n` of the epoch's `total`
+  batches claims virtual times `(k + phase) * total / n`, and batches are emitted in virtual-time
+  order. Each bucket therefore lands evenly spaced across the whole epoch at its natural rate.
+  Measured on the real train split (287,765 batches at `batch_size=2`): **1–2 consecutive
+  same-bucket batches**, i.e. 0.0003%, and every bucket splits exactly evenly across epoch
+  quarters. Consecutive batches differing in bucket also means gradient accumulation accumulates
+  *across* modalities — with bucket-pure micro-batches, drawing per optimiser step instead would
+  make every update single-modality.
+- **`"shuffle"`** — one flat shuffle over all batches (the pre-2026-08 behaviour). Same epoch
+  contents; nothing prevents a run of same-bucket batches.
+
+A greedy "draw proportional to remaining, never repeat the previous bucket" was tried and
+rejected: with two buckets at 3:1 the no-repeat rule forces strict alternation, draining the
+smaller bucket at twice its natural rate and leaving the epoch's whole tail single-modality.
+
+The bucket index is rebuilt whenever `dataset.samples_version` changes, so
+`series_selection="one_per_study_random"` — which replaces `samples` on every `set_epoch` — cannot
+leave the sampler indexing the previous epoch's samples. Use `training.set_loader_epoch(loader,
+epoch)` to advance the epoch; it reseeds the dataset, batch sampler and sampler together.
+
 **`"fixed"`** — one shape and spacing for everything, from `fixed_target_shape` /
 `fixed_target_spacing_mm`. Batching just works and volumes share one grid, but it puts every
 bucket on the same FOV regardless of anatomy. Keep it for a deliberate single-grid study; it is

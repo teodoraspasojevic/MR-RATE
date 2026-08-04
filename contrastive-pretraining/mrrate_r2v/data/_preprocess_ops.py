@@ -9,12 +9,25 @@ Importing this pulls in torch and nibabel. Keep it out of module-level imports i
 that must stay lightweight (`manifest.py` imports it lazily, inside functions, for exactly
 that reason -- see its docstring).
 """
+import os
 import sys
 from pathlib import Path
 
-_SCRIPTS_DIR = Path(__file__).resolve().parents[2] / "scripts"
-if str(_SCRIPTS_DIR) not in sys.path:
-    sys.path.insert(0, str(_SCRIPTS_DIR))
+# `data` is a common enough top-level name that another package can win the import. cv2 appends
+# its own directory to sys.path when imported (monai imports it), and cv2/data/ is a package --
+# so anything that imports monai before this module could otherwise get cv2's `data` here. Take
+# the front of sys.path unconditionally rather than only when scripts/ is absent: being present
+# somewhere in sys.path is not the same as being ahead of the shadowing entry.
+_SCRIPTS_DIR = str(Path(__file__).resolve().parents[2] / "scripts")
+while _SCRIPTS_DIR in sys.path:
+    sys.path.remove(_SCRIPTS_DIR)
+sys.path.insert(0, _SCRIPTS_DIR)
+
+_shadowing = sys.modules.get("data")
+if _shadowing is not None and os.path.dirname(getattr(_shadowing, "__file__", "") or "") != _SCRIPTS_DIR:
+    # Only ever drops a *wrongly* bound top-level `data`; a package's own `pkg.data` is registered
+    # under its dotted name and is untouched.
+    del sys.modules["data"]
 
 from data import (  # noqa: E402
     NORMALIZERS,

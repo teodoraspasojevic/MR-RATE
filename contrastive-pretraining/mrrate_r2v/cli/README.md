@@ -204,10 +204,22 @@ torchrun --nproc_per_node=4 -m mrrate_r2v.cli.train_r2v --num-gpus 4 ...  # same
 | `--split` | `train` | which split to train on |
 | `--report-sections` | `findings impression` | concatenated into the conditioning text |
 | `--geometry-mode` | `per_modality_plane` | as in `preprocess`; per-bucket FOVs |
+| `--bucket-order` | `interleave` | `interleave` = each `(modality, plane)` bucket spread evenly across the epoch, so consecutive batches carry different modalities \| `shuffle` = one flat shuffle |
 | `--num-workers` | `4` | DataLoader workers |
 | `--dry-run` | off | synthetic latents + fabricated reports; no manifest, VAE or GPU needed |
 
 ¹ required unless `--dry-run`.
+
+Series selection is fixed at `"all"` — every eligible series is a training sample, so a study's
+report is paired with each of its ~7 series. That contrast (one report, several modalities,
+distinguished only by `class_labels`/`spacing_tensor`) is what stops the report adapter from
+absorbing modality; the one-per-study modes exist for cohort construction, not training. On the
+real train split that is **575,536 series over 82,233 studies**, 7.0 series per study.
+
+One batch is always one `(modality, plane)` bucket, in either geometry mode — see
+[`../data/README.md`](../data/README.md#batching-geometrybucketbatchsampler). No frequency
+weighting is applied in either `--bucket-order`: one epoch is one pass over every series, and a
+bucket's share of it is its share of the data.
 
 **model**
 
