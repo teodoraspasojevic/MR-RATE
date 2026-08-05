@@ -192,6 +192,9 @@ def save_adapter_checkpoint(
     scaler=None,
     loss: float | None = None,
     rng_state: dict | None = None,
+    optimizer_step: int | None = None,
+    best_metrics: dict | None = None,
+    validation: dict | None = None,
 ) -> Path:
     """Adapter-only checkpoint. Deliberately does *not* contain NVIDIA's 180M base weights: they are
     unchanged by construction, so storing them would make every checkpoint 700 MB of a file the
@@ -201,8 +204,13 @@ def save_adapter_checkpoint(
         "format": ADAPTER_CHECKPOINT_FORMAT,
         "adapter_state_dict": adapter_state_dict(model),
         "step": int(step),
+        # The optimizer step is the run's real clock (every interval and every W&B x-axis uses it);
+        # `step` stays the micro-step count so an older checkpoint still resumes.
+        "optimizer_step": int(optimizer_step if optimizer_step is not None else step),
         "epoch": int(epoch),
         "loss": loss,
+        "best_metrics": dict(best_metrics or {}),
+        "validation": validation,
         "scale_factor": float(scale_factor) if scale_factor is not None else None,
         "config": config,
         "base_checkpoint": base_checkpoint,
@@ -217,14 +225,62 @@ def save_adapter_checkpoint(
     return path
 
 
+def assert_conditioning_compatible(payload: dict, text_encoder: dict | None) -> None:
+    """Refuse an adapter trained under a different conditioning configuration.
+
+    Checked before any tensor is loaded, because the failure mode this prevents is *silent*: a
+    768-wide pooled adapter and a 2560-wide fused adapter have different `context_proj` shapes and
+    would be caught by the shape check, but two configurations that share a width (`cxr_bert_cls`
+    and `radbert_mean` are both 768x1) load cleanly and generate confident nonsense -- the
+    projection was fitted to a different encoder's embedding space.
+
+    The comparison is on the recorded identity, not on the checkpoint filename.
+    """
+    if not text_encoder:
+        return
+    stored = payload.get("text_encoder") or {}
+    if not stored:
+        log.warning("checkpoint records no text-encoder identity; cannot verify conditioning")
+        return
+
+    def key(identity: dict) -> tuple:
+        encoder = identity.get("encoder") or {}
+        return (
+            identity.get("kind"),
+            identity.get("pooling"),
+            int(identity.get("output_dim") or 0),
+            int(identity.get("sequence_length") or 1),
+            tuple(identity.get("sections") or ()),
+            tuple(identity.get("encoder_order") or ()),
+            tuple(identity.get("encoder_dims") or ()),
+            # single-encoder configurations carry their checkpoint one level down
+            encoder.get("name") or identity.get("name"),
+            encoder.get("hf_repo") or identity.get("hf_repo"),
+        )
+
+    if key(stored) != key(text_encoder):
+        raise RuntimeError(
+            "adapter checkpoint was trained under a different conditioning configuration.\n"
+            f"  checkpoint: {key(stored)}\n"
+            f"  requested:  {key(text_encoder)}\n"
+            "Load it with the configuration it was trained under (the checkpoint's "
+            "config['conditioning_name'] names it), or pass allow_conditioning_mismatch=True for "
+            "a deliberate transfer experiment."
+        )
+
+
 def load_adapter_checkpoint(
     path, model, *, base_checkpoint_sha256: str | None = None, allow_base_mismatch: bool = False,
-    strict: bool = True,
+    strict: bool = True, text_encoder: dict | None = None,
+    allow_conditioning_mismatch: bool = False,
 ) -> dict:
     """Load an adapter checkpoint onto a model whose base weights are already loaded.
 
     `strict=True` (the default) means every adapter tensor in the model must be present in the file
     and vice versa -- a partially-trained adapter loaded silently would produce plausible garbage.
+
+    `text_encoder` is the identity dict of the live embedder. Supplying it enables the conditioning
+    compatibility check; omitting it skips the check rather than guessing.
     """
     payload = torch.load(str(path), map_location="cpu", weights_only=False)
     if payload.get("format") != ADAPTER_CHECKPOINT_FORMAT:
@@ -242,6 +298,9 @@ def load_adapter_checkpoint(
         if not allow_base_mismatch:
             raise RuntimeError(message)
         log.warning("%s (continuing: allow_base_mismatch=True)", message)
+
+    if not allow_conditioning_mismatch:
+        assert_conditioning_compatible(payload, text_encoder)
 
     expected = adapter_parameter_names(model)
     provided = set(payload["adapter_state_dict"])

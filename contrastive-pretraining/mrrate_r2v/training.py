@@ -53,6 +53,7 @@ from monai.networks.schedulers.ddpm import DDPMPredictionType
 from torch.amp import GradScaler, autocast
 
 from .conditioning import ConditioningConfig, ModalityEncoder, augment_modality_label, sample_report_drop_mask
+from .text import encode_reports
 from .models.adapter import (
     assert_only_adapter_trainable,
     freeze_to_adapter_only,
@@ -195,9 +196,19 @@ class TrainingConfig:
     amp: bool = True
     seed: int = 0
     log_every: int = 1
+    # All three count **optimizer** steps, not micro-steps, so their meaning does not change with
+    # grad_accumulation_steps. `self.step` remains the micro-step counter for resume compatibility.
     save_every_steps: Optional[int] = None
     validate_every_steps: Optional[int] = None
+    validate_full_every_steps: Optional[int] = None
+    validate_at_end: bool = True
+    validate_full_at_end: bool = False
     save_format: str = "adapter"  # adapter | full | both
+    #: How many periodic step checkpoints to keep. `last`/`best_*` are never counted or deleted.
+    keep_last_n: Optional[int] = 3
+    #: Recorded in the checkpoint so a resume or an inference run can verify what it is loading.
+    conditioning_name: Optional[str] = None
+    report_format: Optional[str] = None
     conditioning: ConditioningConfig = field(default_factory=ConditioningConfig)
 
     def __post_init__(self) -> None:
@@ -205,6 +216,8 @@ class TrainingConfig:
             raise ValueError(f"save_format must be adapter|full|both, got {self.save_format!r}")
         if self.grad_accumulation_steps < 1:
             raise ValueError("grad_accumulation_steps must be >= 1")
+        if self.keep_last_n is not None and self.keep_last_n < 1:
+            raise ValueError("keep_last_n must be >= 1 or None (keep everything)")
 
 
 class MRRateAdapterTrainer:
@@ -223,6 +236,7 @@ class MRRateAdapterTrainer:
         num_train_timesteps: int = 1000,
         modality_encoder: Optional[ModalityEncoder] = None,
         local_rank: int = 0,
+        wandb_run=None,
     ) -> None:
         self.unet = unet
         self.text_embedder = text_embedder
@@ -235,6 +249,9 @@ class MRRateAdapterTrainer:
         self.num_train_timesteps = num_train_timesteps
         self.modality_encoder = modality_encoder or ModalityEncoder()
         self.local_rank = local_rank
+        #: Rank 0 only. A `WandbRun` that failed to init is already a no-op, so this needs no
+        #: further guarding beyond the rank check in `_log_metrics`.
+        self.wandb_run = wandb_run
 
         torch.set_float32_matmul_precision("highest")  # diff_model_train.py:480
         torch.manual_seed(config.seed)
@@ -248,8 +265,12 @@ class MRRateAdapterTrainer:
         # The gate that makes "only adapters train" a checked fact rather than an intention.
         assert_only_adapter_trainable(unet, self.optimizer, text_embedder)
         log.info("adapter training: %s", self.freeze_report.format())
-        self.step = 0
+        self.step = 0            # micro-steps (one per forward/backward)
+        self.optimizer_step = 0  # optimizer steps -- what every interval and every log is keyed on
         self.epoch = 0
+        # Lower-is-better and higher-is-better tracked separately, both persisted, so a resumed run
+        # does not overwrite a better checkpoint with a worse one on its first validation.
+        self.best_metrics: dict = {"fvd": None, "fid_2p5d": None, "ssim": None}
         # Report dropout draws from its own generator so a resumed run reproduces the same drops
         # regardless of what else consumed the global RNG.
         self.dropout_generator = torch.Generator().manual_seed(config.seed + 12345)
@@ -272,7 +293,9 @@ class MRRateAdapterTrainer:
         modality = self.modality_encoder.encode(batch["modality"], device=self.device)
         modality = augment_modality_label(modality, prob=self.config.conditioning.modality_dropout_probability)
 
-        conditioning = self.text_embedder.encode(batch["report_text"], self.device)
+        # The shared seam: dispatches to per-section encoding for a sectioned-fusion embedder and
+        # to plain `report_text` otherwise, so training/validation/sampling cannot diverge.
+        conditioning = encode_reports(self.text_embedder, batch, self.device)
         drop = sample_report_drop_mask(
             latents.shape[0], self.config.conditioning.report_dropout_probability,
             device=self.device, generator=self.dropout_generator,
@@ -334,6 +357,7 @@ class MRRateAdapterTrainer:
             if self.lr_scheduler is not None:
                 self.lr_scheduler.step()
             stepped = True
+            self.optimizer_step += 1
 
         self.step += 1
         return {
@@ -346,43 +370,138 @@ class MRRateAdapterTrainer:
 
     # -- loop ----------------------------------------------------------------------------
 
+    def _log_metrics(self, data: dict, step: int) -> None:
+        """Rank 0 only, one W&B step definition: the optimizer step.
+
+        Micro-steps are never used as the x-axis. Mixing the two is how a `grad_accumulation_steps`
+        change silently rescales every curve in a project, making two runs incomparable.
+        """
+        if self.local_rank == 0 and self.wandb_run is not None:
+            self.wandb_run.log(data, step=step)
+
+    def _prune_checkpoints(self) -> None:
+        """Keep the newest `keep_last_n` periodic step checkpoints. `adapter_last.pt` and the
+        `adapter_best_*.pt` files are matched by a different glob and so are never deleted --
+        retention must not be able to remove the two things a run exists to produce."""
+        if self.config.keep_last_n is None or self.local_rank != 0:
+            return
+        periodic = sorted(self.output_dir.glob("adapter_step*.pt"))
+        for stale in periodic[: max(0, len(periodic) - self.config.keep_last_n)]:
+            for path in (stale, stale.with_name(stale.stem + "_full_unet.pt")):
+                if path.exists():
+                    path.unlink()
+                    log.info("retention: removed %s", path.name)
+
+    def _maybe_save_best(self, validation: dict) -> list:
+        """Update the best-metric checkpoints. Lower FID is better, higher alignment is better."""
+        saved = []
+        if self.local_rank != 0:
+            return saved
+        # One entry per headline validation metric, with its direction stated rather than implied.
+        # FVD and 2.5D FID are distributional distances (lower better, optimum 0); SSIM is a paired
+        # similarity (higher better, max 1).
+        candidates = [
+            ("fvd", "val/fvd", min),
+            ("fid_2p5d", "val/fid_2p5d", min),
+            ("ssim", "val/ssim", max),
+        ]
+        for key, metric_name, better in candidates:
+            value = validation.get(metric_name)
+            if value is None or not isinstance(value, (int, float)) or value != value:  # NaN
+                continue
+            current = self.best_metrics.get(key)
+            if current is None or better(value, current) == value:
+                self.best_metrics[key] = float(value)
+                path = self.save(self.output_dir / f"adapter_best_{key}.pt",
+                                 loss=None, validation=validation)
+                log.info("new best %s = %.5f -> %s", key, value, getattr(path, "name", path))
+                saved.append(key)
+        return saved
+
+    def validate_now(self, validate, full: bool = False) -> dict:
+        """Run validation and act on it. Every rank calls this -- `validate` is responsible for its
+        own sharding and gathering -- but only rank 0 writes checkpoints or logs."""
+        validation = validate(self, self.optimizer_step, full)
+        self._log_metrics({k: v for k, v in validation.items() if isinstance(v, (int, float))},
+                          step=self.optimizer_step)
+        self._maybe_save_best(validation)
+        return validation
+
     def fit(self, train_loader, validate=None) -> dict:
-        total_steps = self.config.max_steps or int(self.config.n_epochs * max(len(train_loader), 1))
+        """`validate(trainer, optimizer_step, full) -> dict`, or None to skip validation.
+
+        `ValidationRunner.run` matches that signature. It is passed in rather than constructed
+        here so the trainer keeps no dependency on the sampler or the feature extractor.
+        """
+        micro_per_epoch = max(len(train_loader), 1)
+        total_steps = self.config.max_steps or int(self.config.n_epochs * micro_per_epoch)
         if self.lr_scheduler is None:
             self.lr_scheduler = build_scheduler(self.optimizer, total_steps)
-        history = []
+        history, validations = [], []
         start = time.time()
+        # Intervals fire on the optimizer step *transition*, so an interval is never missed and
+        # never fires twice for one optimizer step (which `step % N` on micro-steps would do
+        # whenever grad_accumulation_steps > 1).
+        last_validated = last_saved = last_full = 0
         for epoch in range(self.config.n_epochs):
             self.epoch = epoch
             set_loader_epoch(train_loader, epoch)
             for batch in train_loader:
                 metrics = self.train_step(batch)
                 history.append(metrics)
-                if self.local_rank == 0 and self.step % max(self.config.log_every, 1) == 0:
-                    log.info(
-                        "epoch %d step %d/%s loss %.5f lr %.3e dropped %d",
-                        epoch + 1, self.step, total_steps, metrics["loss"], metrics["lr"],
-                        metrics["n_dropped_reports"],
-                    )
-                if (self.config.validate_every_steps and validate is not None
-                        and self.step % self.config.validate_every_steps == 0):
-                    validation = validate(self)
-                    log.info("validation at step %d: %s", self.step, validation)
-                if (self.config.save_every_steps and self.local_rank == 0
-                        and self.step % self.config.save_every_steps == 0):
-                    self.save(self.output_dir / f"adapter_step{self.step:07d}.pt", loss=metrics["loss"])
+                if metrics["stepped"]:
+                    if self.optimizer_step % max(self.config.log_every, 1) == 0:
+                        if self.local_rank == 0:
+                            log.info(
+                                "epoch %d opt-step %d (micro %d/%s) loss %.5f lr %.3e dropped %d",
+                                epoch + 1, self.optimizer_step, self.step, total_steps,
+                                metrics["loss"], metrics["lr"], metrics["n_dropped_reports"],
+                            )
+                        self._log_metrics({"train/loss": metrics["loss"],
+                                           "train/lr": metrics["lr"],
+                                           "train/epoch": epoch + 1,
+                                           "train/dropped_reports": metrics["n_dropped_reports"]},
+                                          step=self.optimizer_step)
+
+                    interval = self.config.validate_every_steps
+                    if (interval and validate is not None
+                            and self.optimizer_step // interval > last_validated // interval):
+                        last_validated = self.optimizer_step
+                        full_interval = self.config.validate_full_every_steps
+                        full = bool(full_interval
+                                    and self.optimizer_step // full_interval > last_full // full_interval)
+                        if full:
+                            last_full = self.optimizer_step
+                        validations.append(self.validate_now(validate, full=full))
+
+                    save_interval = self.config.save_every_steps
+                    if (save_interval and self.local_rank == 0
+                            and self.optimizer_step // save_interval > last_saved // save_interval):
+                        last_saved = self.optimizer_step
+                        self.save(self.output_dir / f"adapter_step{self.optimizer_step:07d}.pt",
+                                  loss=metrics["loss"])
+                        self._prune_checkpoints()
+
                 if self.config.max_steps and self.step >= self.config.max_steps:
                     break
             if self.config.max_steps and self.step >= self.config.max_steps:
                 break
+
+        if self.config.validate_at_end and validate is not None:
+            validations.append(self.validate_now(validate, full=self.config.validate_full_at_end))
         if self.local_rank == 0:
-            self.save(self.output_dir / "adapter_last.pt", loss=history[-1]["loss"] if history else None)
+            self.save(self.output_dir / "adapter_last.pt",
+                      loss=history[-1]["loss"] if history else None,
+                      validation=validations[-1] if validations else None)
         return {
             "steps": self.step,
+            "optimizer_steps": self.optimizer_step,
             "epochs": self.epoch + 1,
             "seconds": time.time() - start,
             "final_loss": history[-1]["loss"] if history else None,
             "mean_loss": sum(h["loss"] for h in history) / len(history) if history else None,
+            "best_metrics": dict(self.best_metrics),
+            "validations": validations,
             "history": history,
         }
 
@@ -405,10 +524,15 @@ class MRRateAdapterTrainer:
                 "seed": self.config.seed,
             },
             "conditioning": vars(self.config.conditioning),
+            # What text the model actually saw. Without these two an inference run cannot tell
+            # whether the adapter expects `impression_findings` or unformatted report text -- and
+            # feeding it the wrong one is silent, not an error.
+            "conditioning_name": self.config.conditioning_name,
+            "report_format": self.config.report_format,
             "num_train_timesteps": self.num_train_timesteps,
         }
 
-    def save(self, path, loss: float | None = None) -> Path:
+    def save(self, path, loss: float | None = None, validation: dict | None = None) -> Path:
         model = self._unwrapped()
         scale_factor = self.latent_encoder.scale_factor if self.latent_encoder else None
         written = None
@@ -421,9 +545,14 @@ class MRRateAdapterTrainer:
                 scale_factor=scale_factor,
                 optimizer=self.optimizer, lr_scheduler=self.lr_scheduler, scaler=self.scaler,
                 loss=loss,
+                optimizer_step=self.optimizer_step,
+                best_metrics=dict(self.best_metrics),
+                validation=validation,
                 rng_state={
                     "torch": torch.get_rng_state(),
                     "dropout_generator": self.dropout_generator.get_state(),
+                    "numpy": None,
+                    "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
                 },
             )
             log.info("saved adapter checkpoint %s", written)
@@ -443,6 +572,10 @@ class MRRateAdapterTrainer:
         payload = load_adapter_checkpoint(
             path, self._unwrapped(),
             base_checkpoint_sha256=self.base_checkpoint.get("sha256"),
+            # Refuses a checkpoint trained under a different conditioning configuration, including
+            # the two that share a width (cxr_bert_cls and radbert_mean are both 768x1) and would
+            # otherwise load cleanly onto the wrong embedding space.
+            text_encoder=dict(self.text_embedder.identity),
         )
         if payload.get("optimizer_state_dict"):
             self.optimizer.load_state_dict(payload["optimizer_state_dict"])
@@ -457,9 +590,20 @@ class MRRateAdapterTrainer:
             torch.set_rng_state(rng["torch"].cpu() if hasattr(rng["torch"], "cpu") else rng["torch"])
         if "dropout_generator" in rng:
             self.dropout_generator.set_state(rng["dropout_generator"])
+        if "cuda" in rng and rng["cuda"] and torch.cuda.is_available():
+            try:
+                torch.cuda.set_rng_state_all(rng["cuda"])
+            except Exception as exc:  # noqa: BLE001 -- a different device count is not fatal
+                log.warning("could not restore CUDA RNG state (%s); continuing", exc)
         self.step = int(payload.get("step", 0))
+        self.optimizer_step = int(payload.get("optimizer_step", self.step))
         self.epoch = int(payload.get("epoch", 0))
-        log.info("resumed from %s at step %d epoch %d", path, self.step, self.epoch)
+        stored_best = payload.get("best_metrics") or {}
+        # Carried forward so the first validation after a resume cannot overwrite a better
+        # checkpoint with a worse one just because this process has not seen a score yet.
+        self.best_metrics.update({k: v for k, v in stored_best.items() if v is not None})
+        log.info("resumed from %s at optimizer step %d (micro %d) epoch %d, best=%s",
+                 path, self.optimizer_step, self.step, self.epoch, self.best_metrics)
         return payload
 
 

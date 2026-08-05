@@ -51,6 +51,26 @@ class WandbRun:
         except Exception as e:  # noqa: BLE001
             log.warning("W&B log_artifact() failed: %s", e)
 
+    def log_html(self, key: str, html: str, step: int | None = None) -> None:
+        """Log a self-contained HTML panel (`wandb.Html`).
+
+        `inject=False` matters: W&B otherwise wraps the payload in its own stylesheet, which
+        overrides the panel's dark-background rules and can leave the slider unstyled and the
+        images mis-sized.
+
+        The key is stable across validation steps for a given case, so W&B's own step selector
+        becomes the "which validation step" control and the panel's slider is the "which slice"
+        control -- the two axes the panel needs, without a custom W&B plugin.
+        """
+        if not self.enabled:
+            return
+        try:
+            import wandb
+
+            self.run.log({key: wandb.Html(html, inject=False)}, step=step)
+        except Exception as e:  # noqa: BLE001
+            log.warning("W&B log_html() failed: %s", e)
+
     def finish(self) -> dict:
         summary = {"wandb_mode_requested": self.mode, "enabled": self.enabled, "run_id": None, "run_url": None, "offline_sync_hint": self.offline_sync_hint}
         if self.enabled:

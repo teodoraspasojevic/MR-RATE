@@ -37,6 +37,9 @@ VAE_CHECKPOINT="$WORKSPACE/models/autoencoder_v1.pt"
 # NVIDIA stores this path relative to cwd in its env config, so it must be given absolutely.
 UNET_CHECKPOINT="$WORKSPACE/models/diff_unet_3d_rflow-mr-brain_v0.pt"
 MEDICALNET_CHECKPOINT="$WORKSPACE/pretrained/medicalnet/resnet_10_23dataset_statedict.pth"
+# torchvision's r3d_18 Kinetics-400 weights, for the FVD-adaptation feature extractor. Staged here
+# rather than in $HOME/.cache so the containers see it and no job depends on a download.
+TORCH_HOME_DIR="$WORKSPACE/pretrained/torchhub"
 
 preflight() {
     local fail=0 p
@@ -59,7 +62,19 @@ setup() {
         # --pwd + PYTHONPATH make `python3 -m mrrate_r2v.cli.*` resolvable regardless of where
         # the job was submitted from, instead of relying on apptainer inheriting the host cwd.
         --pwd "$CP_ROOT"
-        --env "PYTHONPATH=$CP_ROOT")
+        --env "PYTHONPATH=$CP_ROOT"
+        # The encoder zoo's default checkpoint root. Passed explicitly so it follows $WORKSPACE
+        # rather than the hardcoded fallback in textenc/encoders.py -- otherwise overriding
+        # R2V_WORKSPACE would move every path in this file except where encoders are loaded from.
+        --env "MRRATE_PRETRAINED_DIR=$PRETRAINED_DIR"
+        --env "TORCH_HOME=$TORCH_HOME_DIR")
+    # W&B, only when the job asked for it. Credentials are never set here: wandb reads
+    # WANDB_API_KEY or ~/.netrc (which is bind-mounted with $HOME), so nothing is hardcoded and a
+    # job without credentials degrades to a no-op rather than failing.
+    local var
+    for var in WANDB_API_KEY WANDB_MODE WANDB_DIR WANDB_CACHE_DIR; do
+        [[ -n "${!var:-}" ]] && APPTAINER_ARGS+=(--env "$var=${!var}")
+    done
     cd "$CP_ROOT"
 }
 

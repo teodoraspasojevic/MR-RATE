@@ -18,13 +18,18 @@ from .formats import (  # noqa: F401
 )
 
 __all__ = [
+    "CONDITIONING_CONFIGS",
+    "DEFAULT_CONDITIONING",
     "DEFAULT_REPORT_FORMAT",
     "ENCODER_SPECS",
     "METADATA_DEPENDENT_FORMATS",
     "REPORT_FORMATS",
     "MultiEncoderEmbedder",
+    "PooledEmbedder",
     "ProjectedConcatFusion",
+    "SectionedFusionEmbedder",
     "available_encoders",
+    "build_conditioning",
     "build_encoder",
     "format_report",
 ]
@@ -36,6 +41,11 @@ _LAZY = {
     "HFTextEncoder": ("encoders", "HFTextEncoder"),
     "MultiEncoderEmbedder": ("fusion", "MultiEncoderEmbedder"),
     "ProjectedConcatFusion": ("fusion", "ProjectedConcatFusion"),
+    "CONDITIONING_CONFIGS": ("conditioning", "CONDITIONING_CONFIGS"),
+    "DEFAULT_CONDITIONING": ("conditioning", "DEFAULT_CONDITIONING"),
+    "PooledEmbedder": ("conditioning", "PooledEmbedder"),
+    "SectionedFusionEmbedder": ("conditioning", "SectionedFusionEmbedder"),
+    "build_conditioning": ("conditioning", "build_conditioning"),
 }
 
 

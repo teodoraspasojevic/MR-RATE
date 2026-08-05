@@ -10,6 +10,11 @@ should come from — see **[TEXT_ENCODERS.md](TEXT_ENCODERS.md)** and the
 [textenc](../contrastive-pretraining/mrrate_r2v/textenc/README.md) /
 [textbench](../contrastive-pretraining/mrrate_r2v/textbench/README.md) READMEs.
 
+**Training a report adapter? Start at [TEXT_ENCODERS.md §9](TEXT_ENCODERS.md#9-the-three-supported-conditioning-configurations).**
+It covers the three supported configurations and their exact conditioning shapes, how each is run
+(single- and multi-GPU), validation and its two metrics, W&B and the interactive panel, checkpoint
+contents, the measured H200 batch sizes, and the per-bucket geometry table.
+
 All code lives in one package: `contrastive-pretraining/mrrate_r2v/`. Run everything from
 `contrastive-pretraining/`.
 
@@ -471,14 +476,17 @@ contrastive-pretraining/
                        the pretrained diffusion UNet + report cross-attention adapters,
                        and the strict pretrained-checkpoint loader
     models/adapter.py  what is trainable (asserted, not assumed) + the adapter checkpoint format
-    text.py            the replaceable text-encoder seam: RadBERT, a test mock, one registry
+    text.py            the replaceable text-encoder seam: RadBERT, a test mock, one registry,
+                       plus encode_reports (the one dispatch seam) and rebuild_embedder
     textenc/           the encoder zoo + report formats + fusion            (README.md)
+                       conditioning.py = the three supported configurations (TEXT_ENCODERS.md §9)
     textbench/         encoder x format selection benchmark; never imported by the trainer
                        (README.md; results and rationale in docs/TEXT_ENCODERS.md)
     conditioning.py    modality ids, NVIDIA's own modality dropout, report dropout, CFG
     training.py        adapter training; mirrors NV-Generate-CTMR/scripts/diff_model_train.py
+    validation.py      step-based validation during training: FID + alignment proxy, DDP-safe
     sampling.py        report-to-volume sampling; mirrors scripts/diff_model_infer.py
-    cli/               the entry points (nine generation + four text-encoder)
+    cli/               the entry points (nine generation + four text-encoder + one benchmark)
   scripts/             the contrastive-pretraining pipeline (separate; see its own README)
   slurm/               _common.sh + the numbered job scripts
   tests/

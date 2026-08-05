@@ -94,6 +94,12 @@ class R2VDatasetConfig:
     # `report_sections` joined by `ReportRecord.compose`. Set one and it takes over, and the name
     # is recorded in `geometry_fingerprint` so a cohort built with it is a different cohort.
     report_format: Optional[str] = None
+    # Which released sections are additionally returned *unjoined*, as `report_sections_text`, for
+    # conditioning configurations that encode each section separately (Report2CT-style fusion ->
+    # one cross-attention token per section). Purely additive: `report_text` is unaffected, which
+    # is why this is deliberately NOT in `geometry_fingerprint` -- it changes no existing field and
+    # would otherwise invalidate every cohort built before it existed.
+    conditioning_sections: tuple = ("findings", "impression")
     geometry_mode: str = "per_modality_plane"
     # geometry_mode="fixed" only. **Both are (D, H, W)-ordered**, like every other internal
     # geometry parameter -- NOT the (X, Y, Z) order the Dataset *returns*. If your value came from
@@ -131,7 +137,7 @@ class R2VDatasetConfig:
         if self.archive_access_mode not in ARCHIVE_ACCESS_MODES:
             raise ValueError(f"Unknown archive_access_mode '{self.archive_access_mode}'. "
                              f"Choose from: {ARCHIVE_ACCESS_MODES}")
-        for name in self.report_sections:
+        for name in tuple(self.report_sections) + tuple(self.conditioning_sections):
             if name not in REPORT_SECTION_NAMES:
                 raise ValueError(f"Unknown report section '{name}'. Choose from: {REPORT_SECTION_NAMES}")
         if self.report_format is not None:
@@ -401,6 +407,15 @@ class MRReportToVolumeDataset(Dataset):
             report_text = format_report(report, self.config.report_format,
                                         modality=row.modality, plane=row.plane)
 
+        # The same `ReportRecord`, section-separated and unjoined. Deterministic (a plain field
+        # read plus strip -- no parsing, no sampling), so training, validation and sampling see
+        # byte-identical text for a given study. An absent section is "" and is masked out by
+        # `SectionedFusionEmbedder`, never emitted as a real attention key.
+        report_sections_text = {
+            name: (getattr(report, name, None) or "").strip()
+            for name in self.config.conditioning_sections
+        }
+
         native_shape = native_shape or (0, 0, 0)
         native_spacing = native_spacing or (0.0, 0.0, 0.0)
         native_fov = tuple(s * p for s, p in zip(native_shape, native_spacing))
@@ -408,6 +423,7 @@ class MRReportToVolumeDataset(Dataset):
         return {
             "image": image,                          # [1, X, Y, Z], NV-Generate-CTMR-ready
             "report_text": report_text,
+            "report_sections_text": report_sections_text,
             "modality": row.modality or "unknown",
             "acquisition_plane": row.plane or "unknown",
             "contrast_state": "unknown",             # not derivable from the release
@@ -430,7 +446,7 @@ _STACK_TENSOR_KEYS = (
     "native_shape", "native_spacing_mm", "native_fov_mm",
 )
 _LIST_KEYS = (
-    "report_text", "modality", "acquisition_plane",
+    "report_text", "report_sections_text", "modality", "acquisition_plane",
     "contrast_state", "skull_state", "study_key", "series_key",
 )
 

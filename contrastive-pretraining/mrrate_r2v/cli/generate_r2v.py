@@ -58,6 +58,10 @@ def parse_args(argv=None):
     source.add_argument("--report-file", type=Path, default=None, help="file containing the report text")
     source.add_argument("--cohort", type=Path, default=None,
                         help="generate one volume per case from the cohort's paired reports")
+    source.add_argument("--allow-report-format-mismatch", action="store_true",
+                        help="generate even when the cohort's report_format differs from the one "
+                             "the adapter was trained on. For a deliberate ablation only -- the "
+                             "mismatch is otherwise silent")
 
     out = p.add_argument_group("output")
     out.add_argument("--out", type=Path, default=None, help="output .nii.gz (single report)")
@@ -105,7 +109,7 @@ def build_sampler(args):
     )
     from ..models.report_conditioned_unet import build_report_conditioned_unet, load_pretrained_maisi_weights
     from ..sampling import ReportToVolumeSampler, SamplerConfig, official_latent_divisor
-    from ..text import build_text_embedder
+    from ..text import rebuild_embedder
 
     device = torch.device(args.device)
     network_config = args.network_config or DEFAULT_NETWORK_CONFIG
@@ -116,18 +120,17 @@ def build_sampler(args):
     payload = torch.load(str(args.adapter), map_location="cpu", weights_only=False)
     stored_text = payload.get("text_encoder") or {}
     stored_config = payload.get("config") or {}
-    name = args.text_encoder or stored_text.get("name", "radbert")
-    if name == "mock":
-        embedder = build_text_embedder("mock", output_dim=int(stored_text.get("output_dim", 32)),
-                                       max_length=int(stored_text.get("max_length", 16)))
-    else:
-        checkpoint = args.text_checkpoint or stored_text.get("checkpoint")
-        if checkpoint is None:
-            raise SystemExit("--text-checkpoint is required: the adapter recorded no text-encoder path")
-        embedder = build_text_embedder(
-            "radbert", checkpoint=str(checkpoint),
-            max_length=int(args.max_report_tokens or stored_text.get("max_length", 512)),
-        )
+    # `rebuild_embedder` dispatches on the recorded `kind`, so all three conditioning
+    # configurations round-trip. This used to be inline and always built RadBERT regardless of what
+    # the checkpoint recorded.
+    if args.text_encoder:
+        stored_text = dict(stored_text, name=args.text_encoder)
+    embedder = rebuild_embedder(
+        stored_text,
+        conditioning_name=stored_config.get("conditioning_name"),
+        checkpoint=str(args.text_checkpoint) if args.text_checkpoint else None,
+        max_length=args.max_report_tokens or None,
+    )
     if int(stored_text.get("output_dim", embedder.output_dim)) != embedder.output_dim:
         raise SystemExit(
             f"text encoder width {embedder.output_dim} != the {stored_text.get('output_dim')} the "
@@ -213,6 +216,39 @@ def manifest_for(args, sampler, embedder, payload, extra: dict) -> dict:
     }
 
 
+def assert_report_format_matches(payload: dict, cohort, allow_mismatch: bool = False) -> None:
+    """The report text a cohort stores must have been composed the way the adapter was trained.
+
+    A cohort's `reports.json` holds *already-composed* conditioning text, produced at preprocess
+    time under that cohort's `report_format`. So this is a metadata comparison, not a re-formatting
+    step -- re-composing here is impossible anyway, because the section boundaries are gone by the
+    time the text reaches `reports.json`.
+
+    Getting this wrong is silent: an adapter trained on `impression_findings` sampled on
+    `findings_impression` text sees the same words in the other order, produces plausible volumes,
+    and just scores worse. That is exactly the class of bug this repo's cohort contract exists to
+    make impossible, so the default is to refuse.
+    """
+    trained = (payload.get("config") or {}).get("report_format")
+    fingerprint = (getattr(cohort, "spec", None) and getattr(cohort.spec, "geometry_fingerprint", None)) or {}
+    if not isinstance(fingerprint, dict):
+        fingerprint = {}
+    built = fingerprint.get("report_format")
+    if trained == built:
+        return
+    message = (
+        f"report-format mismatch: the adapter was trained on report_format={trained!r} but this "
+        f"cohort's text was composed with report_format={built!r}. The conditioning strings differ, "
+        f"which is silent at generation time and only shows up as a worse score.\n"
+        f"  Rebuild the cohort with `cli.preprocess --report-format {trained}`, or pass "
+        f"--allow-report-format-mismatch for a deliberate cross-format ablation."
+    )
+    if allow_mismatch:
+        log.warning("%s (continuing: --allow-report-format-mismatch)", message)
+    else:
+        raise SystemExit(message)
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
     sampler, embedder, payload = build_sampler(args)
@@ -221,6 +257,7 @@ def main(argv=None) -> int:
         from ..cohort import Cohort
 
         cohort = Cohort(args.cohort)
+        assert_report_format_matches(payload, cohort, allow_mismatch=args.allow_report_format_mismatch)
         args.out_dir.mkdir(parents=True, exist_ok=True)
         written = []
         for case in cohort.cases:

@@ -319,6 +319,103 @@ def build_text_embedder(name: str, **kwargs) -> TextEmbedder:
     return embedder
 
 
+def rebuild_embedder(identity: dict, *, conditioning_name: Optional[str] = None,
+                     checkpoint: Optional[str] = None, max_length: Optional[int] = None):
+    """Reconstruct the embedder a checkpoint was trained with, from its recorded identity.
+
+    **The one place inference rebuilds an encoder.** It exists because both inference CLIs used to
+    do this inline, and both hardcoded `build_text_embedder("radbert", ...)` after computing the
+    recorded name -- so a checkpoint trained with any other encoder silently loaded RadBERT and
+    generated confident nonsense. There is now no second copy to drift.
+
+    Dispatch is on the recorded `kind`, so all three conditioning configurations round-trip:
+
+        kind="pooled"            -> PooledEmbedder over one encoder, with its recorded pooling
+        kind="sectioned_fusion"  -> SectionedFusionEmbedder, recorded section and encoder order
+        (absent)                 -> the historical single-encoder token-level path
+    """
+    kind = identity.get("kind")
+    if kind in ("pooled", "sectioned_fusion"):
+        from .textenc.conditioning import build_conditioning
+
+        name = conditioning_name or identity.get("name")
+        if kind == "pooled" and not (name and name in _conditioning_names()):
+            # A pooled embedder records the encoder one level down, not a configuration name.
+            inner = identity.get("encoder") or {}
+            name = next(
+                (key for key, spec in _conditioning_specs().items()
+                 if spec["kind"] == "pooled" and spec["encoders"] == (inner.get("name"),)
+                 and spec["pooling"] == identity.get("pooling")),
+                None,
+            )
+        if not name or name not in _conditioning_names():
+            raise ValueError(
+                f"checkpoint records kind={kind!r} but no resolvable conditioning configuration "
+                f"(name={identity.get('name')!r}). Pass conditioning_name= explicitly."
+            )
+        members = identity.get("members") or [identity.get("encoder") or {}]
+        recorded_max = max_length or min(
+            [int(m["max_length"]) for m in members if m.get("max_length")] or [512]
+        )
+        checkpoints = {}
+        if checkpoint is not None:
+            specs = _conditioning_specs()[name]["encoders"]
+            if len(specs) != 1:
+                raise ValueError(f"'{name}' uses {len(specs)} encoders; stage them under "
+                                 "MRRATE_PRETRAINED_DIR rather than passing one path")
+            checkpoints[specs[0]] = str(checkpoint)
+        return build_conditioning(name, max_length=recorded_max,
+                                  pooling=identity.get("pooling"), checkpoints=checkpoints)
+
+    name = identity.get("name", "radbert")
+    if name == "mock":
+        return build_text_embedder("mock", output_dim=int(identity.get("output_dim", 32)),
+                                   max_length=int(max_length or identity.get("max_length", 16)))
+    resolved = checkpoint or identity.get("checkpoint")
+    if resolved is None:
+        raise ValueError(f"checkpoint records text encoder '{name}' but no snapshot path; "
+                         "pass checkpoint= explicitly")
+    return build_text_embedder(name, checkpoint=str(resolved),
+                               max_length=int(max_length or identity.get("max_length", 512)))
+
+
+def _conditioning_specs() -> dict:
+    from .textenc.conditioning import CONDITIONING_CONFIGS
+
+    return CONDITIONING_CONFIGS
+
+
+def _conditioning_names() -> tuple:
+    try:
+        return tuple(_conditioning_specs())
+    except Exception:  # noqa: BLE001
+        return ()
+
+
+def encode_reports(embedder, batch: dict, device) -> TextConditioning:
+    """Encode one collated batch's reports. **The only call site for `TextEmbedder.encode` in the
+    training, validation and sampling paths**, so all three cannot drift apart on what text the
+    encoder sees.
+
+    Dispatch is on the embedder, not on the caller: an embedder that sets `needs_sections = True`
+    (`textenc.SectionedFusionEmbedder`) is handed the batch's unjoined `report_sections_text`;
+    everything else is handed the single `report_text` string. A sectioned embedder given a batch
+    with no `report_sections_text` is an error rather than a silent fallback to joined text --
+    that mistake would train a two-token configuration on one token and only show up as a
+    slightly worse FID.
+    """
+    if getattr(embedder, "needs_sections", False):
+        sections = batch.get("report_sections_text")
+        if not sections:
+            raise ValueError(
+                f"{type(embedder).__name__} needs per-section text, but this batch has no "
+                "'report_sections_text'. Set R2VDatasetConfig.conditioning_sections (it defaults "
+                "to ('findings', 'impression')), or use a pooled conditioning configuration."
+            )
+        return embedder.encode_sections(sections, device)
+    return embedder.encode(batch["report_text"], device)
+
+
 class ReportEncodingCache:
     """Optional memo for `TextEmbedder.encode` on single reports. Correctness never depends on it:
     a miss just re-encodes. The key covers the encoder identity, so two encoders, two max lengths or
@@ -358,6 +455,7 @@ __all__ = [
     "TextConditioning",
     "TextEmbedder",
     "build_text_embedder",
+    "encode_reports",
     "ensure_local_safetensors",
     "masked_mean",
 ]

@@ -31,6 +31,7 @@ from monai.networks.schedulers.rectified_flow import RFlowScheduler
 from torch.amp import autocast
 
 from .conditioning import ConditioningConfig, ModalityEncoder, guided_model_output
+from .text import encode_reports
 
 log = logging.getLogger("mrrate_r2v.sampling")
 
@@ -128,6 +129,7 @@ class ReportToVolumeSampler:
         shape_xyz: Sequence[int],
         spacing_mm: Sequence[float],
         seed: Optional[int] = None,
+        report_sections: Optional[dict] = None,
     ) -> torch.Tensor:
         for axis, size in enumerate(shape_xyz):
             if size % self.divisor:
@@ -154,7 +156,15 @@ class ReportToVolumeSampler:
 
         timesteps = self.noise_scheduler.timesteps
         next_timesteps = torch.cat((timesteps[1:], torch.tensor([0], dtype=timesteps.dtype)))
-        conditioning = self.text_embedder.encode([report], self.device)
+        # The same seam the trainer uses, so a configuration that encodes findings and impression
+        # separately gets per-section text here too. Passing only `report_text` to a sectioned
+        # embedder would silently condition on one token instead of two.
+        conditioning = encode_reports(
+            self.text_embedder,
+            {"report_text": [report],
+             "report_sections_text": None if report_sections is None else [report_sections]},
+            self.device,
+        )
         class_labels = self.modality_encoder.encode([modality], device=self.device)
         spacing = spacing_tensor_for(spacing_mm, 1, self.device)
 
@@ -212,10 +222,16 @@ class ReportToVolumeSampler:
         spacing_mm,
         seed: Optional[int] = None,
         modality: str = "T1w",
+        report_sections: Optional[dict] = None,
     ) -> np.ndarray:
         """The contract `cli/predict_r2v.py` documents: report -> `np.ndarray[X, Y, Z]` on the given
-        grid, already postprocessed to the official MR intensity range."""
-        latent = self.sample_latent(report_text, modality, shape, spacing_mm, seed=seed)
+        grid, already postprocessed to the official MR intensity range.
+
+        `report_sections` is required by a sectioned-fusion configuration and ignored by every
+        other one; `encode_reports` raises rather than guessing if it is missing when needed.
+        """
+        latent = self.sample_latent(report_text, modality, shape, spacing_mm, seed=seed,
+                                    report_sections=report_sections)
         if self.autoencoder is None:
             raise RuntimeError("no autoencoder was provided, so a latent cannot be decoded to a volume")
         return postprocess_mr(self.decode(latent))

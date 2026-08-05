@@ -22,6 +22,7 @@ contrastive-pretraining/mrrate_r2v/
 │   ├── formats.py              named report formats            (no torch)
 │   ├── encoders.py             HFTextEncoder + ENCODER_SPECS
 │   ├── fusion.py               MultiEncoderEmbedder, ProjectedConcatFusion
+│   ├── conditioning.py         the three supported configurations         (§9)
 │   └── README.md
 ├── textbench/                  SELECTION: never imported by the trainer
 │   ├── corpus.py               report/label corpus from the shard tars   (no torch)
@@ -35,14 +36,29 @@ contrastive-pretraining/mrrate_r2v/
     ├── download_text_encoders.py   stage checkpoints (idempotent, pinned revisions)
     ├── analyze_reports.py          build-corpus | analyze | tokens
     ├── embed_reports.py            GPU: cache embeddings
-    └── eval_text_encoders.py       CPU: score the matrix
+    ├── eval_text_encoders.py       CPU: score the matrix
+    └── benchmark_h200.py           GPU: environment + step time/memory per config   (§9.7)
+
+mrrate_r2v/validation.py            step-based validation: FID + alignment proxy      (§9.6)
+slurm/configs/{A,B,C}_*.sh          one file per configuration                        (§9.5)
+slurm/10_benchmark_h200.sbatch      the H200 measurements
+slurm/11_train_conditioning.sbatch  trains any of the three
 ```
 
-Changed, minimally: `mrrate_r2v/text.py` (the factory now also resolves zoo names),
-`mrrate_r2v/data/dataset.py` (an optional `report_format`), `mrrate_r2v/cli/train_r2v.py`
-(`--report-format`, the zoo in `--text-encoder`), `slurm/_common.sh` (paths + `run_py_host`).
-**Every default is unchanged**: leave `report_format` unset and `--text-encoder radbert` and the
-pipeline behaves exactly as before, down to the `cohort_id`.
+Changed, minimally: `mrrate_r2v/text.py` (the factory resolves zoo names; `encode_reports` is the
+one dispatch seam; `rebuild_embedder` is the one inference-side rebuild), `mrrate_r2v/data/dataset.py`
+(an optional `report_format`, plus `report_sections_text` alongside the existing `report_text`),
+`mrrate_r2v/training.py` (optimizer-step intervals, a real validation hook, W&B, best/retention
+checkpoints), `mrrate_r2v/sampling.py` (per-section text reaches the sampler),
+`mrrate_r2v/models/adapter.py` (conditioning-compatibility check, `optimizer_step`, `best_metrics`),
+`mrrate_r2v/eval/figures.py` + `eval/wandb_logging.py` (the interactive panel),
+`mrrate_r2v/cli/train_r2v.py` + `cli/generate_r2v.py`, `slurm/_common.sh`.
+
+**Every default is unchanged**: leave `--conditioning` and `report_format` unset with
+`--text-encoder radbert` and the pipeline behaves exactly as before, down to the `cohort_id`. Two
+behaviours *did* change, both because they were broken: `--validate-every-steps` and
+`--save-every-steps` now count **optimizer** steps rather than micro-steps (§9.6), and `--num-gpus >
+1` without `torchrun` now fails instead of silently training N independent single-GPU models (§9.5).
 
 ---
 
@@ -298,7 +314,7 @@ not stated on it is marked so.
 | max context | 512 | **8192** | 512 | 512 | 512 | 512 | **8192** | 512 |
 | tokenizer | RoBERTa BPE (50,265) | ModernBERT BPE (50,368) | BERT wordpiece (30,522) | BERT wordpiece | BERT wordpiece (28,996) | BERT wordpiece, **CXR-specific** (30,522) | ModernBERT BPE | BERT wordpiece |
 | token output | (B, L, 768) | (B, L, 768) | (B, L, 1024) | (B, L, 384) | (B, L, 768) | (B, L, 768) | (B, L, 768) | (B, L, 768) |
-| pooled available | mask-aware mean | mask-aware mean | mask-aware mean | mask-aware mean | mask-aware mean | **trained CLIP `[CLS]`** | mask-aware mean | mask-aware mean |
+| pooled available | mask-aware mean | mask-aware mean | mask-aware mean | mask-aware mean | mask-aware mean | **`[CLS]`, CLIP-trained but pre-projection** ¹ | mask-aware mean | mask-aware mean |
 | language | English | English | English | English | English | English | English | English |
 | biomedical/clinical data | **radiology reports** | PubMed/PMC 50.7B tok + 20 clinical corpora 2.8B tok | medical retrieval fine-tune of BGE-large | as large | MIMIC-III notes (~880M words) | PubMed + MIMIC-III + MIMIC-CXR | none | none |
 | **MRI reports included?** | INFERRED yes — 4M all-modality VA radiology reports; the card does not enumerate modalities | **VERIFIED yes** | not stated | not stated | INFERRED — MIMIC-III `NOTEEVENTS` includes radiology reports; modality not enumerated | no (chest X-ray) | no | no |
@@ -309,6 +325,15 @@ not stated on it is marked so.
 | GPU memory, bf16 inference, batch 64 @512 | ~1.5 GB | ~1.6 GB | ~3.5 GB | **~0.6 GB** | ~1.4 GB | ~1.4 GB | ~1.6 GB | ~1.4 GB |
 | strength for R2V conditioning | closest domain match: radiology report register, negation phrasing, abbreviations | only encoder with documented brain-MRI reports; no truncation at all; modern, fast, MIT | strongest semantic-similarity geometry; winner-precedented | 3× cheaper than anything else, 384-wide context tensor | winner-precedented; broad clinical vocabulary | most token-efficient on radiology text; the only trained (not derived) pooled vector | isolates domain adaptation from architecture | isolates the medical fine-tune from the base retriever |
 | weakness | 512 context; anisotropic embedding space; chest/CT-heavy US corpus, no brain-MRI evidence | brain-MRI data is 0.2M of 53.5B tokens (0.0004%) — presence ≠ specialisation | 3× the compute and 2× the width of the alternatives for one extra bit of geometry | smallest capacity; 384 dims may under-serve cross-attention | **pretrained at sequence length 128** — 300–500-token reports are outside its regime; ICU notes ≠ radiology reports | chest X-ray domain; anatomy vocabulary is wrong for brain | no medical exposure | no medical exposure |
+
+¹ **Precisely what `cxr_bert`'s pooled vector is** (VERIFIED at runtime): `last_hidden_state[:, 0, :]`,
+the raw 768-wide CLS state. CXR-BERT's CLIP objective acted on that CLS *through* a
+`cls_projection_head`, and the `bert_shim` loader drops that head — the load report lists
+`cls_projection_head.{dense_to_hidden,dense_to_output,LayerNorm}.{weight,bias}` as UNEXPECTED. So the
+CLS was shaped by a sentence-level objective (unlike every other staged checkpoint, whose CLS saw
+only MLM), but it is **not** the 128-d CLIP embedding. An earlier version of this row said "trained
+CLIP `[CLS]`", which overstated it. Report2CT's mean-pooled path is unaffected by the dropped head,
+so the fusion in §9 is faithful there.
 
 Also considered and **not** staged, with reasons: `microsoft/BiomedVLP-BioViL-T` (CXR, same family
 as `cxr_bert`, adds nothing); `UFNLP/gatortron-base` (345M, clinical, but 512 context and no
@@ -328,9 +353,14 @@ Eight staged, chosen to answer specific questions rather than to accumulate mode
    (only documented brain-MRI exposure + no truncation), `medembed_large` (best retrieval
    geometry, winner-precedented).
 2. **A genuinely lightweight one** — `medembed_small`, 33M parameters and 384 dims.
-3. **The 2025 CT-winner's trio, reproducible** — `cxr_bert` + `bio_clinicalbert` +
-   `medembed_large` is exactly Report2CT's set, so its multi-encoder claim can be tested on MR
-   rather than assumed to transfer.
+3. **The 2025 CT-winner's trio, near-reproducible** — `cxr_bert` + `bio_clinicalbert` +
+   `medembed_large` is Report2CT's set *up to one substituted checkpoint*, so its multi-encoder
+   claim can be tested on MR rather than assumed to transfer. **Correction (2026-08-05):** an
+   earlier version of this line claimed the set was "exactly" Report2CT's. It is not. Report2CT's
+   own source names `medicalai/ClinicalBERT` — a 6-layer **DistilBERT**, ~66M parameters — not
+   `emilyalsentzer/Bio_ClinicalBERT` (12-layer BERT-base, ~110M). Both are 768-wide, so the fused
+   width is 2560 either way, but they are different checkpoints trained on different corpora. See
+   §9.
 4. **Two controls that make the results interpretable** — `modernbert` is architecture-matched to
    `bioclinical_mbert` (their difference *is* the clinical adaptation) and `bge_base` is
    `medembed_large`'s own base family (their difference *is* the medical fine-tune). Without
@@ -485,7 +515,490 @@ only, never `$HOME`, and note `/hnvme`'s **file-count** quota (61k soft): the fu
 
 ---
 
-## 8. Limitations and next experiments
+## 9. The three supported conditioning configurations
+
+Everything below is production: what the trainer, the validator and the sampler actually run.
+Implemented in [`textenc/conditioning.py`](../contrastive-pretraining/mrrate_r2v/textenc/conditioning.py);
+selected with one flag.
+
+### 9.1 At a glance
+
+| | A | B | C |
+|---|---|---|---|
+| `--conditioning` | `cxr_bert_cls` | `radbert_mean` | `report2ct_style` |
+| encoder(s) | `microsoft/BiomedVLP-CXR-BERT-specialized` | `zzxslp/RadBERT-RoBERTa-4m` | MedEmbed-large + Bio_ClinicalBERT + CXR-BERT |
+| pinned revision | `5157bdba1437` | `b8b7433023c4` | `963121bfb9c6` / `d5892b39a4ad` / `5157bdba1437` |
+| architecture | `CXRBertModel` → stock BERT, 12L | `RobertaForMaskedLM`, 12L | BERT-large 24L / BERT-base 12L / BERT 12L |
+| parameters (frozen) | 109.6M | ~125M | 335.1M + ~110M + 109.6M ≈ 555M |
+| hidden size | 768 | 768 | 1024 + 768 + 768 |
+| max context | 512 | 512 (514−2) | 512 each |
+| tokenizer | CXR-specific WordPiece (30,522) | RoBERTa BPE (50,265) | three independent tokenizers |
+| pooling | **CLS** = `last_hidden_state[:,0,:]` | **masked mean** | **masked mean**, per encoder |
+| **conditioning tensor** | **`(B, 1, 768)`** | **`(B, 1, 768)`** | **`(B, 2, 2560)`** |
+| **attention mask** | **`(B, 1)`**, all True | **`(B, 1)`**, all True | **`(B, 2)`**, False for an absent section |
+| report format | `impression_findings` | `impression_findings` | none — sections encoded separately |
+| trainable text params | 0 (frozen default) | 0 | 0 |
+| trainable adapter params | 8,080,000 | 8,080,000 | 11,753,600 |
+| local checkpoint | `$PRETRAINED_DIR/BiomedVLP-CXR-BERT-specialized` | `.../RadBERT-RoBERTa-4m` | `.../MedEmbed-large-v0.1`, `.../Bio_ClinicalBERT`, `.../BiomedVLP-CXR-BERT-specialized` |
+| licence / access | MIT, public ungated | Apache-2.0, public ungated | Apache-2.0 / MIT / MIT, all public ungated |
+
+The adapter parameter count differs only because `ContextProjection` is built from
+`embedder.output_dim` — 2560 → `cross_attention_dim` is a wider first Linear than 768 →
+`cross_attention_dim`. **No text-encoder dimension is hardcoded anywhere in the generative model.**
+
+### 9.2 Why CLS for A and mean for B
+
+Both are the value already recorded in that encoder's `EncoderSpec.pooling`, i.e. the choice §6 was
+measured under. They differ for a reason:
+
+- **CXR-BERT's CLS was shaped by a sentence-level objective** (its CLIP text tower), so it is a
+  trained summary vector. It is the *pre-projection* CLS — see footnote ¹ in §4.1.
+- **RadBERT has no pooler and no sentence-level objective.** It is a `RobertaForMaskedLM`; its `<s>`
+  state was never trained to summarise anything. Using it as the sole conditioning vector is a
+  worse readout than the mean, and would confound an A-vs-B comparison with an untrained-readout
+  artefact rather than a domain difference. `--text-pooling cls` forces it for an explicit ablation.
+
+### 9.3 How Report2CT's fusion was reproduced — and where it differs
+
+Verified from source, not from the paper: `github.com/sinaamirrajab/report2ct` @
+`7b483a856ef159cfd0dada249b110d8f8eebf502`, files `vlm3d_inference.ipynb` (cell 0,
+`encode_batch_multi`) and `src/maisi/scripts/diff_model_train_vlm3D_2560_multi_text.py:275-297`.
+Report2CT is itself built on MAISI, the same base family as this pipeline.
+
+**Verified shape trace, B = 2** (the batched form from the train script; the notebook's
+`squeeze(0).unsqueeze(0).unsqueeze(0)` is correct only for B = 1):
+
+```
+findings[2], impression[2]                        two lists of strings
+
+per encoder, max_length=512, padding=True, truncation=True:
+  MedEmbed-large-v0.1     (2, L₁, 1024)   L₁ ≤ 512  ─┐ three tokenizers ⇒ L₁ ≠ L₂ ≠ L₃.
+  medicalai/ClinicalBERT  (2, L₂,  768)   L₂ ≤ 512   │ Never aligned — pooling collapses
+  BiomedVLP-CXR-BERT      (2, L₃,  768)   L₃ ≤ 512  ─┘ the token axis first.
+
+masked mean pool, each encoder independently (padding divided out, not averaged in):
+  (2, L₁, 1024) → (2, 1024)
+  (2, L₂,  768) → (2,  768)
+  (2, L₃,  768) → (2,  768)
+
+cat(dim=-1) in order [MedEmbed, ClinicalBERT, CXR-BERT]:
+  → (2, 2560)          slices [0:1024] [1024:1792] [1792:2560]
+
+twice, for findings and impression → each (2, 2560)
+unsqueeze(1)                       → each (2, 1, 2560)
+cat(dim=1)                         → (2, 2, 2560)      index 0 = findings, 1 = impression
+```
+
+Reproduced exactly: the per-encoder independent masked-mean pooling, the feature-axis concatenation
+order, the 2560 width, the separate findings/impression encoding, the section order, the frozen
+encoders, and the 512-token budget. **No LayerNorm and no feature normalisation** are applied to the
+fused vector, matching the original (its `context * 1e2` scaling was tried and left commented out at
+`diff_model_train_vlm3D_2560_multi_text.py:91-92`).
+
+Three documented differences, each because the alternative is worse or impossible here:
+
+| # | Report2CT | here | why |
+|---|---|---|---|
+| 1 | `medicalai/ClinicalBERT` (DistilBERT, 6L, ~66M) | `emilyalsentzer/Bio_ClinicalBERT` (BERT-base, 12L, ~110M) | The original is not staged. Both are 768-wide so the fused width is 2560 either way — but it is a different checkpoint, which is why this is called `report2ct_style` and never "Report2CT". Staging `medicalai/ClinicalBERT` (ungated, ~260 MB, rev `f7c7f65227cb311f`) would make it exact. |
+| 2 | no conditioning mask; a missing section is encoded as `""` | absent section masked out via `(B, 2)` | MAISI's `SpatialTransformer` takes no mask, so Report2CT's absent impression contributes a real attention key. Impression is absent for **8.9%** of MR-RATE studies. With both sections empty the row is all-False, which `prepare_context` already maps to the learned null embedding. |
+| 3 | raw 2560-vector into a UNet with `cross_attention_dim=2560, with_conditioning=True` | 2560 → `--cross-attention-dim` via the existing `ContextProjection` | `with_conditioning=True` makes MAISI swap its `SpatialAttentionBlock`s for `SpatialTransformer`s, which changes the module tree and **destroys NVIDIA's pretrained MR-Brain weight loading** (`models/report_conditioned_unet.py:263-268`). Report2CT could afford this; a frozen-base adapter cannot. |
+
+Also worth knowing, because it explains a common misreading: `encode_batch_multi` **computes a
+token-level path too** — pad every encoder to exactly 512 positions, zero-pad the feature axis up to
+`max_dim=1024`, concatenate along tokens to `(B, 3×512, 1024)` — and then **discards it**
+(`c_vec_f, _ = encode_batch_multi(finding)`). Report2CT's actual conditioning is the pooled path
+only. Report2CT also caches all embeddings to disk (`<file>multi_2560.json`, holding
+`findings_embeddings[2560]` and `impression_embeddings[2560]`), so its encoders never run during
+training; here they run live, which the H200 measurements in §9.7 show costs 0.4–2.7% of a step.
+
+### 9.4 Corrections to the shapes that were assumed before this was checked
+
+| assumed | actual | note |
+|---|---|---|
+| `2048 = 1024 + 512 + 512` | **`2560 = 1024 + 768 + 768`** | CXR-BERT and ClinicalBERT are both **768**-wide, not 512. No staged encoder is 512-wide. |
+| an intermediate `(B, 512, 2048)` | **no such tensor exists** in the used path | `padding=True` pads to the batch's longest sequence, not to 512. The literal 512-pad is in the discarded token path. |
+| concatenate tokens, *then* mean-pool | **pool each encoder first, then concatenate** | Not equivalent: the three tokenizers give different token counts and different masks, so a joint mean over a padded 512 axis is a different number. |
+| final `(B, 2, 2048)` | **`(B, 2, 2560)`** | The `(B, 2, …)` structure and the findings-first order were right. |
+
+### 9.5 Running each configuration
+
+Files: [`slurm/configs/`](../contrastive-pretraining/slurm/configs/README.md), one per
+configuration, sourced by
+[`slurm/11_train_conditioning.sbatch`](../contrastive-pretraining/slurm/11_train_conditioning.sbatch).
+
+```bash
+cd contrastive-pretraining
+
+# CPU wiring check, no data, no GPU, seconds -- run this first after any change
+python -m mrrate_r2v.cli.train_r2v --dry-run --max-steps 2 --device cpu \
+    --conditioning cxr_bert_cls --max-report-tokens 64 --out /tmp/dry_A
+
+# 4-step GPU smoke run, per configuration
+sbatch --export=ALL,R2V_CONFIG=A slurm/11_train_conditioning.sbatch
+sbatch --export=ALL,R2V_CONFIG=B slurm/11_train_conditioning.sbatch
+sbatch --export=ALL,R2V_CONFIG=C slurm/11_train_conditioning.sbatch
+
+# Real single-H200 run, validation every 500 optimizer steps, W&B online
+sbatch --export=ALL,R2V_CONFIG=A,R2V_MAX_STEPS=0,R2V_VALIDATE_EVERY=500,R2V_WANDB=online \
+       --time=24:00:00 slurm/11_train_conditioning.sbatch
+
+# Real 4-GPU DDP run on one node
+sbatch --export=ALL,R2V_CONFIG=C,R2V_MAX_STEPS=0,R2V_NGPU=4,R2V_VALIDATE_EVERY=500 \
+       --gres=gpu:h200:4 --cpus-per-task=32 --time=24:00:00 slurm/11_train_conditioning.sbatch
+```
+
+`#SBATCH --export=NONE` means a bare `VAR=x sbatch ...` does **not** reach the job — always use
+`--export=ALL,...`. `R2V_MAX_STEPS=0` removes the step cap.
+
+Equivalent direct invocation, if you are not using Slurm:
+
+```bash
+python -m mrrate_r2v.cli.train_r2v \
+    --manifest   $DATA/r2v_manifest/manifest_shards_native.csv \
+    --report-index $DATA/r2v_manifest/report_index_shards_native.csv \
+    --base-checkpoint $WS/models/diff_unet_3d_rflow-mr-brain_v0.pt \
+    --vae-checkpoint  $WS/models/autoencoder_v1.pt \
+    --conditioning report2ct_style --max-report-tokens 512 \
+    --split train --val-split val \
+    --batch-size 4 --grad-accumulation-steps 2 --epochs 1 --lr 1e-5 \
+    --validate-every-steps 500 --val-quick-samples 32 --val-inference-steps 30 \
+    --medicalnet-checkpoint $WS/pretrained/medicalnet/resnet_10_23dataset_statedict.pth \
+    --wandb-mode online --wandb-project mr-rate-r2v \
+    --out $WS/runs/r2v_C --num-workers 8 --device cuda
+
+# multi-GPU: prefix with torchrun and declare the count
+torchrun --nproc_per_node=4 --standalone -m mrrate_r2v.cli.train_r2v --num-gpus 4 ...
+```
+
+**`--num-gpus > 1` without `torchrun` now fails immediately** with the correct command in the error.
+Previously it was accepted and silently trained N independent single-GPU models.
+
+### 9.6 Validation, W&B, and the interactive panel
+
+Validation is **off by default** (each pass runs a full diffusion sampler). Enable with
+`--validate-every-steps N`, counted in **optimizer** steps — never micro-steps, so the number means
+the same thing at any `--grad-accumulation-steps`.
+
+This is **conditional** generation: for every validation case `generated_i = G(report_i)`, with
+that case's own `ground_truth_i` held alongside. Generation is report-conditioned always, at a fixed
+per-case seed, and `ValidationRunner.assert_conditioning_active` **refuses to run** if
+`report_guidance_scale == 0` or `report_dropout_probability >= 1` — either would make every
+generation report-blind, and FVD/2.5D FID are marginal metrics that would not reveal it.
+
+**Primary metrics** — both compare `{ground_truth_i}` against `{G(report_i)}`:
+
+| W&B key | definition | provenance |
+|---|---|---|
+| `val/fvd` | Frechet distance over r3d_18 (Kinetics-400) sequence features; per plane, then unweighted mean. Lower better | **MRI-volume adaptation of FVD.** Challenge-precedented in *family* — VLM3D 2025 CT Task 4 scored `FVD_I3D` + `FVD_CT-Net`, inherited from GenerateCT — but the extractor is **r3d_18, not I3D**, so it is never called standard FVD. `eval/video_features.py` states the exact differences from the reference implementation. |
+| `val/fid_2p5d` | one mean-pooled InceptionV3 vector per volume per plane over that plane's non-empty slices, then per-plane Frechet, then unweighted mean. Lower better | **Project-specific adaptation.** Neither the challenge nor GenerateCT uses the name "2.5D FID"; GenerateCT's FID is plain *slice-level*, whose limitation it states itself. Volume-weighted by construction, so a thick volume cannot outvote a thin one. |
+
+**Diagnostics** — logged, but not headline curves:
+
+| key | what |
+|---|---|
+| `val/ssim` | paired 3D SSIM(`generated_i`, `ground_truth_i`), Wang settings (11-wide Gaussian window, σ=1.5, population covariance, K1=0.01, K2=0.03, `data_range=1.0`), cropped to the **ground truth's** foreground box. Standard SSIM; used by neither the challenge nor GenerateCT. |
+| `val/sensitivity/*` | does the report change the generation? Swap in another **study's** report at a fixed seed and measure `swap_ssim` / `swap_relative_l1`, plus `ssim_correct` vs `ssim_shuffled` against the true target. `swap_ssim ≈ 1.0` raises a loud error: the model is ignoring its text. Runs every `--val-sensitivity-every-steps` on `--val-sensitivity-samples` cases (default 8), not the whole split. |
+| `val/*/rank_level` | 0 = rank-deficient, 1 = marginal, 2 = well-conditioned — see the sample-size warning below. |
+
+### ⚠️ Report–volume semantic fidelity is NOT measured
+
+FVD and 2.5D FID are **marginal** metrics: they ask whether the *set* of generations resembles the
+*set* of real volumes. A model that produced a perfectly distributed set of volumes paired to the
+**wrong** reports would score identically. `val/ssim` is paired but structural. So nothing in this
+suite verifies that generation *i* is semantically faithful to report *i*.
+
+Measuring that needs a frozen, independent, validated cross-modal MRI report–volume model. The one
+defensible candidate found is **HLIP** — [`zch0414/clip-vit_base-scan_study-dualdinotxt1568`](https://huggingface.co/zch0414/clip-vit_base-scan_study-dualdinotxt1568),
+[arXiv:2505.21862](https://arxiv.org/abs/2505.21862), MIT, 768-d joint space, BiomedBERT text tower
+at 256 tokens, **trained on MR-RATE's *training* split** so this project's `val` split is unseen. It
+is **not adopted**, and no substitute is faked in its place. `validation.AlignmentMetric` is the seam
+it would plug into; the deterministic different-study permutation such a metric needs is already
+implemented and tested (`shuffled_report_pairing`). Rejected alternatives and why: CT-CLIP (CT
+only), BiomedCLIP (2D PMC figure-captions, no radiology-report claim), BrainG3N (a tokenizer, not an
+aligner; non-commercial), Brainfound/BMLIP (weights unverifiable), this repo's own contrastive model
+(never trained — no checkpoint exists).
+
+### ⚠️ Measured: the Frechet metrics need far more samples than a training loop can afford
+
+On 512-d features with a **known-zero** ground truth (two disjoint halves of one real population,
+so the true distance is 0), the observed Frechet distance is:
+
+| N | 16 | 32 | 64 | 128 | 256 | 512 | 1024 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| real-vs-real (truth = 0) | 21576 | 14189 | **6123** | 3692 | 1908 | 892 | 432 |
+
+while a genuine, substantial distributional difference (+0.5 on every feature) registers **128 at
+every N**. At N=64 the sample-size bias is ~**48×** a real effect, and it still exceeds it at N=1024.
+The conventional FID guidance (N ≥ 2048) is not conservatism.
+
+**Consequence:** `val/ssim` and `val/sensitivity/*` are what a *frequent* validation pass can
+actually support. FVD and 2.5D FID belong on the occasional `--validate-full-every-steps` pass at a
+large `--val-full-samples`, or offline via `cli.evaluate` over a real cohort — which is where this
+repository already computes distribution metrics, at ~2000 cases. `ValidationRunner` warns about
+this at startup with the configured N, and every Frechet value carries a `rank_level` flag so it can
+never be read as more trustworthy than its sample supports.
+
+Cached reference constants come from `cli.validation_reference` (one-off, `--validation-reference
+<json>`), are logged every step so W&B draws them as flat lines, and are never recomputed:
+`ssim_identity` (sanity check, must be ~1.0), four SSIM perturbation checks, `ssim_autoencoder`
+(the frozen VAE's structural ceiling), and `fvd_real_vs_real` / `fid_2p5d_real_vs_real` (the
+finite-sample noise floors above).
+
+The validation subset is **fixed, seeded and bucket-stratified**, and the quick set is a *prefix* of
+the full set so the two curves measure the same population. Real features are cached after the first
+pass. Under DDP, cases are sharded `index % world_size` (no duplication) and gathered with
+`all_gather_object`; only one volume is resident at a time.
+
+W&B: `--wandb-mode online|offline|disabled` (default `disabled`), rank 0 only, and a missing `wandb`
+package or credentials degrades to a no-op rather than a crash. Main plots, all on the optimizer-step
+axis: `train/loss`, `val/fvd`, `val/fid_2p5d`, with `val/ssim` and `val/sensitivity/*` as
+diagnostics and `val/reference/*` as flat lines.
+
+The **interactive panel** is a self-contained `wandb.Html` — no external requests, so it renders
+offline. Per case: ground truth and generated side by side in all three planes, one **slice slider**
+across all six views, plus findings, impression, modality, plane, step, and the anonymised
+`case_id`. Slice indices are matched between the two sources, the intensity window is **one window
+taken from the ground truth** (a degenerate prediction must look degenerate), and each plane carries
+the physical aspect ratio from `spacing_xyz`.
+
+Open it in W&B → the run → Media → `validation/<case_id>`. **Two axes, both native**: W&B's own step
+selector chooses the validation step (the panel key is stable across steps for a given case), and
+the panel's slider chooses the slice. A single W&B panel cannot itself expose a step slider, so this
+uses the run's step control rather than a custom plugin — the documented limitation.
+
+**The panel embeds report text, so it is off unless `--wandb-log-reports` is passed.** Reports are
+patient data even after anonymisation; do not point this at a public project.
+
+### 9.7 H200: measured, not assumed
+
+Environment (job 688298, partition `h200`, node h24-24): **NVIDIA H200, 140.1 GB, compute capability
+9.0, 132 SMs**; driver 595.71.05, CUDA 13.2; torch 2.13.0+cu130, cuDNN 9.2.0, **NCCL 2.29.7**;
+`bf16_supported = True`; 4 GPUs/node, 128 CPU cores.
+
+**One finding that changes what to optimise: `flash_with_mask` is unavailable.**
+
+```
+flash_with_mask          unavailable: RuntimeError      ← the shape this code actually uses
+flash_no_mask            ok
+mem_efficient_with_mask  ok                             ← what MaskedCrossAttention gets
+math_with_mask           ok
+```
+
+`MaskedCrossAttention` always passes `attn_mask` when a `context_mask` is given, so the adapters'
+cross-attention runs on the **mem-efficient** SDPA kernel, never flash. It is exact and it is fast
+(the denoiser is 2–9% of a step), so this is not a problem — but "flash attention is enabled" is
+true of the base UNet's self-attention and false of the conditioning path, and the difference is
+worth knowing before optimising the wrong thing. `flash_attn` the package is not installed; monai's
+`use_flash_attention` routes through SDPA.
+
+Measured at the NVIDIA default 256³ bucket, bf16 autocast, 10 steps after 3 warmup (job 688299):
+
+| config | batch | step s | vol/s | peak alloc GB | peak resv GB | text s | VAE s | UNet s | bound by |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| `cxr_bert_cls` | 1 | 0.481 | 2.08 | 9.53 | 12.32 | 0.005 | 0.393 | 0.084 | VAE encode |
+| `cxr_bert_cls` | 2 | 0.851 | 2.35 | 17.73 | 23.25 | 0.005 | 0.752 | 0.094 | VAE encode |
+| `cxr_bert_cls` | 4 | 1.569 | 2.55 | 34.14 | 45.21 | 0.006 | 1.428 | 0.136 | VAE encode |
+| `radbert_mean` | 1 | 0.508 | 1.97 | 9.58 | 12.40 | 0.005 | 0.387 | 0.116 | VAE encode |
+| `radbert_mean` | 2 | 0.854 | 2.34 | 17.79 | 23.25 | 0.005 | 0.748 | 0.101 | VAE encode |
+| `radbert_mean` | 4 | 1.567 | 2.55 | 34.19 | 45.26 | 0.006 | 1.421 | 0.141 | VAE encode |
+| `report2ct_style` | 1 | 0.511 | 1.96 | 11.22 | 14.03 | 0.030 | 0.455 | 0.026 | VAE encode |
+| `report2ct_style` | 2 | 0.876 | 2.28 | 19.42 | 25.02 | 0.035 | 0.738 | 0.103 | VAE encode |
+| `report2ct_style` | 4 | 1.617 | 2.47 | 35.83 | 46.69 | 0.044 | 1.436 | 0.138 | VAE encode |
+
+Extended sweep to find the actual optimum (job 688301, 6 steps after 3 warmup):
+
+| config | batch | step s | vol/s | peak alloc GB | peak resv GB | verdict |
+|---|---:|---:|---:|---:|---:|---|
+| `cxr_bert_cls` | 8 | 3.109 | **2.573** | 66.95 | 85.29 | **peak throughput** |
+| `cxr_bert_cls` | 12 | 4.847 | 2.476 | 99.76 | 115.97 | slower, 83% of the card |
+| `cxr_bert_cls` | 16 | 6.909 | 2.316 | 132.57 | 133.25 | slower still, 95% of the card |
+| `cxr_bert_cls` | 24 | — | — | — | — | **OutOfMemoryError** |
+| `report2ct_style` | 8 | 3.109 | **2.573** | 68.64 | 87.03 | **peak throughput** |
+| `report2ct_style` | 12 | 4.934 | 2.432 | 101.45 | 117.68 | slower |
+| `report2ct_style` | 16 | 7.073 | 2.262 | 134.27 | 134.77 | slower |
+| `report2ct_style` | 24 | — | — | — | — | **OutOfMemoryError** |
+
+**Batch 8 is the measured optimum, not merely the largest that fits.** Throughput rises 2.08 → 2.35
+→ 2.55 → 2.573 vol/s to batch 8, then *falls* to 2.476 at 12 and 2.316 at 16 — larger batches are
+strictly worse on both axes. At batch 8 the card is 61% reserved, which is the headroom validation
+generation needs.
+
+**The dominant cost is the on-the-fly VAE encode — ~90% of every step — not the conditioning and not
+the denoiser.** Text encoding is 0.3–0.6% of a step for A/B and 1.8–2.7% for C. Consequences:
+
+1. **The three configurations are within ~3% of each other on throughput and ~3% on memory.** The
+   choice between them is a quality decision, not a performance one. (Configuration C does carry
+   ~445M more frozen encoder parameters and a 2560-wide projection: +1.4 GB reserved at batch 4 and
+   +3.67M trainable adapter parameters.)
+2. **Do not micro-optimise the text encoders.** Report2CT precomputed and cached all embeddings;
+   here that would save ~3% of a step. Caching *latents* instead would save ~90% — that is the real
+   optimisation available, and it is a deliberate design choice documented in `training.py`
+   (difference 3: latents on the fly, one fewer on-disk stage).
+
+Batch-size recommendations follow the measurement, with headroom: the recommended size is the
+largest whose peak **reserved** memory stays under 75% of the card, because validation generation
+runs a full sampler plus a MedicalNet forward pass in the same process and its peak is *not* in the
+table above.
+
+| GPUs | batch/GPU | grad accum | effective batch | reserved/GPU | notes |
+|---:|---:|---:|---:|---:|---|
+| 1 | 8 | 8 | 64 | 85–87 GB | measured optimum; 61% of the card |
+| 2 | 8 | 4 | 64 | 85–87 GB | |
+| 4 | 8 | 2 | 64 | 85–87 GB | **the recommended real-run shape** |
+| 8 (2 nodes) | 8 | 1 | 64 | 85–87 GB | multi-node **untested** — see below |
+
+Drop to `--batch-size 4 --grad-accumulation-steps 16` if a validation pass ever OOMs: it costs ~1%
+throughput (2.55 vs 2.573 vol/s) and halves the training-step peak to ~46 GB.
+
+**Honest limits on these numbers.**
+
+- **All measurements are single-GPU.** Multi-GPU DDP throughput, scaling efficiency, and multi-node
+  were **not measured**. The DDP code path is exercised only by the unit tests
+  (`ShardedBatchSampler`, rank-0 gating) and by the launcher's own refusal to run un-launched — no
+  4-GPU job was run. Treat the 2/4/8-GPU rows as arithmetic on the per-GPU measurement, not as
+  measured scaling.
+- **Batch sizes were probed at 1, 2, 4, 8, 12, 16, 24**, so the optimum is bracketed but not
+  resolved between 8 and 12.
+- **Every number is the 256³ fallback bucket**, the largest grid in §9.8. The real per-bucket shapes
+  are smaller (a T2w/CORONAL volume is 192³, ~42% of the voxels), so these are the worst case and
+  real training will be faster and lighter.
+- `radbert_mean` was measured only to batch 4; it is within 0.2% of `cxr_bert_cls` at every shared
+  size and has an identical parameter count, so batch 8 is expected to match — expected, not
+  measured.
+- **Validation-pass peak memory was not measured**, which is exactly why the recommendation is the
+  75%-of-card size rather than the 95%-of-card one.
+
+Optimisations applied, all stable and all evidence-backed: bf16 autocast (`--no-amp` disables), TF32
+for matmul and cuDNN, PyTorch SDPA, pinned host memory, persistent dataloader workers,
+`prefetch_factor=4`, gradient accumulation, DDP with `find_unused_parameters=True`, and frozen
+encoders under `torch.no_grad` so no activation is retained for a backward pass that never reaches
+them. **Not** applied: FP8, FSDP, `torch.compile` — none is needed when 90% of the step is one
+frozen VAE call, and each would add a failure mode for no measured gain.
+
+### 9.8 Volume geometry, end to end
+
+Shape and spacing are **fixed per (modality, plane) bucket** — not global, not per sample. One
+bucket = one geometry = one `.npz` archive = one FID. Each sits on NVIDIA's published FOV for that
+pair: shape = nearest multiple of **32** (the diffusion UNet's constraint), spacing = FOV / shape.
+
+Axis order, the single most bug-prone thing here:
+
+```
+NIfTI / on-disk / internal geometry   (D, H, W) = (S, R, A)
+crossing the package boundary          (X, Y, Z) = (R, A, S)
+PyTorch training tensor                (B, C, X, Y, Z)
+```
+
+Convert only via `geometry.dhw_to_xyz` / `xyz_to_dhw`. A skipped conversion is **silent** for a cube
+at isotropic spacing (256³ @ 1 mm) and scrambles axes otherwise.
+
+| Stage | Shape | Axis order | Spacing | Orientation | Evidence |
+|---|---|---|---:|---|---|
+| Raw source (NIfTI in shard tar) | variable per series | `(X, Y, Z)` | variable, from header | as acquired | `manifest.native_shape` / `native_spacing_mm` |
+| After reorient → resample → crop/pad → normalize | per-bucket, below | `(D, H, W)` | per-bucket | RAS | `_preprocess_ops.preprocess_nii` |
+| Dataset output = **model input** | per-bucket, below | **`(X, Y, Z)`** | per-bucket | RAS | `dataset.py` `permute(0,2,3,1)` |
+| Latent | model input ÷ **4** | `(X, Y, Z)` | ×4 | RAS | `sampling.official_latent_divisor([64,128,256,512]) = 4` |
+| Model output (denoiser) | = latent | `(X, Y, Z)` | ×4 | RAS | `sample_latent` |
+| Decoded + postprocessed | = model input | `(X, Y, Z)` | per-bucket | RAS | `postprocess_mr`, int16, range [0, 1000] |
+| Saved `.nii.gz` | = model input | `(X, Y, Z)` | per-bucket | axis-aligned affine, diag = spacing | `sampling.save_volume` |
+| Evaluator input | = saved | `(X, Y, Z)` | per-bucket | — | `eval/` reads only `.npy`; **never resizes** |
+
+Per bucket (verified at runtime; every `(D,H,W)` divisible by 32, every `(X,Y,Z)` by 4):
+
+| bucket | FOV mm (D,H,W) | shape (D,H,W) | **shape (X,Y,Z)** | **spacing (X,Y,Z) mm** | latent (X,Y,Z) |
+|---|---|---|---|---|---|
+| T1w/AXIAL | (174, 240, 240) | (160, 256, 256) | (256, 256, 160) | (0.938, 0.938, 1.087) | (64, 64, 40) |
+| T1w/SAGITTAL | (250, 176, 250) | (256, 192, 256) | (192, 256, 256) | (0.917, 0.977, 0.977) | (48, 64, 64) |
+| T1w/CORONAL | (240, 240, 200) | (256, 256, 192) | (256, 192, 256) | (0.938, 1.042, 0.938) | (64, 48, 64) |
+| T2w/AXIAL | (158, 240, 240) | (160, 256, 256) | (256, 256, 160) | (0.938, 0.938, 0.988) | (64, 64, 40) |
+| T2w/SAGITTAL | (240, 162, 240) | (256, 160, 256) | (160, 256, 256) | (1.012, 0.938, 0.938) | (40, 64, 64) |
+| T2w/CORONAL | (200, 200, 180) | (192, 192, 192) | (192, 192, 192) | (1.042, 0.938, 1.042) | (48, 48, 48) |
+| FLAIR/AXIAL | (175, 250, 250) | (160, 256, 256) | (256, 256, 160) | (0.977, 0.977, 1.094) | (64, 64, 40) |
+| FLAIR/SAGITTAL | (250, 176, 250) | (256, 192, 256) | (192, 256, 256) | (0.917, 0.977, 0.977) | (48, 64, 64) |
+| FLAIR/CORONAL | (250, 250, 200) | (256, 256, 192) | (256, 192, 256) | (0.977, 1.042, 0.977) | (64, 48, 64) |
+| SWI/AXIAL | (145, 230, 230) | (160, 224, 224) | (224, 224, 160) | (1.027, 1.027, 0.906) | (56, 56, 40) |
+| SWI/SAGITTAL | (230, 140, 230) | (224, 128, 224) | (128, 224, 224) | (1.094, 1.027, 1.027) | (32, 56, 56) |
+| SWI/CORONAL | (230, 230, 155) | (224, 224, 160) | (224, 160, 224) | (1.027, 0.969, 1.027) | (56, 40, 56) |
+| MRA/AXIAL | (158, 220, 220) | (160, 224, 224) | (224, 224, 160) | (0.982, 0.982, 0.988) | (56, 56, 40) |
+| MRA/SAGITTAL | (250, 158, 250) | (256, 160, 256) | (160, 256, 256) | (0.988, 0.977, 0.977) | (40, 64, 64) |
+| MRA/CORONAL | (240, 240, 179) | (256, 256, 192) | (256, 192, 256) | (0.938, 0.932, 0.938) | (64, 48, 64) |
+| *fallback* (unlisted pair) | (256, 256, 256) | (256, 256, 256) | (256, 256, 256) | (1.0, 1.0, 1.0) | (64, 64, 64) |
+
+**Does inference have enough information to restore the intended geometry? Yes, and it is not
+leakage.** Shape and spacing come from the cohort's frozen `GeometrySpec`, which is a property of
+the *request* ("generate an axial T1w at this grid"), not of the held-out target — the cohort
+contract freezes the grid before any model runs. `save_volume` writes an axis-aligned affine whose
+diagonal is the spacing. **There is no inverse transform back to the native grid**, by design: the
+evaluator compares on the cohort grid and excludes a shape mismatch with a reason rather than
+resizing.
+
+### 9.9 Checkpoints
+
+Both layouts come from one writer, `models/adapter.save_adapter_checkpoint`. Module ownership is by
+**module identity** (`adapter_modules`), cross-checked against `CONDITIONING_PREFIXES`, with a raise
+if the two disagree — not substring matching over parameter names.
+
+**Files.** `adapter_last.pt`, `adapter_step<N>.pt` (periodic, `--save-every-steps`, retained
+`--keep-last-n` deep), `adapter_best_fid.pt` (lowest FID), `adapter_best_alignment.pt` (highest
+alignment). Retention never touches `last` or either `best`.
+
+**Contents** — a full resume plus a lightweight conditioning checkpoint in the same file, because
+the frozen 180.5M base is deliberately *not* stored (it is unchanged by construction; storing it
+would make every checkpoint ~700 MB of a file the workspace already has, and let a stale copy
+diverge):
+
+| key | what |
+|---|---|
+| `adapter_state_dict` | `context_proj`, `null_context`, `{down,mid,up}_cross_attn` — the trainable conditioning path, and nothing else |
+| `optimizer_state_dict`, `lr_scheduler_state_dict`, `scaler_state_dict` | exact-resume optimiser state |
+| `step`, `optimizer_step`, `epoch` | micro-step and optimizer-step clocks, kept separately |
+| `rng_state` | `torch`, the report-dropout generator, and CUDA RNG for all devices |
+| `best_metrics` | `{fid, alignment}`, carried across resumes |
+| `config` | `context_dim`, `cross_attention_dim`, `conditioning_levels`, `condition_mid`, **`conditioning_name`**, **`report_format`**, dropout/guidance settings, `num_train_timesteps` |
+| `text_encoder` | the full conditioning identity: kind, pooling, section order, encoder order, per-encoder dims, checkpoint paths, `hf_repo`, `trainable` |
+| `base_checkpoint` | path + sha256 of NVIDIA's frozen denoiser |
+| `scale_factor`, `loss`, `validation` | provenance |
+
+```bash
+# resume (compatibility-checked automatically)
+python -m mrrate_r2v.cli.train_r2v --conditioning A ... --resume $RUN/adapter_last.pt
+
+# load only the conditioning components for inference
+python -m mrrate_r2v.cli.generate_r2v --adapter $RUN/adapter_best_fid.pt \
+    --base-checkpoint $WS/models/diff_unet_3d_rflow-mr-brain_v0.pt \
+    --vae-checkpoint  $WS/models/autoencoder_v1.pt --cohort $COHORT --out-dir $OUT
+
+# inspect what a checkpoint is, without loading a model
+python -c "import torch,json; p=torch.load('$RUN/adapter_last.pt',map_location='cpu',weights_only=False); \
+print(json.dumps({'config':p['config'],'text_encoder':p['text_encoder'],'best':p['best_metrics'], \
+'optimizer_step':p['optimizer_step']},indent=2,default=str))"
+```
+
+**Three refusals, all deliberate.** A different base checkpoint sha256 (`allow_base_mismatch`); a
+different conditioning configuration (`allow_conditioning_mismatch`) — including the two that share
+a shape, `cxr_bert_cls` and `radbert_mean` are both 768×1 and would otherwise load each other's
+weights with no shape error at all; and a cohort whose `report_format` differs from the trained one
+(`--allow-report-format-mismatch`).
+
+### 9.10 Troubleshooting
+
+| symptom | cause | fix |
+|---|---|---|
+| `needs per-section text, but this batch has no 'report_sections_text'` | a sectioned configuration fed joined text | leave `R2VDatasetConfig.conditioning_sections` at its default; do not pass `--report-format` with `report2ct_style` |
+| `adapter checkpoint was trained under a different conditioning configuration` | wrong `--conditioning` for that checkpoint | read `config['conditioning_name']` from the file; or `allow_conditioning_mismatch=True` for a deliberate transfer |
+| `report-format mismatch: the adapter was trained on ... but this cohort's text was composed with ...` | cohort and adapter disagree | rebuild the cohort with the trained format, or `--allow-report-format-mismatch` |
+| `--num-gpus 4 but WORLD_SIZE=1` | launched without `torchrun` | use the `torchrun --nproc_per_node=4` line the error prints |
+| `conditioning '<x>' built with output_dim=N, but the config table says M` | a staged snapshot is not the checkpoint the configuration was defined against | check which snapshot is in `$MRRATE_PRETRAINED_DIR` |
+| validation runs but no FID is logged | fewer usable cases than `--val-quick-samples` 16, or MedicalNet missing | raise `--val-quick-samples`, or pass `--medicalnet-checkpoint` |
+| `MedicalNet feature extractor unavailable` | wrong path | `$PRETRAINED_DIR/medicalnet/resnet_10_23dataset_statedict.pth` |
+| no validation panel in W&B | `--wandb-log-reports` not passed | pass it — and only at a private project, since the panel embeds report text |
+| W&B silent, training fine | intended: `--wandb-mode disabled`, or `wandb` missing/uncredentialed | check `wandb_run.json` in the run directory |
+| `text encoder '<x>' checkpoint directory not found` | not staged | `python -m mrrate_r2v.cli.download_text_encoders --encoders <x>` |
+| step count looks wrong vs an older run | intervals now count **optimizer** steps, not micro-steps | divide the old number by `--grad-accumulation-steps` |
+
+---
+
+## 10. Limitations and next experiments
 
 **Limitations of what was measured.**
 

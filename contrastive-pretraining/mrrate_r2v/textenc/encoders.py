@@ -350,6 +350,16 @@ class HFTextEncoder(torch.nn.Module):
         with context:
             tokens = self.model(**batch).last_hidden_state
         mask = batch["attention_mask"].to(torch.bool)
+        # pooling="cls" reads position 0. That is the model's own classification token for every
+        # checkpoint in the zoo -- verified: `[CLS]` for the BERT/ModernBERT families and `<s>` for
+        # RoBERTa, and in all eight cases `tokenizer.cls_token_id`. The invariant is asserted by
+        # tests/test_textenc_encoders.py::test_cls_pooling_reads_the_models_own_classification_token,
+        # because blind positional indexing would silently read a real word for any future
+        # checkpoint that appends its special token instead of prepending it.
+        #
+        # Having a CLS *token* is not the same as having one trained to summarise: ModernBERT
+        # declares `classifier_pooling: "mean"`, so its `[CLS]` exists but was never supervised as
+        # a sequence representation -- measured cost, 3-4 AUROC points. See docs/TEXT_ENCODERS.md.
         pooled = tokens[:, 0] if self.pooling == "cls" else masked_mean(tokens, mask)
         metadata = dict(self.identity)
         metadata["n_tokens"] = int(tokens.shape[1])

@@ -59,6 +59,9 @@ FORMATS=(raw findings impression findings_impression impression_findings
 # Override to split one slow encoder's formats across two jobs writing into the same cache
 # directory: R2V_FORMATS="full_structured clinical_findings_impression" sbatch ...
 [[ -n "${R2V_FORMATS:-}" ]] && read -r -a FORMATS <<< "$R2V_FORMATS"
+# Extra flags for one-off variants, e.g. the CLS-only study: R2V_EMBED_ARGS="--pooling cls"
+EMBED_EXTRA=()
+[[ -n "${R2V_EMBED_ARGS:-}" ]] && read -r -a EMBED_EXTRA <<< "$R2V_EMBED_ARGS"
 
 echo "run=$RUN_NAME max_length=$MAX_LENGTH train_limit=$TRAIN_LIMIT encoders=${*:-all} -> $OUT"
 # HF_HUB_OFFLINE: every checkpoint is staged locally; a hub call here would be a bug, not a fallback.
@@ -81,6 +84,7 @@ run_py_text mrrate_r2v.cli.embed_reports \
     --pretrained-dir "$PRETRAINED_DIR" \
     --formats "${FORMATS[@]}" \
     "${ENCODER_ARGS[@]}" \
+    "${EMBED_EXTRA[@]}" \
     "${LENGTH_ARGS[@]}"
 
 echo "=== caches ==="
