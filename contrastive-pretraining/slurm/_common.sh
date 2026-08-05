@@ -19,6 +19,13 @@ SIF_IMAGE="$WORKSPACE/containers/nvidia_mri_vae_dmvae.sif"
 # text-encoder stack). Its torch is >= 2.6, so RadBERT's pytorch_model.bin loads directly.
 SIF_IMAGE_TEXT="$WORKSPACE/containers/nvidia+redbert.sif"
 RADBERT_CHECKPOINT="$WORKSPACE/pretrained/RadBERT-RoBERTa-4m"
+PRETRAINED_DIR="$WORKSPACE/pretrained"
+# The text-encoder benchmark's CPU scoring stage needs scikit-learn, which neither container has.
+# It runs on the host module-system python instead (see run_py_host); the GPU embedding stage
+# still runs in SIF_IMAGE_TEXT like every other model job.
+HOST_PYTHON="${R2V_HOST_PYTHON:-/apps/python/3.12-conda/envs/pytorch2.5.1/bin/python3}"
+TEXTBENCH_ROOT="$WORKSPACE/cache/r2v/textbench"
+REPORT_CORPUS="$WORKSPACE/cache/r2v/report_analysis/reports_all.jsonl"
 
 # Persistent artifacts. Cohorts and predictions are large -- workspace only, never git or $HOME.
 MANIFEST_CSV="$DATA_WORKSPACE/r2v_manifest/manifest_shards_native.csv"
@@ -72,4 +79,12 @@ run_sh() {
 run_py_text() {
     [[ -n "${APPTAINER_ARGS+x}" ]] || { echo "run_py_text called before setup()" >&2; exit 1; }
     apptainer exec "${APPTAINER_ARGS[@]}" "$SIF_IMAGE_TEXT" python3 -m "$@"
+}
+
+# run_py_host <module> [args...] -- no container, host python, for the CPU-only scoring stages
+# that need scikit-learn. Never use this for anything touching a model checkpoint or a GPU:
+# the containers exist precisely so those runs are reproducible.
+run_py_host() {
+    [[ -x "$HOST_PYTHON" ]] || { echo "HOST_PYTHON not executable: $HOST_PYTHON" >&2; exit 1; }
+    PYTHONPATH="$CP_ROOT" "$HOST_PYTHON" -m "$@"
 }

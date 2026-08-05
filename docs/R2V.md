@@ -5,6 +5,11 @@ This is the only document you need; the per-module READMEs
 ([data](../contrastive-pretraining/mrrate_r2v/data/README.md),
 [eval](../contrastive-pretraining/mrrate_r2v/eval/README.md)) go deeper on their own area.
 
+For the *conditioning* side — which text encoder, which report format, and where modality/spacing
+should come from — see **[TEXT_ENCODERS.md](TEXT_ENCODERS.md)** and the
+[textenc](../contrastive-pretraining/mrrate_r2v/textenc/README.md) /
+[textbench](../contrastive-pretraining/mrrate_r2v/textbench/README.md) READMEs.
+
 All code lives in one package: `contrastive-pretraining/mrrate_r2v/`. Run everything from
 `contrastive-pretraining/`.
 
@@ -467,15 +472,19 @@ contrastive-pretraining/
                        and the strict pretrained-checkpoint loader
     models/adapter.py  what is trainable (asserted, not assumed) + the adapter checkpoint format
     text.py            the replaceable text-encoder seam: RadBERT, a test mock, one registry
+    textenc/           the encoder zoo + report formats + fusion            (README.md)
+    textbench/         encoder x format selection benchmark; never imported by the trainer
+                       (README.md; results and rationale in docs/TEXT_ENCODERS.md)
     conditioning.py    modality ids, NVIDIA's own modality dropout, report dropout, CFG
     training.py        adapter training; mirrors NV-Generate-CTMR/scripts/diff_model_train.py
     sampling.py        report-to-volume sampling; mirrors scripts/diff_model_infer.py
-    cli/               the seven entry points
+    cli/               the entry points (nine generation + four text-encoder)
   scripts/             the contrastive-pretraining pipeline (separate; see its own README)
-  slurm/               _common.sh + five numbered job scripts
+  slurm/               _common.sh + the numbered job scripts
   tests/
 docs/
   R2V.md               this file
+  TEXT_ENCODERS.md     report analysis, the encoder zoo, formats, metadata conditioning
   design/archive/      the audits and design records behind these decisions
   nhr_official_docs/   FAU cluster documentation
 ```

@@ -1,0 +1,62 @@
+### Starting TaskPrologue of job 685194 on h33-40 at Wed Aug  5 00:38:16 CEST 2026
+Running on cores 48-95 with governor performance
+No GPU known
+### Finished TaskPrologue
+
+=== job 685194 on h33-40.nhr.fau.de ===
+R2V_REPO=/home/hpc/y100dc/y100dc19/VLM3D-MRI-R2V-MICCAI-26/MR-RATE
+2026-08-05 00:38:19,715 INFO embed_reports torch threads: 48 (SLURM_CPUS_PER_TASK=48)
+2026-08-05 00:38:23,267 INFO embed_reports split train: 20000 studies
+2026-08-05 00:38:26,215 INFO embed_reports split test: 5568 studies
+2026-08-05 00:38:26,674 INFO embed_reports mined 2388 negation minimal pairs over 189 topics
+Loading weights:   0%|          | 0/197 [00:00<?, ?it/s]Loading weights: 100%|██████████| 197/197 [00:00<00:00, 4701.22it/s]
+2026-08-05 00:38:30,623 INFO embed_reports === cxr_bert: dim=768 max_length=512 (supports 512) on cpu
+2026-08-05 00:38:30,623 INFO embed_reports   [run ] cxr_bert/findings_impression/train (20000 studies)
+2026-08-05 00:38:30,752 WARNING mrrate_r2v.textenc cxr_bert: truncating reports at 512 tokens (first offender was 610 tokens). Truncation is counted in encoder.truncation and reported by log_truncation_summary().
+    64/20000 (10 reports/s)
+    1344/20000 (18 reports/s)
+    2624/20000 (18 reports/s)
+    3904/20000 (19 reports/s)
+    5184/20000 (19 reports/s)
+    6464/20000 (19 reports/s)
+    7744/20000 (19 reports/s)
+    9024/20000 (19 reports/s)
+    10304/20000 (19 reports/s)
+    11584/20000 (19 reports/s)
+    12864/20000 (19 reports/s)
+    14144/20000 (19 reports/s)
+    15424/20000 (19 reports/s)
+    16704/20000 (20 reports/s)
+    17984/20000 (20 reports/s)
+    19264/20000 (20 reports/s)
+2026-08-05 00:55:28,606 INFO embed_reports         20 reports/s, truncated 1.72%
+2026-08-05 00:55:28,606 INFO embed_reports   [run ] cxr_bert/findings_impression/test (5568 studies)
+    64/5568 (19 reports/s)
+    1344/5568 (21 reports/s)
+    2624/5568 (21 reports/s)
+    3904/5568 (20 reports/s)
+    5184/5568 (20 reports/s)
+2026-08-05 01:00:06,852 INFO embed_reports         20 reports/s, truncated 1.56%
+2026-08-05 01:00:17,760 INFO embed_reports   [run ] negation pairs: 2388 in 10.9s
+2026-08-05 01:00:17,761 INFO mrrate_r2v.textenc cxr_bert truncation: 431/30344 sequences (1.42%) over 512 tokens; longest seen 1084; 37413 tokens dropped
+2026-08-05 01:00:17,761 INFO embed_reports === cxr_bert truncation over the whole run: {'n_sequences': 30344, 'n_truncated': 431, 'fraction_truncated': 0.014203796467176377, 'max_length': 512, 'longest_seen': 1084, 'dropped_tokens': 37413}
+2026-08-05 01:00:17,769 INFO embed_reports caches in /hnvme/workspace/y100dc19-nvidia-mri-brain/cache/r2v/textbench/cxr_meanpool/embeddings
+=== JOB_STATISTICS ===
+=== current date     : Wed Aug  5 01:00:19 CEST 2026
+= Job-ID             : 685194 on helma
+= Job-Name           : emb_cxr_meanpool
+= Job-Command        : (null)
+= Initial workdir    : /home/hpc/y100dc/y100dc19/VLM3D-MRI-R2V-MICCAI-26/MR-RATE/contrastive-pretraining
+= Queue/Partition    : cpu
+= Slurm account      : y100dc with QOS=mq_health
+= Requested resources: cpu=48,mem=93600M,node=1,billing=48 for 02:00:00
+= Elapsed runtime    : 00:22:03
+= Total RAM usage    : 5.6 GiB of assigned 91 GiB (6.2%)
+= Node list          : h33-40
+= Subm/Elig/Start/End: 2026-08-05T00:38:04 / 2026-08-05T00:38:04 / 2026-08-05T00:38:16 / 2026-08-05T01:00:19
+======================
+=== Quota infos ======
+    Path                 Used     SoftQ    HardQ    Gracetime  Filec    FileQ    FiHaQ    FileGrace    
+    /home/hpc              82.5G   104.9G   209.7G        N/A      97K     500K   1,000K        N/A    
+    /hnvme                 10.3T     0.0K     0.0K        N/A  46,100       61K      81K        N/A    
+======================

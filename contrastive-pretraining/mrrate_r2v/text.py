@@ -282,10 +282,37 @@ class RadBertEmbedder(torch.nn.Module):
 TEXT_EMBEDDERS = {"radbert": RadBertEmbedder, "mock": MockTextEmbedder}
 
 
+def _textenc_names():
+    """The `textenc` zoo's encoder names, or () if that subpackage's deps are unavailable.
+
+    Imported lazily and defensively so this module keeps working exactly as before on an
+    interpreter where the zoo cannot be imported -- `radbert` and `mock` never depend on it.
+    """
+    try:
+        from .textenc.encoders import ENCODER_SPECS
+    except Exception:  # noqa: BLE001 -- availability probe, never fatal
+        return ()
+    return tuple(ENCODER_SPECS)
+
+
 def build_text_embedder(name: str, **kwargs) -> TextEmbedder:
-    """The one place a concrete encoder class is named. Everything else takes a `TextEmbedder`."""
+    """The one place a concrete encoder class is named. Everything else takes a `TextEmbedder`.
+
+    Names resolve in two tiers: this module's own `TEXT_EMBEDDERS` first (so `radbert` keeps its
+    long-standing behaviour byte-for-byte), then `textenc.ENCODER_SPECS` for the encoder zoo.
+    """
     if name not in TEXT_EMBEDDERS:
-        raise ValueError(f"unknown text encoder '{name}'. Choose from: {sorted(TEXT_EMBEDDERS)}")
+        if name in _textenc_names():
+            from .textenc.encoders import build_encoder
+
+            embedder = build_encoder(name, **kwargs)
+            if embedder.output_dim <= 0:
+                raise ValueError(f"text encoder '{name}' reported output_dim={embedder.output_dim}")
+            return embedder
+        raise ValueError(
+            f"unknown text encoder '{name}'. Choose from: "
+            f"{sorted(set(TEXT_EMBEDDERS) | set(_textenc_names()))}"
+        )
     embedder = TEXT_EMBEDDERS[name](**kwargs)
     if embedder.output_dim <= 0:
         raise ValueError(f"text encoder '{name}' reported output_dim={embedder.output_dim}")

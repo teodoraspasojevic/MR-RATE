@@ -47,7 +47,12 @@ def parse_args(argv=None):
     data.add_argument("--manifest", type=Path, help="MR-RATE manifest CSV (cli.build_manifest output)")
     data.add_argument("--report-index", type=Path, help="report index CSV for ShardReportStore")
     data.add_argument("--split", default="train")
-    data.add_argument("--report-sections", nargs="+", default=["findings", "impression"])
+    data.add_argument("--report-sections", nargs="+", default=["findings", "impression"],
+                      help="ignored when --report-format is given")
+    data.add_argument("--report-format", default=None,
+                      help="a named format from mrrate_r2v.textenc.formats (e.g. "
+                           "impression_findings). Default: --report-sections joined, i.e. the "
+                           "historical behaviour")
     data.add_argument("--geometry-mode", default="per_modality_plane", choices=["per_modality_plane", "fixed"])
     data.add_argument("--bucket-order", default="interleave", choices=["interleave", "shuffle"],
                       help="'interleave': consecutive batches carry different modalities; "
@@ -69,8 +74,11 @@ def parse_args(argv=None):
     model.add_argument("--context-hidden-dim", type=int, default=None)
 
     text = p.add_argument_group("text encoder")
-    text.add_argument("--text-encoder", default="radbert", choices=["radbert", "mock"])
-    text.add_argument("--text-checkpoint", type=Path, default=None, help="local RadBERT snapshot directory")
+    text.add_argument("--text-encoder", default="radbert", choices=_text_encoder_choices(),
+                      help="'radbert' and 'mock' are the originals; the rest are the textenc zoo")
+    text.add_argument("--text-checkpoint", type=Path, default=None,
+                      help="local snapshot directory; zoo encoders default to "
+                           "$MRRATE_PRETRAINED_DIR/<their directory>")
     text.add_argument("--max-report-tokens", type=int, default=512)
     text.add_argument("--mock-output-dim", type=int, default=32, help="--text-encoder mock only")
 
@@ -111,11 +119,27 @@ def parse_args(argv=None):
     return args
 
 
+def _text_encoder_choices():
+    """The originals first, then whatever the zoo has -- so `--help` lists every real option and
+    argparse rejects a typo before a queue wait rather than after one."""
+    names = ["radbert", "mock"]
+    try:
+        from ..textenc.encoders import ENCODER_SPECS
+    except Exception:  # noqa: BLE001 -- the zoo's deps are optional
+        return names
+    return names + [n for n in sorted(ENCODER_SPECS) if n not in names]
+
+
 def build_text_embedder_from_args(args):
     from ..text import build_text_embedder
 
     if args.text_encoder == "mock":
         return build_text_embedder("mock", output_dim=args.mock_output_dim, max_length=16)
+    if args.text_encoder != "radbert":
+        kwargs = {"max_length": args.max_report_tokens}
+        if args.text_checkpoint is not None:
+            kwargs["checkpoint"] = str(args.text_checkpoint)
+        return build_text_embedder(args.text_encoder, **kwargs)
     return build_text_embedder(
         "radbert", checkpoint=str(args.text_checkpoint), max_length=args.max_report_tokens
     )
@@ -135,6 +159,7 @@ def build_dataloader(args, log):
     config = R2VDatasetConfig(
         split=args.split,
         report_sections=tuple(args.report_sections),
+        report_format=args.report_format,
         geometry_mode=args.geometry_mode,
         # "all": every eligible series is a training sample, so a study's report is paired with
         # each of its ~7 series. That contrast -- one report, several modalities, distinguished

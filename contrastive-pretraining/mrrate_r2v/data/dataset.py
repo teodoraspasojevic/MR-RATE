@@ -89,6 +89,11 @@ class R2VDatasetConfig:
 
     split: str = "train"
     report_sections: tuple = ("findings", "impression")
+    # A named format from `textenc.formats` (e.g. "impression_findings",
+    # "findings_impression_meta"). None -- the default -- keeps the historical behaviour exactly:
+    # `report_sections` joined by `ReportRecord.compose`. Set one and it takes over, and the name
+    # is recorded in `geometry_fingerprint` so a cohort built with it is a different cohort.
+    report_format: Optional[str] = None
     geometry_mode: str = "per_modality_plane"
     # geometry_mode="fixed" only. **Both are (D, H, W)-ordered**, like every other internal
     # geometry parameter -- NOT the (X, Y, Z) order the Dataset *returns*. If your value came from
@@ -129,6 +134,12 @@ class R2VDatasetConfig:
         for name in self.report_sections:
             if name not in REPORT_SECTION_NAMES:
                 raise ValueError(f"Unknown report section '{name}'. Choose from: {REPORT_SECTION_NAMES}")
+        if self.report_format is not None:
+            from ..textenc.formats import REPORT_FORMATS
+
+            if self.report_format not in REPORT_FORMATS:
+                raise ValueError(f"Unknown report_format '{self.report_format}'. "
+                                 f"Choose from: {sorted(REPORT_FORMATS)}")
 
     def geometry_fingerprint(self):
         """The preprocessing settings that change the returned tensor. Recorded in a
@@ -139,7 +150,12 @@ class R2VDatasetConfig:
         emitting the internal (D, H, W) here would make `cohort.json` the one file in the
         directory with a different convention.
         """
+        # `report_format` is emitted only when it is set. A cohort built before formats existed
+        # must keep its cohort_id, and an unset format changes no text -- so adding an always-present
+        # `"report_format": null` key would invalidate every existing cohort for no reason.
+        extra = {"report_format": self.report_format} if self.report_format is not None else {}
         return {
+            **extra,
             "geometry_mode": self.geometry_mode,
             "unet_spatial_multiple": UNET_SPATIAL_MULTIPLE,
             "fixed_target_shape_xyz": list(dhw_to_xyz(self.fixed_target_shape)) if self.geometry_mode == "fixed" else None,
@@ -375,7 +391,15 @@ class MRReportToVolumeDataset(Dataset):
         image = image.permute(0, 2, 3, 1).contiguous()  # [1,D,H,W] -> [1,H,W,D] = [1,X,Y,Z]
 
         report = self.report_store[row.study_uid]
-        report_text = report.compose(self.config.report_sections)
+        if self.config.report_format is None:
+            report_text = report.compose(self.config.report_sections)
+        else:
+            from ..textenc.formats import format_report
+
+            # modality/plane come from the manifest row, never parsed out of the report -- only
+            # the `*_meta` formats read them, and only because they were supplied here.
+            report_text = format_report(report, self.config.report_format,
+                                        modality=row.modality, plane=row.plane)
 
         native_shape = native_shape or (0, 0, 0)
         native_spacing = native_spacing or (0.0, 0.0, 0.0)
