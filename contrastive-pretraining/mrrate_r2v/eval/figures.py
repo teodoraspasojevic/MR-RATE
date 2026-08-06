@@ -200,7 +200,9 @@ def _png_data_uri(tiles, vmin: float, vmax: float) -> str:
 
 
 def validation_panel_html(case, generated: np.ndarray, step: int,
-                          n_slices: int = PANEL_SLICES_PER_PLANE) -> str:
+                          n_slices: int = PANEL_SLICES_PER_PLANE,
+                          epoch: int = 0, validation_index: int = 0,
+                          full: bool = False) -> str:
     """A self-contained interactive ground-truth vs generated panel for one validation case.
 
     Returns HTML with no external requests -- every image is an inline `data:` URI -- so it renders
@@ -220,6 +222,12 @@ def validation_panel_html(case, generated: np.ndarray, step: int,
 
     Report text *is* included, so this panel must not be logged to a public W&B project -- the
     caller gates that (`--wandb-log-reports`).
+
+    `validation_index`, `step` and `epoch` are rendered in the panel heading and as fields, so a
+    panel is self-describing: which validation produced it, at which optimizer step, in which epoch,
+    and whether the pass was quick or full. `validation_index` is not redundant with `step` -- two
+    passes can share a step (an interval pass and the end-of-training pass both fire at the last
+    one), and only the index separates them.
     """
     vmin, vmax = _window(np.asarray(case.target, dtype=np.float32))
     spacing = tuple(float(s) for s in (case.spacing_xyz or (1.0, 1.0, 1.0)))
@@ -257,8 +265,11 @@ def validation_panel_html(case, generated: np.ndarray, step: int,
 
     sections = case.report_sections or {}
     meta = "".join([
+        field("validation #", validation_index),
+        field("optimizer step", step),
+        field("epoch", epoch),
+        field("pass", "full" if full else "quick"),
         field("case", case.case_id),
-        field("step", step),
         field("modality", case.modality),
         field("plane", case.plane),
         field("shape (X,Y,Z)", "x".join(str(s) for s in case.shape_xyz)),
@@ -271,8 +282,12 @@ def validation_panel_html(case, generated: np.ndarray, step: int,
         for name, text in sections.items()
     ) or f'<div class="sec"><div class="sectext">{_html.escape(case.report_text[:4000])}</div></div>'
 
+    heading = (f"validation #{validation_index} &middot; optimizer step {step} &middot; "
+               f"epoch {epoch} &middot; {'full' if full else 'quick'} pass &middot; "
+               f"{_html.escape(case.modality)} {_html.escape(case.plane)}")
     return _PANEL_TEMPLATE.replace("__PANELS__", _json.dumps(panels)) \
                           .replace("__COUNT__", str(max(count, 1))) \
+                          .replace("__HEADING__", heading) \
                           .replace("__META__", meta) \
                           .replace("__REPORTS__", reports)
 
@@ -303,8 +318,10 @@ _PANEL_TEMPLATE = """
  .r2v .sectext{white-space:pre-wrap;font-size:12px;color:#cfd2d6;max-height:150px;overflow:auto}
  .r2v input[type=range]{width:100%;margin-top:6px}
  .r2v .bar{display:flex;align-items:center;gap:10px;margin-top:8px}
+ .r2v .hdr{font-weight:600;font-size:13px;color:#7cc4ff;letter-spacing:.02em;margin-bottom:2px}
 </style>
 <div class="r2v">
+  <div class="hdr">__HEADING__</div>
   <div class="grid" id="planes"></div>
   <div class="bar">
     <span class="k" style="min-width:auto">slice</span>

@@ -133,14 +133,22 @@ def set_loader_epoch(train_loader, epoch: int) -> None:
 
 def wrap_distributed(model, device):
     """`diff_model_train.py:155-159`. `find_unused_parameters=True` matters more here than there:
-    with report dropout, an adapter can go unused within a step."""
+    with report dropout, an adapter can go unused within a step.
+
+    `device_ids` is passed **only for a CUDA module**. DDP rejects it for a CPU module -- "device_ids
+    and output_device arguments only work with single-device/multiple-device GPU modules or CPU
+    modules" -- which broke the gloo/CPU path that exists so the whole distributed wiring can be
+    smoke-tested without booking GPUs.
+    """
     import torch.distributed as dist
 
     if not dist.is_initialized():
         return model
     from torch.nn.parallel import DistributedDataParallel
 
-    return DistributedDataParallel(model, device_ids=[device], find_unused_parameters=True)
+    on_cuda = next(model.parameters()).is_cuda
+    kwargs = {"device_ids": [device]} if on_cuda else {}
+    return DistributedDataParallel(model, find_unused_parameters=True, **kwargs)
 
 
 # --------------------------------------------------------------------------- latents
@@ -153,11 +161,13 @@ class LatentEncoder:
     `required_spatial_divisor` and `pad_to_divisible`, so it matches `cli/predict_vae.py`.
     """
 
-    def __init__(self, autoencoder, divisor: int, scale_factor: float, amp: bool = True) -> None:
+    def __init__(self, autoencoder, divisor: int, scale_factor: float, amp: bool = True,
+                 dtype: torch.dtype = torch.bfloat16) -> None:
         self.autoencoder = autoencoder
         self.divisor = int(divisor)
         self.scale_factor = float(scale_factor)
         self.amp = amp
+        self.dtype = dtype
         for parameter in autoencoder.parameters():
             parameter.requires_grad_(False)
         autoencoder.eval()
@@ -175,7 +185,9 @@ class LatentEncoder:
                 pads.extend([int(axis["before"]), int(axis["after"])])
             images = torch.nn.functional.pad(images, pads)
         device_type = "cuda" if images.is_cuda else "cpu"
-        with autocast(device_type, enabled=self.amp and images.is_cuda):
+        # Same dtype as the training step: a float16 VAE encode can overflow on an unusual
+        # volume and hand the denoiser inf latents, which looks like a diverging adapter.
+        with autocast(device_type, enabled=self.amp and images.is_cuda, dtype=self.dtype):
             latent = self.autoencoder.encode_stage_2_inputs(images.float())
         return latent.float() * self.scale_factor
 
@@ -194,6 +206,17 @@ class TrainingConfig:
     grad_accumulation_steps: int = 1
     grad_clip_norm: Optional[float] = None
     amp: bool = True
+    #: Autocast dtype. **bfloat16 by default, deliberately diverging from the official trainer.**
+    #: `torch.amp.autocast("cuda")` with no dtype silently means *float16*, and float16 overflows:
+    #: an LR sweep (jobs 689068-71) produced NaN at the identical step for every learning rate
+    #: from 1e-5 to 3e-4, with losses matching to four decimals -- i.e. not divergence, an
+    #: overflow. bfloat16 has float32's exponent range, is native on H200 (bf16_supported=True),
+    #: and needs no GradScaler. Set "float16" to reproduce NVIDIA's exact setup.
+    amp_dtype: str = "bfloat16"
+    #: Consecutive non-finite losses tolerated before the run is stopped. One is survivable (the
+    #: scaler skips the step); a run of them means the weights are gone and every later number,
+    #: including every validation metric, is meaningless. Failing fast beats burning the walltime.
+    max_consecutive_nonfinite: int = 5
     seed: int = 0
     log_every: int = 1
     # All three count **optimizer** steps, not micro-steps, so their meaning does not change with
@@ -216,6 +239,8 @@ class TrainingConfig:
             raise ValueError(f"save_format must be adapter|full|both, got {self.save_format!r}")
         if self.grad_accumulation_steps < 1:
             raise ValueError("grad_accumulation_steps must be >= 1")
+        if self.amp_dtype not in ("bfloat16", "float16"):
+            raise ValueError(f"amp_dtype must be bfloat16|float16, got {self.amp_dtype!r}")
         if self.keep_last_n is not None and self.keep_last_n < 1:
             raise ValueError("keep_last_n must be >= 1 or None (keep everything)")
 
@@ -256,14 +281,26 @@ class MRRateAdapterTrainer:
         torch.set_float32_matmul_precision("highest")  # diff_model_train.py:480
         torch.manual_seed(config.seed)
 
-        self.freeze_report = freeze_to_adapter_only(unet, text_embedder)
+        # Every adapter introspection goes through `_unwrapped()`, so the trainer accepts a model
+        # that is already DDP-wrapped. `freeze_to_adapter_only` and `assert_only_adapter_trainable`
+        # read `context_proj` / `CONDITIONING_PREFIXES` off the module, and DDP does not forward
+        # attribute access -- passing the wrapper raised
+        # "'DistributedDataParallel' object has no attribute 'context_proj'".
+        self.freeze_report = freeze_to_adapter_only(self._unwrapped(), text_embedder)
         self.loss_fn = build_loss()
         adapter_params = [p for p in unet.parameters() if p.requires_grad]
         self.optimizer = build_optimizer(adapter_params, config.lr)
         self.lr_scheduler = None
-        self.scaler = GradScaler("cuda", enabled=config.amp and self.device.type == "cuda")
+        self.amp_dtype = getattr(torch, config.amp_dtype)
+        # A GradScaler exists to stop float16 gradients underflowing. bfloat16 has float32's
+        # exponent range, so scaling it is pointless and PyTorch recommends against it.
+        self.scaler = GradScaler(
+            "cuda",
+            enabled=config.amp and self.device.type == "cuda" and self.amp_dtype is torch.float16,
+        )
+        self._nonfinite_streak = 0
         # The gate that makes "only adapters train" a checked fact rather than an intention.
-        assert_only_adapter_trainable(unet, self.optimizer, text_embedder)
+        assert_only_adapter_trainable(self._unwrapped(), self.optimizer, text_embedder)
         log.info("adapter training: %s", self.freeze_report.format())
         self.step = 0            # micro-steps (one per forward/backward)
         self.optimizer_step = 0  # optimizer steps -- what every interval and every log is keyed on
@@ -318,7 +355,8 @@ class MRRateAdapterTrainer:
         prepared = self.prepare_batch(batch)
         latents = prepared["latents"]
         amp_enabled = self.config.amp and self.device.type == "cuda"
-        with autocast("cuda" if self.device.type == "cuda" else "cpu", enabled=amp_enabled):
+        with autocast("cuda" if self.device.type == "cuda" else "cpu", enabled=amp_enabled,
+                      dtype=self.amp_dtype):
             noise = torch.randn_like(latents)
             timesteps = official_timesteps(self.noise_scheduler, latents, self.num_train_timesteps)
             noisy = self.noise_scheduler.add_noise(original_samples=latents, noise=noise, timesteps=timesteps)
@@ -333,6 +371,35 @@ class MRRateAdapterTrainer:
             )
             target = official_target(self.noise_scheduler, latents, noise, timesteps)
             loss = self.loss_fn(model_output.float(), target.float())
+
+        if not torch.isfinite(loss):
+            self._nonfinite_streak += 1
+            # Name the first non-finite tensor: overflow in the frozen VAE encode, a degenerate
+            # input volume, and a diverging adapter are three different bugs with three different
+            # fixes, and the loss value alone cannot tell them apart.
+            culprit = next(
+                (name for name, tensor in (("image", batch.get("image")), ("latents", latents),
+                                           ("context", prepared["context"]),
+                                           ("model_output", model_output), ("target", target))
+                 if tensor is not None and not torch.isfinite(tensor).all()),
+                "none (loss only)",
+            )
+            log.error("non-finite loss at optimizer step %d (streak %d/%d); first non-finite "
+                      "tensor: %s. amp=%s dtype=%s", self.optimizer_step, self._nonfinite_streak,
+                      self.config.max_consecutive_nonfinite, culprit, self.config.amp,
+                      self.config.amp_dtype)
+            if self._nonfinite_streak >= self.config.max_consecutive_nonfinite:
+                raise RuntimeError(
+                    f"loss has been non-finite for {self._nonfinite_streak} consecutive steps "
+                    f"(first non-finite tensor: {culprit}). Every metric from here on is "
+                    f"meaningless. With amp_dtype=float16 this is usually overflow -- use "
+                    f"bfloat16 (the default)."
+                )
+            self.optimizer.zero_grad(set_to_none=True)
+            self.step += 1
+            return {"loss": float("nan"), "lr": self.optimizer.param_groups[0]["lr"],
+                    "stepped": False, "n_dropped_reports": 0, "timestep_mean": 0.0}
+        self._nonfinite_streak = 0
 
         scaled = loss / self.config.grad_accumulation_steps
         if self.scaler.is_enabled():
@@ -420,10 +487,36 @@ class MRRateAdapterTrainer:
 
     def validate_now(self, validate, full: bool = False) -> dict:
         """Run validation and act on it. Every rank calls this -- `validate` is responsible for its
-        own sharding and gathering -- but only rank 0 writes checkpoints or logs."""
+        own sharding and gathering -- but only rank 0 writes checkpoints or logs.
+
+        **Only the headline metrics reach W&B, and they are split by pass.** A pass returns ~47
+        numbers (per plane, per bucket, rank flags, timings, counts, the sensitivity diagnostic);
+        logging all of them produced a dashboard nobody could read. So the curves are exactly six:
+
+            val/quick/{fvd,fid_2p5d,ssim}   frequent, few samples
+            val/full/{fvd,fid_2p5d,ssim}    infrequent, many samples
+
+        Two separate series rather than one, because a quick and a full pass measure the *same*
+        metric at different N -- and for a Frechet distance N is part of the number. Overlaying them
+        on one curve would draw a step change that is a sample-size artefact, not a model change.
+        All three metrics are computed on whichever samples a pass evaluates, so the two series are
+        each internally comparable.
+
+        Everything else stays in the returned payload and lands in `train_summary.json`.
+        """
+        from .validation import HEADLINE_METRICS
+
         validation = validate(self, self.optimizer_step, full)
-        self._log_metrics({k: v for k, v in validation.items() if isinstance(v, (int, float))},
-                          step=self.optimizer_step)
+        kind = "full" if validation.get("val/full") else "quick"
+        curves = {}
+        for metric in HEADLINE_METRICS:
+            value = validation.get(f"val/{metric}")
+            if isinstance(value, (int, float)) and value == value:      # present and not NaN
+                curves[f"val/{kind}/{metric}"] = float(value)
+        # Reference lines are constants, so they belong on the same axes as the curves above.
+        curves.update({k: v for k, v in validation.items()
+                       if k.startswith("val/reference/") and isinstance(v, (int, float))})
+        self._log_metrics(curves, step=self.optimizer_step)
         self._maybe_save_best(validation)
         return validation
 

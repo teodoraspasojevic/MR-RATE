@@ -163,6 +163,10 @@ def parse_args(argv=None):
     train.add_argument("--grad-accumulation-steps", type=int, default=1)
     train.add_argument("--grad-clip-norm", type=float, default=None)
     train.add_argument("--no-amp", dest="amp", action="store_false", help="disable mixed precision")
+    train.add_argument("--amp-dtype", default="bfloat16", choices=["bfloat16", "float16"],
+                       help="bfloat16 is the default and diverges from NVIDIA deliberately: "
+                            "float16 autocast overflowed to NaN at the same step for every LR "
+                            "from 1e-5 to 3e-4. bf16 is native on H200 and needs no GradScaler")
     train.add_argument("--seed", type=int, default=0)
     train.add_argument("--log-every", type=int, default=10)
     train.add_argument("--save-every-steps", type=int, default=None,
@@ -176,7 +180,10 @@ def parse_args(argv=None):
     train.add_argument("--scale-factor", default="auto",
                        help="'auto' = from the base checkpoint (matches official inference), "
                             "'recompute' = 1/std(z) of the first batch (official training), or a literal")
-    train.add_argument("--num-gpus", type=int, default=1)
+    train.add_argument("--num-gpus", type=int, default=1,
+                       help="TOTAL world size (ranks), not GPUs per node. 2 nodes x 4 GPUs = 8. "
+                            "Cross-checked against torchrun's WORLD_SIZE, which is the only thing "
+                            "that actually knows")
     train.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
 
     cond = p.add_argument_group("conditioning")
@@ -190,8 +197,13 @@ def parse_args(argv=None):
                    if getattr(args, name) is None]
         if missing:
             p.error(f"--{', --'.join(m.replace('_', '-') for m in missing)} required unless --dry-run")
-    if args.text_encoder == "radbert" and args.text_checkpoint is None and not args.dry_run:
-        p.error("--text-checkpoint is required for --text-encoder radbert")
+    # `--text-encoder` keeps its "radbert" default even when `--conditioning` supersedes it, so this
+    # legacy requirement must not fire in that case -- it predates `--conditioning` and would
+    # otherwise reject every named configuration for a checkpoint it never uses.
+    if (not args.conditioning and args.text_encoder == "radbert"
+            and args.text_checkpoint is None and not args.dry_run):
+        p.error("--text-checkpoint is required for --text-encoder radbert "
+                "(not needed with --conditioning, which resolves its own checkpoints)")
     return args
 
 
@@ -280,7 +292,9 @@ def setup_distributed(args):
     than silently training N independent single-GPU models (which is what this CLI did before).
 
     Device assignment is rank-local (`cuda:LOCAL_RANK`) and `set_device` is called before the
-    process group is created, so NCCL binds each rank to its own GPU.
+    process group is created, so NCCL binds each rank to its own GPU. This is identical for
+    single- and multi-node: `LOCAL_RANK` is per-node (0..gpus_per_node-1) while `RANK` is global,
+    which is exactly the split `cuda:LOCAL_RANK` + a global process group needs.
     """
     import os
 
@@ -670,7 +684,8 @@ def main(argv=None) -> int:
         autoencoder, _cfg, divisor = load_autoencoder(
             args.vae_checkpoint, DEFAULT_ENV_CONFIG, DEFAULT_MODEL_CONFIG, network_config, device=str(device)
         )
-        latent_encoder = LatentEncoder(autoencoder, divisor, scale_factor, amp=args.amp)
+        latent_encoder = LatentEncoder(autoencoder, divisor, scale_factor, amp=args.amp,
+                                       dtype=getattr(torch, args.amp_dtype))
         log.info("latent encoder ready (divisor=%d, scale_factor=%.6f)", divisor, scale_factor)
         if args.validate_every_steps or args.validate_at_end:
             # A separate Dataset on the val split, with the *same* report_format -- the whole point
@@ -683,7 +698,7 @@ def main(argv=None) -> int:
     training_config = TrainingConfig(
         lr=args.lr, n_epochs=args.epochs, max_steps=args.max_steps, batch_size=args.batch_size,
         grad_accumulation_steps=args.grad_accumulation_steps, grad_clip_norm=args.grad_clip_norm,
-        amp=args.amp, seed=args.seed, log_every=args.log_every,
+        amp=args.amp, amp_dtype=args.amp_dtype, seed=args.seed, log_every=args.log_every,
         save_every_steps=args.save_every_steps, validate_every_steps=args.validate_every_steps,
         validate_full_every_steps=args.validate_full_every_steps,
         validate_at_end=args.validate_at_end, validate_full_at_end=args.validate_full_at_end,

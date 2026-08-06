@@ -68,6 +68,12 @@ log = logging.getLogger("mrrate_r2v.validation")
 
 METRIC_NAMES = ("fvd", "fid_2p5d", "ssim")
 
+#: The only validation metrics that become W&B *curves*. Everything else a pass produces -- per
+#: plane, per bucket, rank flags, timings, counts, the sensitivity diagnostic -- stays in the
+#: returned payload and in `train_summary.json`, and is deliberately kept out of the dashboard: 47
+#: curves is not a dashboard. `training.MRRateAdapterTrainer.validate_now` is what applies this.
+HEADLINE_METRICS = ("fvd", "fid_2p5d", "ssim")
+
 
 # --------------------------------------------------------------------------- config
 
@@ -306,6 +312,14 @@ class ValidationRunner:
         #: is filled on the first pass and reused for the rest of the run.
         self._real_features: dict[int, dict] = {}
         self.reference = self._load_reference()
+        #: Whether panels are rendered at all. Must NOT key off `self.wandb_run`: under DDP that is
+        #: None on every non-zero rank, and those ranks are exactly the ones that need to render the
+        #: panels rank 0 will log. `n_visualize > 0` is identical on every rank, so no broadcast.
+        self._wants_panels = self.config.n_visualize > 0
+        #: Incremented once per pass, so a panel can say which validation produced it. Distinct
+        #: from the optimizer step: two passes can share a step (an interval pass and the
+        #: end-of-training pass both fire at the last step).
+        self._validation_index = 0
         self._checked_intensity = False
         log.info("validation: %d quick / %d full cases over %d buckets (seed %d), metrics %s",
                  len(self._quick_indices), len(self._full_indices),
@@ -491,6 +505,8 @@ class ValidationRunner:
         # score a report-blind generator just fine, so "conditioning was on" cannot be inferred from
         # them and is checked here instead.
         conditioning_state = self.assert_conditioning_active(trainer)
+        self._validation_index += 1
+        epoch = int(getattr(trainer, "epoch", 0)) + 1
 
         indices = self._full_indices if full else self._quick_indices
         mine = [i for n, i in enumerate(indices) if n % world_size() == rank()]
@@ -534,9 +550,18 @@ class ValidationRunner:
                             record["ssim_excluded"] = verdict.reason
                         timings["ssim"] += time.time() - clock
 
-                    records.append(record)
+                    # The panel is *rendered* on whichever rank generated the case, but only rank 0
+                    # holds a W&B run. So the HTML travels through the same gather as the features
+                    # and rank 0 logs it below. Rendering here and logging there is what keeps the
+                    # visualised case set fixed and independent of world size -- calling
+                    # `_visualize` inline would silently drop every panel whose case did not land
+                    # on rank 0 (3 of 4 at world_size=4, since the visualised cases are the first
+                    # `n_visualize` and sharding is `index % world_size`).
                     if index in set(self._quick_indices[: self.config.n_visualize]):
-                        self._visualize(case, generated, step)
+                        record["panel_html"] = self._render_panel(
+                            case, generated, step, epoch=epoch,
+                            validation_index=self._validation_index, full=full)
+                    records.append(record)
                     del generated       # one volume at a time, never the set
         finally:
             unet.train(was_training)
@@ -550,11 +575,15 @@ class ValidationRunner:
             metrics.update(self.condition_sensitivity(trainer, step))
             timings["sensitivity"] = time.time() - clock
 
+        if rank() == 0:
+            metrics["val/n_panels"] = self._log_panels(gathered, step)
         metrics["val/conditioning_active"] = int(bool(conditioning_state.get("checked")))
         metrics.update({f"val/time/{k}": round(v, 2) for k, v in timings.items()})
         metrics["val/n_cases"] = len(gathered)
         metrics["val/seconds"] = time.time() - started
         metrics["val/full"] = int(bool(full))
+        metrics["val/validation_index"] = self._validation_index
+        metrics["val/epoch"] = epoch
         metrics.update(self.reference_scalars())
         if rank() == 0:
             headline = {k: round(v, 5) for k, v in metrics.items()
@@ -564,6 +593,8 @@ class ValidationRunner:
         return metrics
 
     def _metrics(self, records: list[dict]) -> dict:
+        # `panel_html` rides along in the gathered records but is not a feature and not a metric.
+        # `_metrics` only reads the keys it names, so nothing here has to strip it.
         from .eval.validation_metrics import PlaneFeatures, aggregate_frechet
 
         out: dict = {}
@@ -771,16 +802,52 @@ class ValidationRunner:
 
     # -- visualisation ------------------------------------------------------------------
 
-    def _visualize(self, case: ValidationCase, generated: np.ndarray, step: int) -> None:
-        if self.wandb_run is None or not getattr(self.wandb_run, "enabled", False):
-            return
+    def _render_panel(self, case: ValidationCase, generated: np.ndarray, step: int,
+                      epoch: int = 0, validation_index: int = 0, full: bool = False):
+        """Render the interactive panel on the rank that generated the case. Returns HTML or None.
+
+        Skipped entirely when no rank has a W&B run, so a `--wandb-mode disabled` run pays nothing
+        for rendering panels nobody will see. Under DDP `self.wandb_run` is None on non-zero ranks,
+        so `_wants_panels` is broadcast-free: it keys off the config, not off this rank's run.
+        """
+        if not self._wants_panels:
+            return None
         try:
             from .eval.figures import validation_panel_html
 
-            html = validation_panel_html(case, generated, step)
-            self.wandb_run.log_html(f"validation/{case.case_id}", html, step=step)
+            return validation_panel_html(case, generated, step, epoch=epoch,
+                                         validation_index=validation_index, full=full)
         except Exception as exc:  # noqa: BLE001 -- a plot must never end a training run
-            log.warning("validation visualisation failed for %s: %s", case.case_id, exc)
+            log.warning("validation panel render failed for %s: %s", case.case_id, exc)
+            return None
+
+    def _log_panels(self, records: list[dict], step: int) -> int:
+        """Rank 0 logs every gathered panel, whichever rank rendered it.
+
+        **The key stays `validation/<case_id>` -- stable across validation steps on purpose.** W&B
+        keeps one media panel per key with its own step slider, so a stable key is what lets you drag
+        through training and watch *the same case* evolve. Putting the step in the key instead would
+        create a fresh panel per (case, step) -- 4 cases x 20 validations = 80 panels -- and destroy
+        exactly the comparison the panel exists for.
+
+        The step, epoch, validation index and pass type are instead rendered *inside* the panel (its
+        heading and its metadata fields), so an individual panel is still self-describing. W&B also
+        embeds the step in the stored filename (`validation/<case>_<step>_<hash>.html`), so the
+        provenance is on disk too.
+        """
+        if self.wandb_run is None or not getattr(self.wandb_run, "enabled", False):
+            return 0
+        logged = 0
+        for record in records:
+            html = record.get("panel_html")
+            if not html:
+                continue
+            try:
+                self.wandb_run.log_html(f"validation/{record['case_id']}", html, step=step)
+                logged += 1
+            except Exception as exc:  # noqa: BLE001
+                log.warning("validation panel log failed for %s: %s", record["case_id"], exc)
+        return logged
 
 
 def _to_lists(features: dict) -> dict:

@@ -23,9 +23,15 @@
 #   sbatch --export=ALL,R2V_CONFIG=A,R2V_MAX_STEPS=0,R2V_VALIDATE_EVERY=500,R2V_WANDB=online \
 #          --time=24:00:00 slurm/11_train_conditioning.sbatch
 #
-# Real 4-GPU run on one node (DDP via torchrun; set R2V_NGPU to match --gres):
+# Real 4-GPU run on one node (DDP via torchrun; R2V_NGPU is the TOTAL rank count):
 #   sbatch --export=ALL,R2V_CONFIG=C,R2V_MAX_STEPS=0,R2V_NGPU=4,R2V_VALIDATE_EVERY=500 \
 #          --gres=gpu:h200:4 --cpus-per-task=32 --time=24:00:00 slurm/11_train_conditioning.sbatch
+#
+# Multi-node (2 nodes x 4 GPUs = 8 ranks). --ntasks-per-node=1 is REQUIRED: one torchrun per node,
+# which then forks one rank per GPU. R2V_NGPU must equal nodes x GPUs-per-node:
+#   sbatch --export=ALL,R2V_CONFIG=A,R2V_MAX_STEPS=0,R2V_NGPU=8,R2V_VALIDATE_EVERY=500 \
+#          --nodes=2 --ntasks-per-node=1 --gres=gpu:h200:4 --cpus-per-task=32 \
+#          --time=24:00:00 slurm/11_train_conditioning.sbatch
 #
 # `#SBATCH --export=NONE` means a plain `VAR=x sbatch ...` does NOT reach the job -- always pass
 # overrides through --export=ALL,... as above. R2V_MAX_STEPS=0 removes the step cap.
@@ -103,7 +109,18 @@ if [[ -n "${R2V_VALIDATE_EVERY:-}" ]]; then
         --val-visualize "${R2V_VAL_VISUALIZE:-4}"
         --val-seed "${R2V_VAL_SEED:-0}"
         --medicalnet-checkpoint "$MEDICALNET_CHECKPOINT"
+        --val-metrics ${R2V_VAL_METRICS:-fvd fid_2p5d ssim}
+        --val-fvd-extractor "${R2V_VAL_FVD_EXTRACTOR:-r3d18}"
+        --val-feature-cache "$WORKSPACE/cache/r2v/val_features"
+        --torch-home "$TORCH_HOME_DIR"
     )
+    # Condition-sensitivity diagnostic: swaps in another study's report at a fixed seed to prove the
+    # model uses its text at all. Costs a second generation per case, so it runs on a small subset.
+    [[ -n "${R2V_SENSITIVITY_EVERY:-}" ]] && ARGS+=(
+        --val-sensitivity-every-steps "$R2V_SENSITIVITY_EVERY"
+        --val-sensitivity-samples "${R2V_SENSITIVITY_N:-8}")
+    [[ -n "${R2V_VALIDATION_REFERENCE:-}" ]] && ARGS+=(
+        --validation-reference "$R2V_VALIDATION_REFERENCE")
     [[ -n "${R2V_VALIDATE_FULL_EVERY:-}" ]] && ARGS+=(--validate-full-every-steps "$R2V_VALIDATE_FULL_EVERY")
     [[ -n "${R2V_VAL_FULL:-}" ]] && ARGS+=(--val-full-samples "$R2V_VAL_FULL")
 else
@@ -126,8 +143,42 @@ if [[ "$WANDB_MODE_ARG" != "disabled" ]]; then
     [[ -n "${WANDB_API_KEY:-}" ]] && APPTAINER_ARGS+=(--env "WANDB_API_KEY=$WANDB_API_KEY")
 fi
 
-if [[ "$NGPU" -gt 1 ]]; then
-    echo "=== DDP: torchrun --nproc_per_node=$NGPU ==="
+# ---------------------------------------------------------------- launch
+#
+# Three launch shapes. `--num-gpus` is the **total world size** (ranks), not GPUs per node, because
+# that is what the Python side cross-checks against torchrun's WORLD_SIZE.
+#
+#   1 rank              plain python, no process group
+#   1 node, N ranks     torchrun --standalone   (its own rendezvous, no network setup)
+#   M nodes, N per node srun + torchrun c10d rendezvous on the first node
+#
+# The multi-node form follows the NHR recipe in docs/nhr_official_docs/apps_pytorch.md verbatim:
+# one *task* per node (`--ntasks-per-node=1`), each task running torchrun, which then forks
+# `--nproc-per-node` ranks locally. Requesting one task per GPU instead would start N torchruns per
+# node, each spawning N ranks -- N^2 processes fighting over N GPUs.
+NNODES="${SLURM_JOB_NUM_NODES:-1}"
+
+if [[ "$NNODES" -gt 1 ]]; then
+    GPUS_PER_NODE="${SLURM_GPUS_ON_NODE:-$(( NGPU / NNODES ))}"
+    MASTER_ADDR="$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)"
+    # Derived from the job id so two concurrent multi-node jobs cannot collide on a port.
+    MASTER_PORT=$(( 29400 + SLURM_JOB_ID % 1000 ))
+    echo "=== DDP multi-node: $NNODES nodes x $GPUS_PER_NODE GPUs = $((NNODES * GPUS_PER_NODE)) ranks ==="
+    echo "    rendezvous ${MASTER_ADDR}:${MASTER_PORT} (c10d, id $SLURM_JOB_ID)"
+    [[ "$NGPU" -eq $(( NNODES * GPUS_PER_NODE )) ]] || {
+        echo "R2V_NGPU=$NGPU but the allocation gives $((NNODES * GPUS_PER_NODE)) ranks" >&2; exit 1; }
+    # NCCL over InfiniBand. Left to NCCL's own detection; set NCCL_DEBUG=INFO to see what it chose.
+    srun --cpu-bind=verbose --ntasks-per-node=1 \
+        apptainer exec "${APPTAINER_ARGS[@]}" "$SIF_IMAGE_TEXT" \
+        torchrun \
+            --nnodes="$NNODES" \
+            --nproc-per-node="$GPUS_PER_NODE" \
+            --rdzv-id="$SLURM_JOB_ID" \
+            --rdzv-backend=c10d \
+            --rdzv-endpoint="${MASTER_ADDR}:${MASTER_PORT}" \
+            -m mrrate_r2v.cli.train_r2v "${ARGS[@]}"
+elif [[ "$NGPU" -gt 1 ]]; then
+    echo "=== DDP single-node: torchrun --standalone --nproc_per_node=$NGPU ==="
     apptainer exec "${APPTAINER_ARGS[@]}" "$SIF_IMAGE_TEXT" \
         torchrun --nproc_per_node="$NGPU" --standalone \
         -m mrrate_r2v.cli.train_r2v "${ARGS[@]}"
