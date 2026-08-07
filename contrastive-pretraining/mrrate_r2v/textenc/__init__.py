@@ -13,8 +13,12 @@ or stdlib-only interpreter must still be able to build report strings.
 from .formats import (  # noqa: F401
     DEFAULT_REPORT_FORMAT,
     METADATA_DEPENDENT_FORMATS,
+    ORDER_AGNOSTIC_META_SPEC,
     REPORT_FORMATS,
+    choose_format,
     format_report,
+    meta_prefix_for,
+    parse_format_spec,
 )
 
 __all__ = [
@@ -23,7 +27,11 @@ __all__ = [
     "DEFAULT_REPORT_FORMAT",
     "ENCODER_SPECS",
     "METADATA_DEPENDENT_FORMATS",
+    "ORDER_AGNOSTIC_META_SPEC",
     "REPORT_FORMATS",
+    "choose_format",
+    "meta_prefix_for",
+    "parse_format_spec",
     "MultiEncoderEmbedder",
     "PooledEmbedder",
     "ProjectedConcatFusion",

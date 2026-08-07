@@ -1,4 +1,4 @@
-# Configuration C -- Report2CT-style three-encoder fusion.
+# Configuration D -- Report2CT-style three-encoder fusion.
 #
 # Conditioning tensor: (B, 2, 2560).
 #   sequence axis: [0] = findings, [1] = impression        (an absent section is masked out)
@@ -21,6 +21,11 @@
 #     The existing ContextProjection maps 2560 -> --cross-attention-dim instead.
 #
 # No R2V_REPORT_FORMAT: sections are encoded separately and never joined into one string.
+#
+# So the order-agnostic spec A and B use does not apply here -- and does not need to: there is no
+# section *order* to be robust to, each section is its own attention token. The trade is the other
+# way round, though: this configuration also has nowhere to put the [MODALITY]/[PLANE]/[SPACING]
+# prefix, so modality/plane reach the UNet only as `class_labels`/`spacing_tensor` and never as text.
 R2V_CONDITIONING=report2ct_style
 R2V_REPORT_FORMAT=
 R2V_MAX_REPORT_TOKENS=512

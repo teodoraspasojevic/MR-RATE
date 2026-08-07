@@ -204,7 +204,12 @@ class TrainingConfig:
     max_steps: Optional[int] = None
     batch_size: int = 1
     grad_accumulation_steps: int = 1
-    grad_clip_norm: Optional[float] = None
+    #: Gradient-norm clip. **On by default, unlike the official trainer.** With `grad_clip_norm=None`
+    #: and no GradScaler, a single non-finite gradient writes NaN into the weights and every later
+    #: step, checkpoint and validation number is garbage -- observed in jobs 690054-57. The official
+    #: trainer gets away without it because float16 + GradScaler silently *skips* such steps; that
+    #: masking is what made the same failure look like a step-240 divergence under float16.
+    grad_clip_norm: Optional[float] = 1.0
     amp: bool = True
     #: Autocast dtype. **bfloat16 by default, deliberately diverging from the official trainer.**
     #: `torch.amp.autocast("cuda")` with no dtype silently means *float16*, and float16 overflows:
@@ -299,6 +304,7 @@ class MRRateAdapterTrainer:
             enabled=config.amp and self.device.type == "cuda" and self.amp_dtype is torch.float16,
         )
         self._nonfinite_streak = 0
+        self.skipped_steps = 0
         # The gate that makes "only adapters train" a checked fact rather than an intention.
         assert_only_adapter_trainable(self._unwrapped(), self.optimizer, text_embedder)
         log.info("adapter training: %s", self.freeze_report.format())
@@ -408,23 +414,44 @@ class MRRateAdapterTrainer:
             scaled.backward()
 
         stepped = False
+        grad_norm = None
         if (self.step + 1) % self.config.grad_accumulation_steps == 0:
-            if self.config.grad_clip_norm:
-                if self.scaler.is_enabled():
-                    self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(
-                    [p for p in self.unet.parameters() if p.requires_grad], self.config.grad_clip_norm
-                )
             if self.scaler.is_enabled():
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
+                self.scaler.unscale_(self.optimizer)   # needed before inspecting or clipping
+            trainable = [p for p in self.unet.parameters() if p.requires_grad]
+            # `clip_grad_norm_` returns the pre-clip total norm, so one call both clips and gives
+            # the diagnostic. Called even when clipping is off, purely to inspect the norm.
+            grad_norm = float(torch.nn.utils.clip_grad_norm_(
+                trainable, self.config.grad_clip_norm or float("inf")))
+
+            if grad_norm != grad_norm or grad_norm == float("inf"):
+                # Skip -- exactly what GradScaler does for float16, but dtype-independent. Without
+                # this, bfloat16 and float32 (which have no scaler) write NaN straight into the
+                # weights and never recover.
+                self.skipped_steps += 1
+                # Name the parameters whose gradient is non-finite. The loss is L1, so the gradient
+                # *at the output* is bounded by 1/N -- a non-finite parameter gradient is therefore
+                # produced somewhere in the backward pass (a normalisation layer dividing by a
+                # near-zero activation std is the usual culprit), not by the loss. Which module it
+                # is decides the fix, and only this tells us.
+                culprits = [n for n, q in self._unwrapped().named_parameters()
+                            if q.grad is not None and not torch.isfinite(q.grad).all()]
+                log.warning("skipping optimizer step %d: gradient norm is %s (%d skipped so far). "
+                            "Weights untouched. %d/%d trainable tensors have non-finite grads; "
+                            "first: %s", self.optimizer_step + 1, grad_norm, self.skipped_steps,
+                            len(culprits), len(trainable), culprits[:5] or "none (norm overflow only)")
+                self.optimizer.zero_grad(set_to_none=True)
             else:
-                self.optimizer.step()
-            self.optimizer.zero_grad(set_to_none=True)
-            if self.lr_scheduler is not None:
-                self.lr_scheduler.step()
-            stepped = True
-            self.optimizer_step += 1
+                if self.scaler.is_enabled():
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    self.optimizer.step()
+                self.optimizer.zero_grad(set_to_none=True)
+                if self.lr_scheduler is not None:
+                    self.lr_scheduler.step()
+                stepped = True
+                self.optimizer_step += 1
 
         self.step += 1
         return {
@@ -433,6 +460,7 @@ class MRRateAdapterTrainer:
             "stepped": stepped,
             "n_dropped_reports": int(prepared["context_drop_mask"].sum()),
             "timestep_mean": float(timesteps.float().mean()),
+            "grad_norm": grad_norm,
         }
 
     # -- loop ----------------------------------------------------------------------------
@@ -545,15 +573,28 @@ class MRRateAdapterTrainer:
                 if metrics["stepped"]:
                     if self.optimizer_step % max(self.config.log_every, 1) == 0:
                         if self.local_rank == 0:
+                            # No skip counter here: a skip already emits its own WARNING at the
+                            # moment it happens, and repeating a "skipped 0" on every healthy line
+                            # is noise. The cumulative count lives on one W&B curve and in
+                            # train_summary.json.
                             log.info(
-                                "epoch %d opt-step %d (micro %d/%s) loss %.5f lr %.3e dropped %d",
+                                "epoch %d opt-step %d (micro %d/%s) loss %.5f lr %.3e dropped %d "
+                                "grad_norm %s",
                                 epoch + 1, self.optimizer_step, self.step, total_steps,
                                 metrics["loss"], metrics["lr"], metrics["n_dropped_reports"],
+                                ("%.3f" % metrics["grad_norm"]) if metrics.get("grad_norm") is not None else "-",
                             )
                         self._log_metrics({"train/loss": metrics["loss"],
                                            "train/lr": metrics["lr"],
                                            "train/epoch": epoch + 1,
-                                           "train/dropped_reports": metrics["n_dropped_reports"]},
+                                           "train/dropped_reports": metrics["n_dropped_reports"],
+                                           # One curve, cumulative. A skip is lost training signal,
+                                           # not a harmless retry: the gradient failure that caused
+                                           # it was confined to a single geometry bucket, so any
+                                           # nonzero value means one bucket is being trained on
+                                           # zero times. Healthy is a flat line at 0.
+                                           "train/skipped_steps": self.skipped_steps,
+                                           "train/grad_norm": metrics["grad_norm"]},
                                           step=self.optimizer_step)
 
                     interval = self.config.validate_every_steps
@@ -589,6 +630,9 @@ class MRRateAdapterTrainer:
         return {
             "steps": self.step,
             "optimizer_steps": self.optimizer_step,
+            # Belongs in the summary, not only in the log: a run whose numbers look fine but which
+            # skipped a third of its steps trained on a different dataset than it claims to have.
+            "skipped_steps": self.skipped_steps,
             "epochs": self.epoch + 1,
             "seconds": time.time() - start,
             "final_loss": history[-1]["loss"] if history else None,

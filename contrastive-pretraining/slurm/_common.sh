@@ -41,6 +41,39 @@ MEDICALNET_CHECKPOINT="$WORKSPACE/pretrained/medicalnet/resnet_10_23dataset_stat
 # rather than in $HOME/.cache so the containers see it and no job depends on a download.
 TORCH_HOME_DIR="$WORKSPACE/pretrained/torchhub"
 
+# RRZE's outbound HTTP proxy. Compute nodes have no direct route off-site, so anything that talks
+# to the internet -- in practice only W&B in `online` mode -- needs this. The login node does have a
+# direct route, which is why an interactive `curl api.wandb.ai` works and the same job on h200 does
+# not: without the proxy `wandb.init(mode="online")` hangs, then degrades to a no-op with a warning
+# (`eval/wandb_logging.py` catches it), so the failure looks like "W&B is just not logging".
+#
+# Set R2V_NO_PROXY=1 to skip this entirely.
+#
+# `no_proxy` covers loopback and the cluster's own domain. NCCL and torchrun's c10d rendezvous use
+# raw sockets and are not proxied at all, so they are unaffected either way -- the entries are there
+# so any *HTTP* call to a node (a local service, a health check) keeps working. The allocation's own
+# nodes are appended by name because Python's `urllib`/`requests` match `no_proxy` by hostname
+# suffix and do not understand CIDR blocks.
+PROXY_URL="${R2V_PROXY_URL:-http://proxy.rrze.uni-erlangen.de:80}"
+
+setup_proxy() {
+    [[ -n "${R2V_NO_PROXY:-}" ]] && { echo "proxy: disabled (R2V_NO_PROXY set)"; return 0; }
+    local no_proxy_list="localhost,127.0.0.1,::1,.nhr.fau.de,.fau.de,.rrze.uni-erlangen.de"
+    if [[ -n "${SLURM_JOB_NODELIST:-}" ]]; then
+        local host
+        for host in $(scontrol show hostnames "$SLURM_JOB_NODELIST" 2>/dev/null); do
+            no_proxy_list+=",${host},${host}.nhr.fau.de"
+        done
+    fi
+    export http_proxy="$PROXY_URL"
+    export https_proxy="$PROXY_URL"
+    export HTTP_PROXY="$PROXY_URL"
+    export HTTPS_PROXY="$PROXY_URL"
+    export no_proxy="$no_proxy_list"
+    export NO_PROXY="$no_proxy_list"
+    echo "proxy: $PROXY_URL (no_proxy=$no_proxy_list)"
+}
+
 preflight() {
     local fail=0 p
     for p in "$@"; do
@@ -52,6 +85,7 @@ preflight() {
 setup() {
     echo "=== job ${SLURM_JOB_ID:-local} on $(hostname -f) ==="
     echo "R2V_REPO=$R2V_REPO"
+    setup_proxy
     preflight "$REPO_ROOT" "$CP_ROOT" "$WORKSPACE" "$SIF_IMAGE" "$REPO_ROOT/NV-Generate-CTMR"
     mkdir -p "$WORKSPACE/slurm_logs" "$COHORT_ROOT" "$PRED_ROOT" "$RESULT_ROOT"
     APPTAINER_ARGS=(--nv
@@ -68,10 +102,16 @@ setup() {
         # R2V_WORKSPACE would move every path in this file except where encoders are loaded from.
         --env "MRRATE_PRETRAINED_DIR=$PRETRAINED_DIR"
         --env "TORCH_HOME=$TORCH_HOME_DIR")
+    # The proxy has to be inside the container too: apptainer does not inherit the host environment
+    # for these, so exporting them in `setup_proxy` alone leaves the *host* able to reach W&B and the
+    # process that actually calls `wandb.init` unable to.
+    local var
+    for var in http_proxy https_proxy HTTP_PROXY HTTPS_PROXY no_proxy NO_PROXY; do
+        [[ -n "${!var:-}" ]] && APPTAINER_ARGS+=(--env "$var=${!var}")
+    done
     # W&B, only when the job asked for it. Credentials are never set here: wandb reads
     # WANDB_API_KEY or ~/.netrc (which is bind-mounted with $HOME), so nothing is hardcoded and a
     # job without credentials degrades to a no-op rather than failing.
-    local var
     for var in WANDB_API_KEY WANDB_MODE WANDB_DIR WANDB_CACHE_DIR; do
         [[ -n "${!var:-}" ]] && APPTAINER_ARGS+=(--env "$var=${!var}")
     done

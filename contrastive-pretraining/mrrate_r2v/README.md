@@ -140,6 +140,39 @@ during training (`series_selection="all"`), all conditioned on the same report.
 each bucket has its own shape, so `GeometryBucketBatchSampler` only ever emits batches drawn from
 **one** bucket — that is what makes `batch_size > 1` legal.
 
+`drop_last=True` (what `cli.train_r2v` uses) drops a bucket's *remainder*, never the **bucket**. A
+bucket smaller than `batch_size` has no full batch at all, so a plain `drop_last` deletes it from
+every epoch and the model silently never sees that (modality, plane). On the real train split at
+`batch_size=8` that is SWI CORONAL (4 series) and SWI SAGITTAL (2) — and neither exists in val or
+test, so no metric could have revealed it. Such buckets keep one short batch and are logged as
+`undersized_buckets`.
+
+### 4.2.1 Report format
+
+`R2VDatasetConfig.report_format` takes one name from
+[`textenc/formats.py`](textenc/formats.py) — or **several, comma-separated**, in which case one is
+drawn per sample, uniformly, deterministically from `(seed, epoch, index)`.
+
+The shipped training spec is `findings_impression_meta,impression_findings_meta`
+(`ORDER_AGNOSTIC_META_SPEC`). Two reasons, both about the challenge rather than about MR-RATE:
+
+- **Section order.** The challenge's report layout is unknown and nothing at submission time can
+  detect that the order flipped. Training on both orders means the model has seen every section in
+  first position — which matters most under truncation, where a 512-token encoder keeps the head of
+  the string (8–10% of MR-RATE studies truncate; RadBERT 9.2%).
+- **`[MODALITY] … [PLANE] … [SPACING] x y z`** leads both orderings. Spacing is `(X, Y, Z)` and
+  matches the sample's own `target_spacing_mm` exactly. It is *also* a numeric input via
+  `spacing_tensor`, but the text encoder is the only path that sees modality, plane and spacing
+  together, and it is the path a challenge request can populate with no volume attached.
+
+Validation is pinned to the spec's **first** name — a sampled format would add format variance to a
+curve whose only job is to show model improvement. The checkpoint records the whole spec, so
+`cli.generate_r2v` accepts a cohort built under either ordering.
+
+At inference (`cli.generate_r2v --report`) the prefix is prepended from `--modality`, `--plane` and
+`--spacing`, and `--dim`/`--spacing` default to that bucket's own trained grid. Only pass them to
+override; an unknown (modality, plane) still lands on NVIDIA's 256³ @ 1 mm.
+
 ### 4.3 One training step
 
 ```python
@@ -352,8 +385,9 @@ or `sbatch slurm/07_generate_r2v.sbatch <ws>/runs/r2v_adapter_v1/adapter_last.pt
 | `--report-guidance-scale` | `4.0` | how hard the report is pushed. `0` = NVIDIA's original behaviour exactly; `1` = the plain conditioned prediction; higher = stronger and eventually over-saturated. **The first thing to sweep.** |
 | `--modality-guidance-scale` | `10.0` | NVIDIA's own `cfg_guidance_scale`. `0` leaves the modality conditioned and guides the report only. |
 | `--num-inference-steps` | `30` | NVIDIA's default; quality vs wall-clock |
-| `--dim` / `--spacing` | `256³` / `1 mm` | the output grid. Spacing is a **real conditioning input**, so asking for a bucket's own FOV is what makes generated and real populations comparable. `--dim` must be divisible by 4. |
-| `--modality` | `T1w` | the class label the frozen model is conditioned on |
+| `--dim` / `--spacing` | the `(--modality, --plane)` bucket's own grid | the output grid. Spacing is a **real conditioning input**, so asking for a bucket's own FOV is what makes generated and real populations comparable. `--dim` must be divisible by 4. Unknown (modality, plane) → NVIDIA's 256³ @ 1 mm. |
+| `--modality` | `T1w` | the class label the frozen model is conditioned on, and the `[MODALITY]` marker under a `*_meta` format |
+| `--plane` | `AXIAL` | selects the geometry bucket and the `[PLANE]` marker |
 | `--seed` | `1234` | reproducibility |
 | `--latent-only` | off | skip the VAE decode — a cheap check that the diffusion loop runs |
 
@@ -369,9 +403,12 @@ python -m mrrate_r2v.cli.preprocess \
     --manifest-csv <data_ws>/r2v_manifest/manifest_shards_native.csv \
     --report-index-csv <data_ws>/r2v_manifest/report_index_shards_native.csv \
     --split test --sequences T1w T2w FLAIR SWI --n-per-bucket 200 \
+    --report-format findings_impression_meta \
     --out <ws>/cohorts/test_v1
+#   ^ must be one of the formats the adapter was trained on, or step 2 refuses the cohort. A cohort
+#     stores already-composed text, so the format cannot be changed after the fact.
 
-# 2. one volume per case, from that case's own report
+# 2. one volume per case, from that case's own report and its own modality
 python -m mrrate_r2v.cli.predict_r2v \
     --cohort <ws>/cohorts/test_v1 \
     --checkpoint      <ws>/runs/r2v_adapter_v1/adapter_last.pt \
@@ -414,6 +451,9 @@ is not contributing.
 | **Two divisors** | `4` for sampling (output ÷ latent), `16` for VAE-encode padding. Swapping them yields a valid file 4× too small on every axis. |
 | **`--series-selection`** | `one_per_study_per_bucket` is the default and must stay it. `one_per_study_per_sequence` silently collapses the *planes*. |
 | **`--export=NONE`** | on every sbatch script — `VAR=x sbatch ...` does not reach the job. Use `--export=ALL,VAR=x`. Every Helma partition defaults to a **10-minute** walltime without `--time`. |
+| **`drop_last` and tiny buckets** | a bucket smaller than `batch_size` keeps one short batch instead of vanishing. Before the fix, `drop_last=True` removed SWI CORONAL and SWI SAGITTAL from every epoch and nothing failed — see §4.2. |
+| **W&B needs the proxy** | compute nodes have no direct route off-site. `slurm/_common.sh:setup_proxy` exports `http(s)_proxy` **and** passes them into the container. Without it `wandb.init(mode="online")` fails and `WandbRun` degrades to a silent no-op, so the run looks like "W&B just isn't logging". `R2V_WANDB=online` probes `api.wandb.ai` before any GPU work; `R2V_NO_PROXY=1` disables the proxy. |
+| **`report_format` at inference** | a `*_meta` format's `[MODALITY]/[PLANE]/[SPACING]` prefix is a trained token sequence. `cli.generate_r2v` prepends it for free-form text and refuses a cohort composed under a format the adapter never saw. |
 | **Privacy** | `study_uid`/`series_id` appear only in a cohort's `index.csv`. Everything else on disk uses `case_id` and `cohort_id`. Don't log identifiers verbatim or write them into results. |
 | **Disk** | `/hnvme` has a **file-count** quota (61k soft), not a space quota — hence one archive per bucket instead of one file per volume. |
 | **Fréchet distance** | computed in `eval/distribution.py`, not via `monai.metrics.FIDMetric` (that path passes a `disp=` kwarg scipy removed in 1.17). Don't reintroduce the monai call. |

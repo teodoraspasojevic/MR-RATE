@@ -13,7 +13,12 @@
 # tokens versus RadBERT's 9.20%. Its weakness is domain: chest X-ray anatomy vocabulary is wrong
 # for brain.
 R2V_CONDITIONING=cxr_bert_cls
-R2V_REPORT_FORMAT=impression_findings          # also the configuration's own default
+# Two formats = sample one per training sample (see mrrate_r2v/textenc/formats.py). The challenge's
+# report layout is unknown, so training on one fixed section order teaches the model that order and
+# nothing at submission time can detect that it flipped. Both carry the same
+# [MODALITY]/[PLANE]/[SPACING] prefix; validation is pinned to the first name.
+# Set R2V_REPORT_FORMAT=impression_findings for the single-format run this replaced.
+R2V_REPORT_FORMAT="${R2V_REPORT_FORMAT:-findings_impression_meta,impression_findings_meta}"
 R2V_MAX_REPORT_TOKENS=512
 # Measured on one H200 (140 GB) at the 256^3 fallback bucket, bf16: batch 8 is peak throughput
 # (2.573 vol/s, 85-87 GB reserved = 61% of the card). Throughput *falls* at 12 and 16, and 24 OOMs.

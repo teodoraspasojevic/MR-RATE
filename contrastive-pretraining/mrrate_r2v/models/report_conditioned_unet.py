@@ -35,6 +35,7 @@ Properties that are the point of doing it this way:
 
 from __future__ import annotations
 
+import contextlib
 import inspect
 import json
 from collections.abc import Sequence
@@ -54,6 +55,49 @@ from monai.utils.type_conversion import convert_to_tensor
 DEFAULT_CROSS_ATTENTION_DIM = 512
 
 _MAISI_PARAMS = inspect.signature(DiffusionModelUNetMaisi.__init__).parameters
+
+
+# -- SDPA backend guard ------------------------------------------------------------------------
+#
+# `F.scaled_dot_product_attention` is one *interface* over four interchangeable CUDA kernels; torch
+# picks one per call from the shapes, dtype and mask. Two places here reach it: the base model's
+# `SpatialAttentionBlock`s (MONAI's `use_flash_attention=True` means "call SDPA", not "use
+# FlashAttention"), and `MaskedCrossAttention` below, which calls it unconditionally.
+#
+# The cuDNN backend returns **non-finite gradients from a finite forward** at latent 48^3 -- the
+# (T2w, CORONAL) bucket -- in bfloat16 and float16. Measured: 8/8 seeds, batch 1-8, with random
+# Gaussian latents and no data, model or adapter involved; born on the query branch of
+# `up_blocks.1.attentions.*` and reaching every adapter tensor. This is the same class as PyTorch
+# issue #166211 (NaN in grad_q under CUDNN_ATTENTION, finite output), and cuDNN's own release notes
+# document a backward defect at certain static sequence lengths plus problems at key/value length 1
+# -- which is exactly what a pooled report embedding gives the adapter.
+#
+# Every other backend is correct here, so the fix is to take cuDNN out of the running rather than
+# to abandon SDPA. MATH stays in the list purely as a last resort: `MaskedCrossAttention` passes an
+# `attn_mask` that the fused kernels can refuse, and an empty candidate set is a hard
+# "No available kernel" error, not a fallback.
+def safe_sdpa_backends() -> list:
+    """The SDPA backends this model is allowed to use: every one except cuDNN's."""
+    from torch.nn.attention import SDPBackend
+
+    return [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
+
+
+def sdpa_backend_guard(on_cuda: bool = True):
+    """Context manager restricting SDPA to `safe_sdpa_backends()`. A no-op off CUDA.
+
+    Applied around the *forward* pass only, in `ReportConditionedUNetMaisi.forward`, which is
+    enough: the backend is chosen during forward and the matching backward kernel is bound into
+    the autograd node then, so backward inherits the choice (verified -- the 48^3 gradient is
+    finite with the guard on forward alone). Activation checkpointing would break that assumption
+    by re-running attention during backward under whatever context is live then; this model does
+    not use it, and a future change that adds it must wrap the backward too.
+    """
+    if not on_cuda:
+        return contextlib.nullcontext()
+    from torch.nn.attention import sdpa_kernel
+
+    return sdpa_kernel(safe_sdpa_backends())
 
 
 def _maisi_arg(maisi_kwargs: dict, name: str):
@@ -459,24 +503,30 @@ class ReportConditionedUNetMaisi(DiffusionModelUNetMaisi):
         (`(B, context_dim)` or `(B, L, context_dim)`; `None` = unconditional), `context_mask` is an
         optional `(B, L)` bool marking real (`True`) versus padding (`False`) tokens, and
         `context_drop_mask` is an optional `(B,)` bool selecting the null embedding per sample.
+
+        The whole body runs under `sdpa_backend_guard`, so no caller -- trainer, sampler, either
+        CLI -- can reach the cuDNN attention backend that produces non-finite gradients at some
+        latent shapes. Putting it here rather than in the trainer is what makes that impossible to
+        forget at a new call site.
         """
-        context, context_mask = self.prepare_context(x.shape[0], context, context_drop_mask, context_mask)
+        with sdpa_backend_guard(x.is_cuda):
+            context, context_mask = self.prepare_context(x.shape[0], context, context_drop_mask, context_mask)
 
-        emb = self._get_time_and_class_embedding(x, timesteps, class_labels)
-        emb = self._get_input_embeddings(emb, top_region_index_tensor, bottom_region_index_tensor, spacing_tensor)
-        h = self.conv_in(x)
-        h, res_samples = self._apply_down_blocks(
-            h, emb, context, down_block_additional_residuals, context_mask=context_mask
-        )
+            emb = self._get_time_and_class_embedding(x, timesteps, class_labels)
+            emb = self._get_input_embeddings(emb, top_region_index_tensor, bottom_region_index_tensor, spacing_tensor)
+            h = self.conv_in(x)
+            h, res_samples = self._apply_down_blocks(
+                h, emb, context, down_block_additional_residuals, context_mask=context_mask
+            )
 
-        if self.mid_cross_attn is not None:
-            h = self.mid_cross_attn(h, context=context, context_mask=context_mask)
-        h = self.middle_block(h, emb, None)
-        if mid_block_additional_residual is not None:  # ControlNet residual
-            h = h + mid_block_additional_residual
+            if self.mid_cross_attn is not None:
+                h = self.mid_cross_attn(h, context=context, context_mask=context_mask)
+            h = self.middle_block(h, emb, None)
+            if mid_block_additional_residual is not None:  # ControlNet residual
+                h = h + mid_block_additional_residual
 
-        h = self._apply_up_blocks(h, emb, context, res_samples, context_mask=context_mask)
-        out: torch.Tensor = convert_to_tensor(self.out(h))
+            h = self._apply_up_blocks(h, emb, context, res_samples, context_mask=context_mask)
+            out: torch.Tensor = convert_to_tensor(self.out(h))
         return out
 
 
@@ -761,4 +811,6 @@ __all__ = [
     "build_report_conditioned_unet",
     "load_pretrained_maisi_weights",
     "nvidia_unet_kwargs",
+    "safe_sdpa_backends",
+    "sdpa_backend_guard",
 ]

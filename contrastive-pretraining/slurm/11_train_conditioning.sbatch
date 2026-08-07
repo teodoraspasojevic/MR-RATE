@@ -46,9 +46,16 @@ setup
 # ---------------------------------------------------------------- configuration
 CONFIG="${R2V_CONFIG:?set R2V_CONFIG to A, B or C (see slurm/configs/README.md)}"
 case "$CONFIG" in
+    # The four-arm lineup. A is the pooled-conditioning baseline (one token, degenerate attention);
+    # B and C keep the token axis; D is the sectioned multi-encoder fusion.
+    #
+    # **The letters changed on 2026-08-07.** C used to mean report2ct_style and B used to mean
+    # radbert_mean. If you have an older submission script, re-read it before reusing it -- an
+    # unchanged `R2V_CONFIG=C` now trains a different model, and nothing about that is loud.
     A|a) CONFIG_FILE="A_cxr_bert_cls.sh" ;;
-    B|b) CONFIG_FILE="B_radbert_mean.sh" ;;
-    C|c) CONFIG_FILE="C_report2ct_style.sh" ;;
+    B|b) CONFIG_FILE="B_cxr_bert_tokens.sh" ;;
+    C|c) CONFIG_FILE="C_radbert_tokens.sh" ;;
+    D|d) CONFIG_FILE="D_report2ct_style.sh" ;;
     *)   CONFIG_FILE="${CONFIG}.sh" ;;
 esac
 CONFIG_PATH="$CP_ROOT/slurm/configs/$CONFIG_FILE"
@@ -141,6 +148,33 @@ if [[ "$WANDB_MODE_ARG" != "disabled" ]]; then
     export WANDB_DIR="$RUN_DIR"
     APPTAINER_ARGS+=(--env "WANDB_DIR=$RUN_DIR")
     [[ -n "${WANDB_API_KEY:-}" ]] && APPTAINER_ARGS+=(--env "WANDB_API_KEY=$WANDB_API_KEY")
+    # wandb's own service handshake, over a shared filesystem inside a container, occasionally
+    # exceeds the 30 s default and then `wandb.init` raises -- which `WandbRun` catches, so the run
+    # continues with no logging at all. 300 s costs nothing when things are fine.
+    APPTAINER_ARGS+=(--env "WANDB__SERVICE_WAIT=300")
+fi
+
+if [[ "$WANDB_MODE_ARG" == "online" ]]; then
+    # Fail before the GPU work rather than after it. `online` mode is the only thing in this job that
+    # needs the internet, and an unreachable W&B degrades to silence (see `setup_proxy`), so the run
+    # would burn its whole walltime and produce no curves. 401/404 both mean "reached the server".
+    # Probed with `requests` inside the container, not host `curl`: requests is the library wandb
+    # itself uses, so this tests the exact proxy handling the real call will get.
+    echo "=== W&B online: probing api.wandb.ai through the proxy ==="
+    code="$(apptainer exec "${APPTAINER_ARGS[@]}" "$SIF_IMAGE_TEXT" python3 -c \
+        'import requests,sys
+try: sys.stdout.write(str(requests.get("https://api.wandb.ai/", timeout=30).status_code))
+except Exception as e: sys.stdout.write("000"); sys.stderr.write(f"{type(e).__name__}: {e}\n")' || echo 000)"
+    echo "    api.wandb.ai -> HTTP $code"
+    if [[ "$code" == "000" ]]; then
+        echo "W&B is unreachable from inside the container (proxy=$PROXY_URL). Either fix the" >&2
+        echo "proxy, or submit with R2V_WANDB=offline and 'wandb sync $RUN_DIR/wandb' afterwards." >&2
+        exit 1
+    fi
+    [[ -n "${WANDB_API_KEY:-}" || -f "$HOME/.netrc" ]] || {
+        echo "W&B online needs credentials: export WANDB_API_KEY, or 'wandb login' once to write" >&2
+        echo "~/.netrc (it is bind-mounted into the container with \$HOME)." >&2
+        exit 1; }
 fi
 
 # ---------------------------------------------------------------- launch

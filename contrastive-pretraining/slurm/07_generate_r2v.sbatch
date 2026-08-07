@@ -47,6 +47,7 @@ COMMON=(--base-checkpoint "$UNET_CHECKPOINT"
         --adapter "$ADAPTER"
         --text-checkpoint "$RADBERT_CHECKPOINT"
         --modality "${R2V_MODALITY:-T1w}"
+        --plane "${R2V_PLANE:-AXIAL}"
         --num-inference-steps "${R2V_STEPS:-30}"
         --report-guidance-scale "${R2V_REPORT_GUIDANCE:-4.0}"
         --modality-guidance-scale "${R2V_MODALITY_GUIDANCE:-10.0}"
@@ -54,13 +55,19 @@ COMMON=(--base-checkpoint "$UNET_CHECKPOINT"
         --device cuda)
 [[ "${R2V_LATENT_ONLY:-0}" == "1" ]] && COMMON+=(--latent-only)
 
+# --dim/--spacing are passed only when explicitly set. Their default is the (modality, plane)
+# bucket's own trained grid, and hardcoding 256^3 @ 1 mm here would override that for every bucket
+# -- conditioning the model on a spacing it never trained on for that pair, and putting that same
+# wrong spacing into the [SPACING] marker under a *_meta format.
+GEOMETRY=()
+[[ -n "${R2V_DIM_X:-}" ]] && GEOMETRY+=(--dim "$R2V_DIM_X" "${R2V_DIM_Y:?set all three}" "${R2V_DIM_Z:?set all three}")
+[[ -n "${R2V_SPACING_X:-}" ]] && GEOMETRY+=(--spacing "$R2V_SPACING_X" "${R2V_SPACING_Y:?set all three}" "${R2V_SPACING_Z:?set all three}")
+
 if [[ -n "${R2V_COHORT:-}" ]]; then
     run_py_text mrrate_r2v.cli.generate_r2v "${COMMON[@]}" --cohort "$R2V_COHORT" --out-dir "$OUT_DIR"
 else
-    run_py_text mrrate_r2v.cli.generate_r2v "${COMMON[@]}" \
+    run_py_text mrrate_r2v.cli.generate_r2v "${COMMON[@]}" ${GEOMETRY+"${GEOMETRY[@]}"} \
         --report "$REPORT" \
-        --dim "${R2V_DIM_X:-256}" "${R2V_DIM_Y:-256}" "${R2V_DIM_Z:-256}" \
-        --spacing "${R2V_SPACING_X:-1}" "${R2V_SPACING_Y:-1}" "${R2V_SPACING_Z:-1}" \
         --out "$OUT_DIR/sample.nii.gz"
 fi
 

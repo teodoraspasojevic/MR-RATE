@@ -11,6 +11,14 @@ sampler and `ReportConditionedUNetMaisi` need no branch on which configuration i
 | A `cxr_bert` CLS | `PooledEmbedder` | 1 | 768 |
 | B `radbert` masked mean | `PooledEmbedder` | 1 | 768 |
 | C Report2CT-style fusion | `SectionedFusionEmbedder` | 2 | 2560 |
+| A-tokens `cxr_bert` unpooled | `TokenSequenceEmbedder` | dynamic | 768 |
+| B-tokens `radbert` unpooled | `TokenSequenceEmbedder` | dynamic | 768 |
+
+**L=1 is a degenerate cross-attention.** Softmax over one key is identically 1, so the query and
+key projections have no effect and get no gradient, and the adapter reduces to a per-channel bias
+applied uniformly at every voxel. A and B are therefore *pooled-conditioning baselines*, not the
+recommended path; the `_tokens` variants keep the token axis and make the attention real. See
+`TokenSequenceEmbedder` for the measurements.
 
 `build_conditioning_config(name)` is the only place these are assembled; `CONDITIONING_CONFIGS`
 is the table `--conditioning` validates against. The projection to the UNet's
@@ -57,6 +65,7 @@ from torch import nn
 
 from ..text import TextConditioning, masked_mean
 from .encoders import POOLING_MODES, build_encoder
+from .formats import ORDER_AGNOSTIC_META_SPEC
 from .fusion import ProjectedConcatFusion
 
 log = logging.getLogger("mrrate_r2v.textenc.conditioning")
@@ -130,6 +139,85 @@ class PooledEmbedder(nn.Module):
             )
         mask = torch.ones(tokens.shape[:2], dtype=torch.bool, device=tokens.device)
         return TextConditioning(tokens, mask, pooled, dict(self.identity))
+
+    def log_truncation_summary(self) -> dict:
+        report = getattr(self.inner, "log_truncation_summary", None)
+        return report() if report else {}
+
+
+class TokenSequenceEmbedder(nn.Module):
+    """One encoder's **unpooled** `last_hidden_state`: `(B, L, D)` + its real padding mask.
+
+    Why this exists: cross-attention over a *single* key is degenerate. Softmax over one element is
+    identically 1 for every query, so `to_q` and `to_k` have no effect on the output and receive
+    exactly zero gradient, and the attention output does not depend on the image at all -- the
+    adapter collapses into a per-channel bias that is the same at every voxel. Measured on the real
+    model: with L=1 the injected residual is spatially constant to 1.8e-05 and `to_q`/`to_k`/
+    `proj_in`/`norm` gradients sit at 1e-11..1e-13 (roundoff), against 1e-4 for `to_v`. With L>1
+    they come alive and the residual varies over space.
+
+    Keeping the token axis is therefore not an optimisation, it is what makes the cross-attention a
+    cross-attention. It is also the only configuration in which the report can express *where*
+    something is rather than only *what*, because different voxels can attend to different tokens.
+
+    `MaskedCrossAttention` was written for exactly this input: it honours `context_mask`, so the
+    padding introduced by batching reports of different lengths cannot join the attention softmax.
+    That is the property `tests/test_models_report_conditioned_unet.py::TestPadding` pins.
+
+    `L` is dynamic -- the tokenizer pads to the longest report in the batch, not to `max_length` --
+    so `sequence_length` in the identity records the *upper bound* (`max_length`), which is the
+    stable quantity a checkpoint can be checked against.
+    """
+
+    def __init__(self, inner) -> None:
+        super().__init__()
+        self.inner = inner
+
+    @property
+    def output_dim(self) -> int:
+        return int(self.inner.output_dim)
+
+    @property
+    def sequence_length(self) -> int:
+        """Upper bound, not the runtime length: batches are padded to their own longest report."""
+        return int(getattr(self.inner, "max_length", 0))
+
+    @property
+    def identity(self) -> dict:
+        return {
+            # `kind` is what stops an adapter trained on pooled conditioning from loading onto this
+            # one: both are 768-wide, so width alone cannot tell them apart and
+            # `assert_conditioning_compatible` would pass a silently wrong checkpoint.
+            "kind": "tokens",
+            "pooling": None,
+            "sequence_length": self.sequence_length,
+            "output_dim": self.output_dim,
+            "encoder": dict(self.inner.identity),
+        }
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        self.inner.train(mode)
+        return self
+
+    def encode(self, reports: Sequence[str], device) -> TextConditioning:
+        part = self.inner.encode([_as_text(r) for r in reports], device)
+        tokens, mask = part.token_embeddings, part.attention_mask
+        if tokens.ndim != 3 or tokens.shape[-1] != self.output_dim:
+            raise AssertionError(
+                f"{type(self).__name__} produced {tuple(tokens.shape)}; expected "
+                f"(B, L, {self.output_dim}). This is a bug in the encoder, not a config error."
+            )
+        if tokens.shape[1] < 2:
+            # Not fatal -- a one-token batch is legal -- but it is the degenerate case this class
+            # exists to avoid, and silently training on it would waste the run.
+            log.warning(
+                "%s produced only %d token(s): cross-attention over a single key is degenerate "
+                "(to_q/to_k get no gradient). Check the tokenizer and the report text.",
+                type(self).__name__, tokens.shape[1],
+            )
+        # The pooled vector is carried for logging/probing only; the denoiser never reads it.
+        return TextConditioning(tokens, mask, masked_mean(tokens, mask), dict(self.identity))
 
     def log_truncation_summary(self) -> dict:
         report = getattr(self.inner, "log_truncation_summary", None)
@@ -278,28 +366,57 @@ def _pool(part: TextConditioning, pooling: str) -> torch.Tensor:
 
 #: name -> everything needed to build it and to describe it in a checkpoint. `report_format` is
 #: the *recommended* format, applied unless the CLI overrides it, and is recorded either way.
+#:
+#: A and B recommend `ORDER_AGNOSTIC_META_SPEC` -- two formats, sampled per training sample. The
+#: challenge's report layout is unknown, and a model trained on one fixed section order has no way
+#: to signal at submission time that the order it was given is not the one it learned.
 CONDITIONING_CONFIGS: dict[str, dict] = {
     "cxr_bert_cls": {
         "kind": "pooled",
         "encoders": ("cxr_bert",),
         "pooling": "cls",
-        "report_format": "impression_findings",
+        "report_format": ORDER_AGNOSTIC_META_SPEC,
         "sequence_length": 1,
         "output_dim": 768,
-        "note": "Configuration A. Raw last_hidden_state[:, 0, :]; matches the encoder spec's own "
+        "note": "Configuration A (pooled baseline). Raw last_hidden_state[:, 0, :]; matches the encoder spec's own "
                 "pooling, under which the text-encoder study scored it best of the single encoders.",
     },
     "radbert_mean": {
         "kind": "pooled",
         "encoders": ("radbert",),
         "pooling": "mean",
-        "report_format": "impression_findings",
+        "report_format": ORDER_AGNOSTIC_META_SPEC,
         "sequence_length": 1,
         "output_dim": 768,
-        "note": "Configuration B. Masked mean, per the encoder spec. RadBERT is a "
+        "note": "Superseded, out of the lettered lineup (use C). Masked mean, per the encoder spec. RadBERT is a "
                 "RobertaForMaskedLM with no pooler and no sentence-level objective, so its <s> "
                 "state was never trained to summarise -- use --text-pooling cls only for an "
                 "explicit ablation.",
+    },
+    "radbert_tokens": {
+        "kind": "tokens",
+        "encoders": ("radbert",),
+        "pooling": None,                     # nothing is pooled; the token axis is kept
+        "report_format": ORDER_AGNOSTIC_META_SPEC,
+        "sequence_length": None,             # dynamic; the embedder records max_length
+        "output_dim": 768,
+        "note": "Configuration C. RadBERT's full last_hidden_state, unpooled. RadBERT is a "
+                "RobertaForMaskedLM with no pooler and no sentence-level objective, so there is no "
+                "trained summary vector to pool *to* -- masked-mean is an unweighted average over "
+                "token states chosen for lack of an alternative. Keeping the tokens removes both "
+                "that arbitrary reduction and the single-key attention collapse it caused.",
+    },
+    "cxr_bert_tokens": {
+        "kind": "tokens",
+        "encoders": ("cxr_bert",),
+        "pooling": None,
+        "report_format": ORDER_AGNOSTIC_META_SPEC,
+        "sequence_length": None,
+        "output_dim": 768,
+        "note": "Configuration B. CXR-BERT's full last_hidden_state. Unlike RadBERT its CLS "
+                "*was* trained to summarise (CLIP objective), so this is a genuine A/B against "
+                "cxr_bert_cls rather than a strict improvement: it trades a supervised summary "
+                "vector for a non-degenerate attention that can localise.",
     },
     "report2ct_style": {
         "kind": "sectioned_fusion",
@@ -309,7 +426,7 @@ CONDITIONING_CONFIGS: dict[str, dict] = {
         "report_format": None,               # sections are encoded separately, never joined
         "sequence_length": 2,
         "output_dim": 2560,
-        "note": "Configuration C. Report2CT-style: masked-mean each encoder, concat features to "
+        "note": "Configuration D. Report2CT-style: masked-mean each encoder, concat features to "
                 "2560, one token per section, findings first. bio_clinicalbert substitutes for "
                 "Report2CT's medicalai/ClinicalBERT -- same width, different checkpoint.",
     },
@@ -360,7 +477,15 @@ def build_conditioning(
     members = [make(n) for n in spec["encoders"]]
     resolved_pooling = pooling or spec["pooling"]
 
-    if spec["kind"] == "pooled":
+    if spec["kind"] == "tokens":
+        if pooling:
+            raise ValueError(
+                f"conditioning '{name}' keeps the token axis, so --text-pooling {pooling!r} has "
+                f"nothing to act on. Use a pooled configuration (e.g. "
+                f"{'cxr_bert_cls' if 'cxr' in name else 'radbert_mean'}) to pool."
+            )
+        embedder = TokenSequenceEmbedder(members[0])
+    elif spec["kind"] == "pooled":
         embedder = PooledEmbedder(members[0], pooling=resolved_pooling)
     else:
         fusion = None
@@ -378,8 +503,11 @@ def build_conditioning(
             f"this configuration was defined against -- check which snapshot is in "
             f"{pretrained_dir or 'MRRATE_PRETRAINED_DIR'}."
         )
-    log.info("conditioning '%s': L=%s D=%d (%s)", name,
-             getattr(embedder, "sequence_length", 1), embedder.output_dim, spec["note"])
+    length = getattr(embedder, "sequence_length", 1)
+    # For a token configuration `sequence_length` is the cap, not the runtime length: batches are
+    # padded to their own longest report. Printing a bare "L=512" invites reading it as fixed.
+    shown = f"L<={length} (variable, padded per batch)" if spec["kind"] == "tokens" else f"L={length}"
+    log.info("conditioning '%s': %s D=%d (%s)", name, shown, embedder.output_dim, spec["note"])
     return embedder
 
 
@@ -390,5 +518,6 @@ __all__ = [
     "REPORT2CT_SECTIONS",
     "REPORT2CT_STYLE_ENCODERS",
     "SectionedFusionEmbedder",
+    "TokenSequenceEmbedder",
     "build_conditioning",
 ]
