@@ -555,7 +555,14 @@ class MRRateAdapterTrainer:
         here so the trainer keeps no dependency on the sampler or the feature extractor.
         """
         micro_per_epoch = max(len(train_loader), 1)
-        total_steps = self.config.max_steps or int(self.config.n_epochs * micro_per_epoch)
+        total_micro = self.config.max_steps or int(self.config.n_epochs * micro_per_epoch)
+        # `PolynomialLR` is stepped once per *optimizer* step, so its horizon must be counted in
+        # optimizer steps -- but both `max_steps` and `len(train_loader)` are micro-step counts.
+        # Passing the micro count made the schedule decay `grad_accumulation_steps` times too
+        # slowly: job 690962 (accum 2, max_steps 3000) reached only 64% of its base LR by its last
+        # optimizer step instead of ~0, and at config B's accum 16 the LR would have been constant
+        # to within 12% for the whole run. Every LR sweep before 2026-08-07 measured that schedule.
+        total_steps = max(1, total_micro // self.config.grad_accumulation_steps)
         if self.lr_scheduler is None:
             self.lr_scheduler = build_scheduler(self.optimizer, total_steps)
         history, validations = [], []
@@ -577,10 +584,13 @@ class MRRateAdapterTrainer:
                             # moment it happens, and repeating a "skipped 0" on every healthy line
                             # is noise. The cumulative count lives on one W&B curve and in
                             # train_summary.json.
+                            # `total_steps` is an optimizer-step count, so it is the denominator of
+                            # `opt-step`, not of `micro`. Printing it next to the micro counter
+                            # read as a progress fraction that was accum times too small.
                             log.info(
-                                "epoch %d opt-step %d (micro %d/%s) loss %.5f lr %.3e dropped %d "
+                                "epoch %d opt-step %d/%s (micro %d) loss %.5f lr %.3e dropped %d "
                                 "grad_norm %s",
-                                epoch + 1, self.optimizer_step, self.step, total_steps,
+                                epoch + 1, self.optimizer_step, total_steps, self.step,
                                 metrics["loss"], metrics["lr"], metrics["n_dropped_reports"],
                                 ("%.3f" % metrics["grad_norm"]) if metrics.get("grad_norm") is not None else "-",
                             )

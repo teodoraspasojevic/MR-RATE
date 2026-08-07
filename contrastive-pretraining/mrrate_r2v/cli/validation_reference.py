@@ -152,8 +152,15 @@ def autoencoder_reference(volumes, args, log) -> dict:
                 for axis in reversed(record.per_axis):
                     pads.extend([int(axis["before"]), int(axis["after"])])
                 x = torch.nn.functional.pad(x, pads)
-            latent = autoencoder.encode_stage_2_inputs(x)
-            recon = autoencoder.decode_stage_2_outputs(latent)
+            # Same autocast wrapper as `training.LatentEncoder.encode`, and required for the same
+            # reason: MAISI's autoencoder casts activations to float16 inside its own group norm,
+            # so an unwrapped call hands a Half activation to a float32 conv bias and dies with
+            # "Input type (c10::Half) and bias type (float) should be the same" (job 711944).
+            # Wrapping it also keeps this reference on the numerical path training really uses.
+            with torch.autocast("cuda", enabled=str(args.device).startswith("cuda"),
+                                dtype=torch.bfloat16):
+                latent = autoencoder.encode_stage_2_inputs(x)
+                recon = autoencoder.decode_stage_2_outputs(latent)
             # Crop the padding back off so the comparison is on the original grid -- the one place a
             # round trip really is invertible, because end-only padding is exactly recorded.
             recon = recon[:, :, :volume.shape[0], :volume.shape[1], :volume.shape[2]]
@@ -259,7 +266,10 @@ def main(argv=None) -> int:
         "reference": reference,
         "provenance": {
             "split": args.split, "n_samples": len(indices), "seed": args.seed,
-            "shapes": sorted(str(tuple(v.shape)) for v in {tuple(x.shape) for x in volumes}),
+            # The set comprehension already yields shape tuples, so its elements have no `.shape`.
+            # This line ran only after ~18 min of sampling and metric work, so the bug destroyed two
+            # complete runs (jobs 711944, 713010) before writing anything.
+            "shapes": sorted(str(s) for s in {tuple(x.shape) for x in volumes}),
             "buckets": sorted({f"{dataset.samples[i].modality}_{dataset.samples[i].plane}"
                                for i in indices}),
             "ssim_parameters": ssim_parameters(),

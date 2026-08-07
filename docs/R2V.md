@@ -10,8 +10,10 @@ should come from — see **[TEXT_ENCODERS.md](TEXT_ENCODERS.md)** and the
 [textenc](../contrastive-pretraining/mrrate_r2v/textenc/README.md) /
 [textbench](../contrastive-pretraining/mrrate_r2v/textbench/README.md) READMEs.
 
-**Training a report adapter? Start at [TEXT_ENCODERS.md §9](TEXT_ENCODERS.md#9-the-three-supported-conditioning-configurations).**
-It covers the three supported configurations and their exact conditioning shapes, how each is run
+**Training a report adapter? Start at
+[`textenc/README.md` Part 4](../contrastive-pretraining/mrrate_r2v/textenc/README.md) for the four
+named configurations (`--conditioning`), then [TEXT_ENCODERS.md §9](TEXT_ENCODERS.md) for the study
+behind them.** Between them they cover the configurations and their exact conditioning shapes, how each is run
 (single- and multi-GPU), validation and its two metrics, W&B and the interactive panel, checkpoint
 contents, the measured H200 batch sizes, and the per-bucket geometry table.
 
@@ -440,6 +442,88 @@ For a different text encoder, add it to `TEXT_EMBEDDERS` in
 [`text.py`](../contrastive-pretraining/mrrate_r2v/text.py) and pass `--text-encoder <name>`. The
 trainable projection is built from `embedder.output_dim`, so no other file changes.
 
+### The training recipe
+
+Sizes, from the run logs: **575,187** train and **23,356** val (study, series) samples. 8,080,000
+trainable parameters. One H200 node = 4 GPUs; the `h200` partition caps a job at **24 h**.
+
+| | value | why |
+|---|---|---|
+| optimizer | `Adam`, betas (0.9, 0.999), eps 1e-8, wd 0 | `training.py:104` = `diff_model_train.py:198`; the recipe the checkpoint was trained with |
+| schedule | `PolynomialLR`, power 2, no warmup | `training.py:109` = `diff_model_train.py:220` |
+| lr | **sweep pending** — jobs 711945-49 | every earlier sweep is void, see below |
+| precision | bf16 autocast | fp16 overflows this model (`TrainingConfig.amp_dtype`) |
+| grad clip | 1.0 | measured grad norms are 0.002–0.017, so it never binds — it is a NaN backstop, not regularisation |
+| batch / GPU | 8 | **not 4** — see below; 4 halves throughput and the memory is there |
+| effective batch | 256 | `batch x grad_accum x world_size`, **not rescaled by node count** — at 8 GPUs pass `R2V_GRAD_ACCUM=4`, or EB silently doubles |
+| epochs | 2 (~4,500 optimizer steps) | 8.08M parameters against 575k volumes; no overfitting has been observed or is expected inside 2 epochs |
+| nodes x GPUs | 2 x 4 | ~11 h for 2 epochs at batch 8, so the whole run fits one job under the 24 h cap |
+| report/modality dropout | 0.10 / 0.10 | enables classifier-free guidance at inference |
+
+**Throughput is bounded by the frozen VAE encode, not by the adapter.** `vae_encode_seconds` is
+90.6% of `step_seconds` at batch 8 (`cache/r2v/benchmarks/h200_688301.json`). Measured **20.2
+volumes/s** on one node at batch 8 (job 710049: 350 micro-steps in 556 s, 4 ranks) → **~7.9 h/epoch
+on one node**. Two-node scaling measured at 73% on a 200-step run (`scale3_1node` vs
+`scale3_2node`), which is a floor: that run syncs every micro-step, the recipe above syncs every 4.
+
+**Batch 4 costs half the throughput, and the configs default to it.** Job 711945 (configuration B,
+4 ranks x batch 4) runs optimizer steps 25 → 50 in 641.3 s — 400 micro-steps, startup excluded —
+= 1.60 s/micro-step = **9.98 volumes/s**, against 20.2 at batch 8, so 16 h/epoch instead of 7.9.
+At effective batch 256 that is 25.7 s per optimizer step, against ~12.7 s at batch 8. The per-volume cost at batch 4 and 8 is within 1% only at the 256³
+fallback bucket (`h200_688301.json`); at the real per-bucket geometries the volumes are smaller, so
+batch 4 leaves the GPU idle and fixed per-step overhead dominates. Memory is not the constraint:
+configuration B at batch 4 peaks at 35.6 GB of 140 (job 711503), and the 256³ worst case at batch 8
+was 85–87 GB. Raise `R2V_BATCH_SIZE` to 8 and halve `R2V_GRAD_ACCUM` to hold the effective batch;
+drop back to 4 only if a validation pass OOMs.
+
+**Every learning-rate sweep before 2026-08-07 is void.** `lrsweep_*` finished with `final_loss:
+NaN`; `lrsweep2_*` never wrote a summary; `lrsweep3_*` looks clean in `train_summary.json` but its
+log reads `skipped 828` at optimizer step 600 — **58% of its optimizer steps were discarded** for
+non-finite gradients, and not uniformly: the cause is the cuDNN SDPA backend returning a non-finite
+`grad_q` at latent 48³ in bf16 (`verify_fix_695257` E1), which hits only the buckets with a 48 in
+their latent. Those runs trained on a biased subset of the buckets. The fix is the backend guard in
+`report_conditioned_unet.py:71-100` (FLASH + EFFICIENT + MATH, cuDNN excluded), verified at 0/1200
+non-finite across all 16 bucket geometries (E3), 0/200 skipped in the real pipeline (E5), and 0
+skipped over 200 optimizer steps on 4 GPUs (job 710049).
+
+A second defect made those sweeps compare the wrong thing: `fit` passed a **micro**-step count as
+the `PolynomialLR` horizon while stepping the scheduler once per **optimizer** step, so the decay
+ran `grad_accumulation_steps` times too slowly — job 690962 reached 64% of its base LR at its last
+step instead of ~0, and at accum 16 the LR would have been constant to within 12%. Fixed at
+`training.py:557-565`, pinned by
+`test_r2v_training.py::test_the_schedule_horizon_is_counted_in_optimizer_steps_not_micro_steps`.
+
+### How often to validate, and on how many cases
+
+Every validation case costs a full diffusion sampling run, so this is a real budget. Measured at
+N=16 on 4 ranks (`lrsweep_1e-5`, validation 1): 180.7 s total = ~72 s fixed overhead + **1.50
+s/case** (generate + features + SSIM) + **21.0 s/case** for the condition-sensitivity swap, which is
+by far the most expensive part and belongs on its own rarer schedule.
+
+| | N | every | cost |
+|---|---|---|---|
+| quick pass (SSIM curve + FVD/FID trend) | 128 | 400 optimizer steps | ~4.4 min, ~5% overhead; 11 points over a 2-epoch run |
+| condition sensitivity | 8 | 1200 optimizer steps | ~2.8 min |
+| full pass | 512 | end of run | ~13 min |
+
+**Read SSIM as the curve and FVD/FID as a trend.** `rank_status` (`validation_metrics.py:85`) calls
+a Frechet distance well-conditioned only at `N >= 2 x feature_dim` — 1024 volumes for FVD, 4096 for
+2.5D FID. Anything affordable in-loop is `rank_level: 0`, comparable only against other values at
+the same N with the same extractor, never across runs with different N. Calibrated distribution
+numbers come from `cli.evaluate` over a real cohort, not from the training loop.
+
+What makes N=128 enough is that the case list and seed are **fixed** (`select_validation_cases` is
+deterministic in `config.seed` and prefix-stable), so consecutive points are paired and the curve
+tracks the model rather than the sample. `cli.validation_reference` gives the real-vs-real noise
+floor those curves are read against; run it once at the same N and seed and pass
+`--validation-reference`.
+
+**There is no held-out validation *loss*.** Grepping `val/loss` across `mrrate_r2v/` returns
+nothing, so the only validation signal is generative and therefore expensive. The same L1 velocity
+objective on val batches costs one forward pass — roughly 100x less per case than sampling — and
+would give a true train/val overfitting curve at every 100 steps for a negligible fraction of the
+budget. It is the single highest-value addition to the validation path.
+
 ---
 
 ## 8. Testing
@@ -479,7 +563,7 @@ contrastive-pretraining/
     text.py            the replaceable text-encoder seam: RadBERT, a test mock, one registry,
                        plus encode_reports (the one dispatch seam) and rebuild_embedder
     textenc/           the encoder zoo + report formats + fusion            (README.md)
-                       conditioning.py = the three supported configurations (TEXT_ENCODERS.md §9)
+                       conditioning.py = the four named configurations (textenc/README.md Part 4)
     textbench/         encoder x format selection benchmark; never imported by the trainer
                        (README.md; results and rationale in docs/TEXT_ENCODERS.md)
     conditioning.py    modality ids, NVIDIA's own modality dropout, report dropout, CFG
