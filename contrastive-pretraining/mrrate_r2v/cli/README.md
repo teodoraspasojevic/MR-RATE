@@ -204,7 +204,7 @@ torchrun --nproc_per_node=4 -m mrrate_r2v.cli.train_r2v --num-gpus 4 ...  # same
 | `--report-index` | required¹ | report index CSV for `ShardReportStore` |
 | `--split` | `train` | which split to train on |
 | `--report-sections` | `findings impression` | concatenated into the conditioning text; ignored when `--report-format` is given |
-| `--report-format` | the `--conditioning` config's own (A/B: `findings_impression_meta,impression_findings_meta`) | one named format, or **several comma-separated to sample one per training sample**. Validation is pinned to the first name; the checkpoint records the whole spec. See `mrrate_r2v/README.md` §4.2.1. |
+| `--report-format` | the `--conditioning` configuration's own (A/B/C: `findings_impression_meta,impression_findings_meta`; D encodes sections separately and takes none) | one named format, or **several comma-separated to sample one per training sample**. Validation is pinned to the first name; the checkpoint records the whole spec. See `mrrate_r2v/README.md` §4.2.1. |
 | `--geometry-mode` | `per_modality_plane` | as in `preprocess`; per-bucket FOVs |
 | `--bucket-order` | `interleave` | `interleave` = each `(modality, plane)` bucket spread evenly across the epoch, so consecutive batches carry different modalities \| `shuffle` = one flat shuffle |
 | `--num-workers` | `4` | DataLoader workers |
@@ -264,13 +264,35 @@ own attention, a report describes global findings rather than per-voxel texture,
 grows with voxel count — turning on level 0 means attending over the full-resolution latent at every
 step. Start here; widening it is an experiment, not a fix.
 
-**text encoder**
+**report conditioning** — normally the only flag you set
 
 | flag | default | meaning |
 |---|---|---|
-| `--text-encoder` | `radbert` | `radbert` \| `mock` (deterministic hash-based stand-in for CPU tests) |
-| `--text-checkpoint` | — | local RadBERT snapshot directory; **required** for `radbert` |
-| `--max-report-tokens` | `512` | truncation length. Exceeding the encoder's real limit is refused up front, not as a CUDA index error at step 1. |
+| `--conditioning` | — | one of four named configurations. Fixes the encoder, the pooling and the report format together. |
+| `--max-report-tokens` | `512` | truncation length, and the cap on `n`. Exceeding the encoder's real limit is refused up front, not as a CUDA index error at step 1. |
+| `--text-pooling` | the configuration's own | pooled configurations only; passing it to a `_tokens` one is an error, not a silent no-op |
+| `--text-checkpoint` | — | override the staged snapshot directory; single-encoder configurations only |
+
+| `--conditioning` | conditioning tensor | Slurm |
+|---|---|---|
+| `cxr_bert_cls` | `(B, 1, 768)` — pooled baseline | `R2V_CONFIG=A` |
+| `cxr_bert_tokens` | `(B, n, 768)` + `(B, n)` mask | `R2V_CONFIG=B` |
+| `radbert_tokens` | `(B, n, 768)` + `(B, n)` mask | `R2V_CONFIG=C` |
+| `report2ct_style` | `(B, 2, 2560)` | `R2V_CONFIG=D` |
+
+`n` is the longest report **in that batch** after tokenisation, capped at `--max-report-tokens`;
+padding is masked out of the attention, so a sample's conditioning never depends on its batchmates.
+**`n = 1` makes the cross-attention degenerate** (softmax over one key is constant → `to_q`/`to_k`
+get no gradient, and the report can only add a per-channel bias). That is why `cxr_bert_cls` is a
+baseline rather than the recommendation, and why `radbert_mean` left the lineup — it is still
+runnable as `--conditioning superseded_radbert_mean` so old adapters keep loading.
+See [`textenc/README.md`](../textenc/README.md) Part 4.
+
+**text encoder** — the pre-`--conditioning` path, kept for `--dry-run` and old scripts
+
+| flag | default | meaning |
+|---|---|---|
+| `--text-encoder` | `radbert` | `radbert` \| `mock` (deterministic hash-based stand-in for CPU tests). Ignored when `--conditioning` is given. |
 | `--mock-output-dim` | `32` | `--text-encoder mock` only |
 
 **optimisation**
@@ -303,11 +325,18 @@ step. Start here; widening it is an experiment, not a fix.
 | `--modality-dropout-probability` | `0.1` | NVIDIA's own `augment_modality_label(prob=...)`, imported unchanged |
 
 **Writes:** `adapter_last.pt` (+ `adapter_step*.pt` if `--save-every-steps`), `train_summary.json`
-(steps, wall time, final/mean loss, trainable vs frozen parameter counts, text-encoder identity,
-base-checkpoint identity).
+(steps, **`skipped_steps`**, wall time, final/mean loss, trainable vs frozen parameter counts,
+text-encoder identity, base-checkpoint identity).
 
 **Logged per step:** `loss` (L1 on the rectified-flow velocity target `x0 − ε` — NVIDIA's own
-objective, no auxiliary alignment term), `lr`, `n_dropped_reports`, `timestep_mean`.
+objective, no auxiliary alignment term), `lr`, `n_dropped_reports`, `timestep_mean`, `grad_norm`,
+and `train/skipped_steps`.
+
+**Check `skipped_steps` before reading any result.** A step whose gradient is non-finite is skipped
+so the weights survive, but the batch is lost — and such failures have been geometry-specific, so a
+nonzero count means one `(modality, plane)` bucket was trained on *zero* times. Healthy is a flat 0.
+DDP and gradient accumulation multiply the exposure: one bad micro-batch on any rank poisons the
+whole accumulated, all-reduced gradient.
 
 ---
 

@@ -25,7 +25,9 @@ sample  = dataset[0]
 ```python
 sample["image"]              # torch.Tensor [1, X, Y, Z] -- preprocessed, model-ready
                              # dtype = config.dtype (default torch.bfloat16)
-sample["report_text"]        # str -- the conditioning text
+sample["report_text"]        # str -- the conditioning text, composed by R2VDatasetConfig.report_format
+sample["report_sections_text"]  # dict -- unjoined sections; used only by a sectioned-fusion
+                             # conditioning (report2ct_style), which encodes each separately
 sample["modality"]           # "T1w" | "T2w" | "FLAIR" | "SWI" | "unknown"
                              # ("MRA" only if you override --excluded-modalities)
 sample["acquisition_plane"]  # "AXIAL" | "SAGITTAL" | "CORONAL" | "OBLIQUE" | "unknown"
@@ -138,6 +140,10 @@ a different shape per bucket. Per-bucket caching is not implemented — the coho
 | `storage.py` | reading bytes out of un-extracted tars; the node-local cache | stdlib |
 | `manifest.py` | which (study, series) pairs exist and where they live | stdlib |
 | `reports.py` | where the conditioning text comes from | stdlib |
+
+The Dataset only *composes* the text; it never tokenises or encodes. Which words go in is
+`report_format` (`textenc/formats.py`), and which model turns them into numbers is `--conditioning`
+(`textenc/README.md` Part 4). The Dataset is unaware of both — it emits strings.
 | `geometry.py` | what voxel grid each series is resampled onto | stdlib |
 | `dataset.py` | assembling all of it into tensors | torch |
 

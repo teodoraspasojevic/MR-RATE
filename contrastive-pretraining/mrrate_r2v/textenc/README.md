@@ -43,6 +43,9 @@ cond    = encoder.encode([text], device)                # the actual encoding st
 `B` = number of reports in the batch, `L` = number of tokens (the longest report in the batch),
 `D` = `encoder.output_dim` (768 for most, 1024 for MedEmbed-large, 384 for MedEmbed-small).
 
+In practice you do not assemble this by hand: `--conditioning <name>` selects one of four named
+configurations that fix the encoder, the pooling and the format together — see **Part 4**.
+
 ---
 
 ## Part 1: report formats — which words go in
@@ -259,6 +262,75 @@ memory, and a wider conditioning tensor. Only worth it if it measurably helps �
 
 ---
 
+## Part 4: the four named configurations
+
+A *configuration* bundles an encoder set, a pooling decision and a report format under one name.
+`--conditioning <name>` selects it; nothing else needs setting.
+
+| | `--conditioning` | encoder | conditioning tensor |
+|---|---|---|---|
+| **A** | `cxr_bert_cls` | CXR-BERT | `(B, 1, 768)` |
+| **B** | `cxr_bert_tokens` | CXR-BERT | `(B, n, 768)` + `(B, n)` mask |
+| **C** | `radbert_tokens` | RadBERT | `(B, n, 768)` + `(B, n)` mask |
+| **D** | `report2ct_style` | MedEmbed-large + Bio_ClinicalBERT + CXR-BERT | `(B, 2, 2560)` |
+
+`superseded_radbert_mean` (pooled RadBERT, `(B, 1, 768)`) is out of the lineup but still runnable,
+so adapters trained under it keep loading.
+
+### The one rule: **`n = 1` makes the cross-attention a no-op**
+
+Softmax over a single key is identically 1 for every query, so `to_q` and `to_k` cannot affect the
+output and get no gradient — the report collapses to a per-channel bias applied uniformly at every
+voxel. Measured after 40 real training steps, `to_q` gradient norm:
+
+```
+A (n=1)   1.2e-12   <- roundoff, i.e. dead      33.8% of adapter params inert
+B (n≤512) 4.4e-07
+C (n≤512) 8.0e-07
+D (n=2)   2.7e-07
+```
+
+Keeping the token axis costs nothing measurable: 29 s per 40 steps and 13.8 GiB peak, identical to
+`n=1`. **A is kept as a pooled baseline** (CXR-BERT's CLS *was* CLIP-trained to summarise, and it is
+the exact form CTFlow uses), not as a recommendation.
+
+### `n` is variable, and that is fine
+
+The tokenizer pads each batch to *its own* longest report, capped at `--max-report-tokens` (512),
+so `n` changes from batch to batch — and differs per tokenizer (the same text is 194 CXR-BERT
+tokens, 243 RadBERT tokens). Reports are tokenised **as a batch**, never encoded separately and
+stacked, so there is no shape to reconcile. Padding is carried in the mask and dropped from the
+attention softmax, so a sample's conditioning never depends on its batchmates.
+
+Nothing resamples `n`: `ContextProjection` maps `(B, n, D) → (B, n, cross_attention_dim)`.
+
+### Choosing `--max-report-tokens`
+
+The encoder context is the binding constraint, not the report statistics. Measured over 8,000 train
+reports at `findings_impression_meta`:
+
+| | mean | median | p95 | p99 | truncated at 512 |
+|---|---|---|---|---|---|
+| CXR-BERT | 266 | 242 | 469 | 629 | **3.2%** (1.2% of tokens) |
+| RadBERT | 350 | 321 | 607 | 805 | **11.8%** (3.9% of tokens) |
+
+Both encoders hard-cap at 512, so p99 coverage is not purchasable — RadBERT loses part of ~1 report
+in 8. `bioclinical_mbert` (768-wide, 8192 context, staged) is the only staged way to remove
+truncation entirely.
+
+### Setting it
+
+```bash
+python -m mrrate_r2v.cli.train_r2v --conditioning cxr_bert_tokens ...   # or via Slurm:
+sbatch --export=ALL,R2V_CONFIG=B slurm/11_train_conditioning.sbatch     # A | B | C | D
+```
+
+`--report-format` defaults to the configuration's own recommendation and rarely needs setting.
+`--text-pooling` applies only to pooled configurations; passing it to a `_tokens` one is an error
+rather than a silent no-op.
+
+---
+
 ## Where the numbers go next
 
 `encoder.output_dim` is read by `ContextProjection` inside `ReportConditionedUNetMaisi`, which
@@ -276,4 +348,7 @@ needs **no code change** — just rebuild the adapter.
 | `max_length=N exceeds what '<x>' supports` | asked for more tokens than the model has | lower it, or switch to `bioclinical_mbert` |
 | `contains custom code which must be executed` | loaded `cxr_bert` via plain `AutoModel` | use `build_encoder("cxr_bert")` |
 | `unknown report format 'findings_only'` | typo — the error lists the valid names | see the format table above |
+| `unknown conditioning configuration '<x>'` | not one of the four names | see Part 4 |
+| `--text-pooling ... has nothing to act on` | pooling passed to a `_tokens` configuration | drop the flag, or use `cxr_bert_cls` |
+| `adapter checkpoint was trained under a different conditioning configuration` | loading e.g. a `cxr_bert_cls` adapter under `cxr_bert_tokens` (both 768-wide) | load it under the configuration named in the checkpoint's `config['conditioning_name']` |
 | out of GPU memory | `medembed_large` is 3× the others | smaller batch, or `dtype=torch.bfloat16` |

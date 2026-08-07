@@ -206,14 +206,21 @@ sees only the adapter; `scale_factor` comes from the checkpoint; latents encoded
 
 Four steps — full detail in [`models/README.md`](models/README.md):
 
-1. **RadBERT** turns the report into `[B, L, 768]` token embeddings plus an attention mask. Frozen,
-   `no_grad`, permanently in `eval()`.
-2. **`context_proj`** (a small trainable MLP) projects to `[B, L, 512]`. This is the *only* place the
-   text encoder's width appears, which is why swapping encoders needs no other code change.
+1. **A frozen text encoder** turns the report into `[B, n, D]` embeddings plus an attention mask
+   (`no_grad`, permanently in `eval()`). Which encoder, and whether `n` is the token count or 1,
+   is set by `--conditioning` — see [`textenc/README.md`](textenc/README.md) Part 4. `n` is the
+   longest report in the batch, capped at `--max-report-tokens`; padding is masked out.
+2. **`context_proj`** (a small trainable MLP) projects to `[B, n, 512]`, preserving the sequence
+   axis. This is the *only* place the text encoder's width appears, which is why swapping encoders
+   needs no other code change.
 3. **Five cross-attention adapters** sit at the input of each conditioned UNet level and at the
    bottleneck. Each is `x + proj_out(attn(norm(x)))`, with `proj_out` zero-initialised. Read it as:
    *every voxel of the feature map asks which words of this report are relevant to it, and adds the
    answer to itself.* The mask is honoured, so padding never joins the softmax.
+
+   This only does anything for `n > 1`: softmax over a single key is identically 1, so a pooled
+   one-token configuration reduces the adapter to a per-channel bias applied uniformly at every
+   voxel, and its query/key projections receive no gradient at all.
 4. **A learned `null_context` token** replaces the report for 10% of training samples. So the model
    learns both "with this report" and "with no report" — and the difference between the two is
    exactly the report's contribution, which guidance amplifies at inference. Training dropout and

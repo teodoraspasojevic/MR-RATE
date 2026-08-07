@@ -154,6 +154,28 @@ would depend on the longest report that happened to share its batch. Same parame
 state-dict keys; a startup check (`_BORROWED`) fails loudly if MONAI ever renames the attributes it
 relies on.
 
+**A single conditioning token makes this block a no-op.** Softmax over one key is identically 1 for
+every query, so `to_q`/`to_k` cannot affect the output and get exactly zero gradient, and the
+attention output no longer depends on `x` at all — the adapter degenerates into a report-dependent
+per-channel bias, added uniformly at every voxel. Measured: `to_q` gradient 1.2e-12 at `n=1` versus
+4.4e-07 at `n≤512`, and 33.8% of adapter parameters inert. Prefer a token-sequence conditioning
+(`textenc/README.md` Part 4).
+
+### `sdpa_backend_guard` — why `forward` runs inside a context manager
+
+`F.scaled_dot_product_attention` is one interface over four interchangeable CUDA kernels, and torch
+picks one per call. **cuDNN's returns non-finite gradients from a finite forward** at some latent
+shapes — measured at 48³ (the `(T2w, CORONAL)` bucket) in bfloat16 and float16, reproducible with
+random data and no adapter involved, and confirmed by forcing that backend explicitly. The guard
+restricts SDPA to FLASH + EFFICIENT + MATH (everything except cuDNN) and wraps the whole of
+`ReportConditionedUNetMaisi.forward`, so trainer, sampler and both CLIs are covered by one change.
+
+MATH stays in the list only as a fallback — `MaskedCrossAttention` passes an `attn_mask` the fused
+kernels may refuse, and an empty candidate set raises "No available kernel" rather than falling
+back. Guarding the forward is enough: the backend is bound into the autograd node at forward time,
+so the backward inherits it. Activation checkpointing would break that; this model does not use it.
+Pinned by `tests/test_sdpa_backend_guard.py`.
+
 ### The null report and `prepare_context`
 
 `prepare_context(batch_size, context, context_drop_mask, context_mask)` turns a raw report embedding
