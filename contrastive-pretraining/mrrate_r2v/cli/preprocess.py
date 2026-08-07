@@ -174,6 +174,11 @@ def parse_args(argv=None):
     io.add_argument("--overwrite", action="store_true")
     io.add_argument("--archive-access-mode", default="stream", choices=["stream", "node_local_cache"])
     io.add_argument("--report-sections", nargs="+", default=["findings", "impression"])
+    io.add_argument("--report-format", default=None,
+                    help="a single named format from mrrate_r2v.textenc.formats. Must match one of "
+                         "the formats the adapter was trained on, or cli.generate_r2v refuses the "
+                         "cohort: a cohort stores already-composed text, so the format cannot be "
+                         "changed afterwards. Default: --report-sections joined")
     io.add_argument("--dry-run", action="store_true",
                     help="select the cohort and print what would be written, then stop")
     return p.parse_args(argv)
@@ -203,11 +208,23 @@ def main(argv=None) -> int:
         raise SystemExit("0 manifest rows after split/sequence filtering -- check --split/--sequences")
 
     report_store, report_source = build_report_store(args)
+    if args.report_format is not None:
+        # A cohort's text is composed once and frozen, so a sampled multi-name spec has no meaning
+        # here -- there would be no single answer to record in `cohort.json`.
+        from ..textenc.formats import parse_format_spec
+
+        if len(parse_format_spec(args.report_format)) != 1:
+            raise SystemExit(
+                f"--report-format {args.report_format!r} names several formats. A cohort freezes one "
+                "conditioning string per case; pick the single format the predictions will be "
+                "generated under (for a multi-format training run, its first name)."
+            )
     config = R2VDatasetConfig(
         split=args.split, geometry_mode=args.geometry_mode,
         series_selection=args.series_selection, seed=args.seed, dtype=torch.float32,
         normalizer=args.normalizer, posterior_shift_mm=args.posterior_shift_mm,
         report_sections=tuple(args.report_sections),
+        report_format=args.report_format,
         archive_access_mode=args.archive_access_mode,
         # (X, Y, Z) in, (D, H, W) out: R2VDatasetConfig's fixed-target fields are the internal
         # (D, H, W) order, while the CLI flags and NVIDIA's dim/spacing are (X, Y, Z). See

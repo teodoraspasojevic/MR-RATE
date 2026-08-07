@@ -59,7 +59,7 @@ def load_r2v_model(args):
 
     from .generate_r2v import build_sampler
 
-    sampler, _embedder, _payload = build_sampler(SimpleNamespace(
+    sampler, _embedder, payload = build_sampler(SimpleNamespace(
         base_checkpoint=args.base_checkpoint, vae_checkpoint=args.vae_checkpoint,
         adapter=args.checkpoint, network_config=args.network_config,
         text_encoder=None, text_checkpoint=args.text_checkpoint, max_report_tokens=None,
@@ -69,12 +69,18 @@ def load_r2v_model(args):
         num_inference_steps=args.num_inference_steps, seed=args.seed,
         batched_guidance=True, allow_base_mismatch=args.allow_base_mismatch,
     ))
-    return sampler
+    return sampler, payload
 
 
-def generate_one(model, report_text: str, case, seed: int, modality: str = "T1w") -> np.ndarray:
-    """One report in, one volume out on the case's own grid."""
-    return model.generate(report_text, tuple(case.shape), tuple(case.spacing_mm), seed, modality=modality)
+def generate_one(model, report_text: str, case, seed: int, modality: str | None = None) -> np.ndarray:
+    """One report in, one volume out on the case's own grid.
+
+    `modality` defaults to the case's own sequence. Passing a fixed one instead conditions every
+    case of a four-sequence cohort on the same class label, which generates perfectly well and
+    scores as if the model were bad at three of them.
+    """
+    return model.generate(report_text, tuple(case.shape), tuple(case.spacing_mm), seed,
+                          modality=modality or case.sequence)
 
 
 def parse_args(argv=None):
@@ -88,11 +94,16 @@ def parse_args(argv=None):
                    help="text encoder directory; default = whatever the adapter recorded")
     p.add_argument("--network-config", type=Path, default=None)
     p.add_argument("--model-name", default="report2volume", help="recorded in the prediction set's provenance")
-    p.add_argument("--modality", default="T1w", choices=["T1w", "T2w", "FLAIR", "SWI", "unknown"])
+    p.add_argument("--modality", default=None, choices=["T1w", "T2w", "FLAIR", "SWI", "unknown"],
+                   help="force one modality for every case. Default: each case's own sequence, "
+                        "which is what a per-bucket cohort is for")
     p.add_argument("--num-inference-steps", type=int, default=30)
     p.add_argument("--report-guidance-scale", type=float, default=4.0)
     p.add_argument("--modality-guidance-scale", type=float, default=10.0)
     p.add_argument("--allow-base-mismatch", action="store_true")
+    p.add_argument("--allow-report-format-mismatch", action="store_true",
+                   help="predict even when the cohort's report_format is not one the adapter was "
+                        "trained on. For a deliberate cross-format ablation only")
     p.add_argument("--device", default="cuda", choices=["cpu", "cuda"])
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--limit", type=int, default=None)
@@ -107,7 +118,14 @@ def main(argv=None) -> int:
 
     cohort = Cohort(args.cohort)
     log.info("cohort %s", cohort.summary())
-    model = load_r2v_model(args)
+    model, payload = load_r2v_model(args)
+    # The same gate `cli.generate_r2v --cohort` applies. It was missing here, which meant the
+    # evaluated path -- the one that produces the numbers -- was the only one that did not check
+    # that the cohort's conditioning text was composed the way the adapter was trained.
+    from .generate_r2v import assert_report_format_matches
+
+    assert_report_format_matches(payload, cohort,
+                                 allow_mismatch=args.allow_report_format_mismatch)
 
     cases = cohort.cases[:args.limit] if args.limit else cohort.cases
     items, failures = [], []

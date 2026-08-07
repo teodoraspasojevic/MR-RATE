@@ -93,6 +93,13 @@ class R2VDatasetConfig:
     # "findings_impression_meta"). None -- the default -- keeps the historical behaviour exactly:
     # `report_sections` joined by `ReportRecord.compose`. Set one and it takes over, and the name
     # is recorded in `geometry_fingerprint` so a cohort built with it is a different cohort.
+    #
+    # **A comma-separated spec ("a,b") samples one format per sample**, uniformly, deterministically
+    # from (seed, epoch, index) -- see `textenc.formats.choose_format`. This exists because the
+    # challenge's report formatting is unknown: training on one fixed section order teaches the
+    # model that order, and there is no way to detect at submission time that the order flipped.
+    # Use it for the *train* split only; a validation curve computed over a sampled format measures
+    # format noise on top of model quality (`cli/train_r2v.py` passes the first name for val).
     report_format: Optional[str] = None
     # Which released sections are additionally returned *unjoined*, as `report_sections_text`, for
     # conditioning configurations that encode each section separately (Report2CT-style fusion ->
@@ -124,6 +131,9 @@ class R2VDatasetConfig:
     cache_max_bytes: int = DEFAULT_CACHE_MAX_BYTES
     cache_max_files: int = DEFAULT_CACHE_MAX_FILES
 
+    #: Derived in `__post_init__` from `report_format`, never passed in: the parsed spec.
+    report_format_names: tuple = field(init=False, repr=False, default=())
+
     def __post_init__(self):
         if self.series_selection not in SERIES_SELECTION_MODES:
             raise ValueError(f"Unknown series_selection '{self.series_selection}'. "
@@ -141,11 +151,11 @@ class R2VDatasetConfig:
             if name not in REPORT_SECTION_NAMES:
                 raise ValueError(f"Unknown report section '{name}'. Choose from: {REPORT_SECTION_NAMES}")
         if self.report_format is not None:
-            from ..textenc.formats import REPORT_FORMATS
+            from ..textenc.formats import parse_format_spec
 
-            if self.report_format not in REPORT_FORMATS:
-                raise ValueError(f"Unknown report_format '{self.report_format}'. "
-                                 f"Choose from: {sorted(REPORT_FORMATS)}")
+            # Validates every name in the spec and rejects a repeat. Parsed once here, not 575k
+            # times an epoch in `__getitem__`.
+            self.report_format_names = parse_format_spec(self.report_format)
 
     def geometry_fingerprint(self):
         """The preprocessing settings that change the returned tensor. Recorded in a
@@ -397,15 +407,23 @@ class MRReportToVolumeDataset(Dataset):
         image = image.permute(0, 2, 3, 1).contiguous()  # [1,D,H,W] -> [1,H,W,D] = [1,X,Y,Z]
 
         report = self.report_store[row.study_uid]
+        target_spacing_xyz = dhw_to_xyz(spec.target_spacing)
         if self.config.report_format is None:
             report_text = report.compose(self.config.report_sections)
         else:
-            from ..textenc.formats import format_report
+            from ..textenc.formats import choose_format, format_report
 
-            # modality/plane come from the manifest row, never parsed out of the report -- only
-            # the `*_meta` formats read them, and only because they were supplied here.
-            report_text = format_report(report, self.config.report_format,
-                                        modality=row.modality, plane=row.plane)
+            # One name -> that name. Several -> a uniform draw keyed on (seed, epoch, index), so the
+            # text a given step saw is reproducible under any --num-workers and after a resume. The
+            # docstring's "nothing is drawn from the process-global RNG in __getitem__" still holds.
+            name = choose_format(self.config.report_format_names,
+                                 (self.config.seed, self._epoch, index))
+            # modality/plane/spacing come from the manifest row and the resolved geometry, never
+            # parsed out of the report -- only the `*_meta` formats read them, and only because
+            # they were supplied here. Spacing is (X, Y, Z), the same order `target_spacing_mm`
+            # below is returned in, so the text and the numeric conditioning cannot disagree.
+            report_text = format_report(report, name, modality=row.modality, plane=row.plane,
+                                        spacing_mm_xyz=target_spacing_xyz)
 
         # The same `ReportRecord`, section-separated and unjoined. Deterministic (a plain field
         # read plus strip -- no parsing, no sampling), so training, validation and sampling see
@@ -428,7 +446,7 @@ class MRReportToVolumeDataset(Dataset):
             "acquisition_plane": row.plane or "unknown",
             "contrast_state": "unknown",             # not derivable from the release
             "skull_state": "defaced_not_stripped",   # constant for native_space
-            "target_spacing_mm": torch.tensor(dhw_to_xyz(spec.target_spacing), dtype=torch.float32),
+            "target_spacing_mm": torch.tensor(target_spacing_xyz, dtype=torch.float32),
             "target_shape": torch.tensor(dhw_to_xyz(spec.target_shape), dtype=torch.int64),
             "native_shape": torch.tensor(dhw_to_xyz(native_shape), dtype=torch.int64),
             "native_spacing_mm": torch.tensor(dhw_to_xyz(native_spacing), dtype=torch.float32),
@@ -505,6 +523,14 @@ class GeometryBucketBatchSampler(Sampler):
 
     Neither mode applies frequency weighting or temperature: a bucket's share of the epoch is
     its share of the data, and the 2-series SWI SAGITTAL bucket contributes 2 series.
+
+    **`drop_last` drops remainders, never a whole bucket.** A bucket smaller than `batch_size` has
+    no full batch at all, so a plain `drop_last` deletes it from every epoch -- the model never sees
+    that (modality, plane) and nothing fails. On MR-RATE's train split at `batch_size=8` that is
+    exactly SWI CORONAL (4 series) and SWI SAGITTAL (2), and both are *absent from val and test*,
+    so no metric could have revealed it either. Such a bucket therefore keeps one short batch, and
+    `undersized_buckets` is logged by the caller so the fact is on the record. Only buckets that do
+    have at least one full batch drop their remainder.
     """
 
     def __init__(self, dataset, batch_size, drop_last=False, seed=0, bucket_order="interleave"):
@@ -518,6 +544,18 @@ class GeometryBucketBatchSampler(Sampler):
         self.epoch = 0
         self._buckets = None
         self._buckets_version = None
+
+    @property
+    def undersized_buckets(self):
+        """{(modality, plane): n} for every bucket holding fewer than `batch_size` samples.
+
+        Empty in the ordinary case. Non-empty means those buckets contribute one short batch per
+        epoch (see the class docstring) -- worth logging, because a short batch carries less
+        gradient weight than a full one, and because a bucket this small is memorised rather than
+        learned. Reduce `batch_size`, or accept it, but do not let it be invisible.
+        """
+        return {key: len(indices) for key, indices in self.buckets.items()
+                if len(indices) < self.batch_size}
 
     @property
     def buckets(self):
@@ -545,7 +583,9 @@ class GeometryBucketBatchSampler(Sampler):
             indices = list(indices)
             rng.shuffle(indices)
             batches = [indices[s:s + self.batch_size] for s in range(0, len(indices), self.batch_size)]
-            if self.drop_last and batches and len(batches[-1]) < self.batch_size:
+            # `len(batches) > 1` is the whole guard: a bucket with a single short batch is the
+            # undersized case and keeps it. See the class docstring.
+            if self.drop_last and len(batches) > 1 and len(batches[-1]) < self.batch_size:
                 batches.pop()
             if batches:
                 per_bucket[key] = batches
@@ -590,7 +630,12 @@ class GeometryBucketBatchSampler(Sampler):
         n = 0
         for indices in self.buckets.values():
             full, rem = divmod(len(indices), self.batch_size)
-            n += full + (0 if self.drop_last or rem == 0 else 1)
+            if rem == 0:
+                n += full
+            elif self.drop_last and full >= 1:
+                n += full            # remainder dropped, the bucket still has full batches
+            else:
+                n += full + 1        # keep the short batch (drop_last off, or nothing else to keep)
         return n
 
 

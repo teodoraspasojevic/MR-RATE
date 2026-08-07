@@ -51,8 +51,12 @@ def parse_args(argv=None):
                       help="ignored when --report-format is given")
     data.add_argument("--report-format", default=None,
                       help="a named format from mrrate_r2v.textenc.formats (e.g. "
-                           "impression_findings). Default: --report-sections joined, i.e. the "
-                           "historical behaviour")
+                           "impression_findings), or several comma-separated to sample one per "
+                           "training sample (e.g. "
+                           "findings_impression_meta,impression_findings_meta -- the "
+                           "order-agnostic spec for an unknown challenge format). Validation "
+                           "always uses the first name. Default: --report-sections joined, i.e. "
+                           "the historical behaviour")
     data.add_argument("--geometry-mode", default="per_modality_plane", choices=["per_modality_plane", "fixed"])
     data.add_argument("--bucket-order", default="interleave", choices=["interleave", "shuffle"],
                       help="'interleave': consecutive batches carry different modalities; "
@@ -245,6 +249,19 @@ def resolve_report_format(args):
     return None, "--report-sections (historical default)"
 
 
+def validation_format_for(report_format):
+    """The single format the val split is composed with, given the (possibly multi-name) spec.
+
+    The first name, by definition of the spec's order, so it is stable across runs and readable off
+    the command line. `None` (the historical `--report-sections` path) passes through unchanged.
+    """
+    if report_format is None:
+        return None
+    from ..textenc.formats import parse_format_spec
+
+    return parse_format_spec(report_format)[0]
+
+
 def build_text_embedder_from_args(args):
     from ..text import build_text_embedder
 
@@ -401,6 +418,15 @@ def build_dataloader(args, log, dataset, rank: int = 0, world_size: int = 1):
                                          seed=args.seed, bucket_order=args.bucket_order)
     log.info("batching: %d batches/epoch over %d (modality, plane) buckets, order=%s",
              len(sampler), len(sampler.buckets), args.bucket_order)
+    undersized = sampler.undersized_buckets
+    if undersized:
+        # Not a warning-and-continue for cosmetics: before the sampler kept these, `drop_last=True`
+        # removed such a bucket from every epoch and the model silently never saw that
+        # (modality, plane). They now contribute one short batch each; saying so is what makes the
+        # under-weighted gradient a known property of the run instead of a surprise in the numbers.
+        log.warning("%d bucket(s) smaller than batch_size=%d contribute one short batch per epoch "
+                    "(kept, not dropped): %s", len(undersized), args.batch_size,
+                    ", ".join(f"{m}/{p}={n}" for (m, p), n in sorted(undersized.items())))
     if world_size > 1:
         sampler = ShardedBatchSampler(sampler, rank=rank, world_size=world_size)
     return DataLoader(
@@ -624,10 +650,14 @@ def main(argv=None) -> int:
 
     device, rank, local_rank, world_size = setup_distributed(args)
     report_format, format_source = resolve_report_format(args)
+    validation_report_format = validation_format_for(report_format)
     embedder = build_text_embedder_from_args(args)
     if rank == 0:
         log.info("conditioning: %s", json.dumps(embedder.identity, indent=None))
         log.info("report format: %s (from %s)", report_format, format_source)
+        if validation_report_format != report_format:
+            log.info("report format sampled per training sample; validation pinned to %s",
+                     validation_report_format)
 
     network_config = args.network_config
     if network_config is None:
@@ -691,7 +721,11 @@ def main(argv=None) -> int:
             # A separate Dataset on the val split, with the *same* report_format -- the whole point
             # of resolving the format once above. MR-RATE's splits are patient-isolated (0
             # violations in the release's own check), so no study can appear in both.
-            validation_dataset = build_dataset(args, args.val_split, report_format)
+            #
+            # Except when the format is a multi-name spec: the val split takes the FIRST name only.
+            # A sampled format would add format variance to a curve whose only job is to show model
+            # improvement, and would do it inconsistently across validation steps.
+            validation_dataset = build_dataset(args, args.val_split, validation_report_format)
 
     unet = wrap_distributed(unet, local_rank) if world_size > 1 else unet
 

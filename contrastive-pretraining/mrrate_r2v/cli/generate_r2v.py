@@ -13,8 +13,13 @@ One report from a string:
         --adapter <ws>/runs/r2v_adapter_v1/adapter_last.pt \\
         --text-checkpoint <ws>/pretrained/RadBERT-RoBERTa-4m \\
         --report "Findings: 12 mm enhancing lesion in the right frontal lobe." \\
-        --modality T1w --dim 256 256 256 --spacing 1 1 1 \\
+        --modality T1w --plane AXIAL \\
         --report-guidance-scale 4 --out <ws>/samples/case001.nii.gz
+
+`--dim`/`--spacing` default to the (modality, plane) bucket's own trained grid; pass them only to
+override it. When the adapter was trained on a `*_meta` format, the `[MODALITY]/[PLANE]/[SPACING]`
+prefix is prepended from those same values -- so a challenge request that carries no acquisition
+metadata just takes the defaults, and the text and the numeric conditioning still agree.
 
 Every case in a cohort's validation split, from its paired MR-RATE report:
 
@@ -66,9 +71,17 @@ def parse_args(argv=None):
     out = p.add_argument_group("output")
     out.add_argument("--out", type=Path, default=None, help="output .nii.gz (single report)")
     out.add_argument("--out-dir", type=Path, default=None, help="output directory (--cohort)")
-    out.add_argument("--modality", default="T1w", choices=["T1w", "T2w", "FLAIR", "SWI", "unknown"])
-    out.add_argument("--dim", nargs=3, type=int, default=[256, 256, 256], help="output shape (X Y Z)")
-    out.add_argument("--spacing", nargs=3, type=float, default=[1.0, 1.0, 1.0], help="mm (X Y Z)")
+    out.add_argument("--modality", default="T1w", choices=["T1w", "T2w", "FLAIR", "SWI", "unknown"],
+                     help="the modality to generate. Also the [MODALITY] marker when the adapter "
+                          "was trained on a metadata format -- there is no 'unspecified' option, "
+                          "because the model never saw a report without one")
+    out.add_argument("--plane", default="AXIAL", choices=["AXIAL", "SAGITTAL", "CORONAL", "unknown"],
+                     help="acquisition plane. Selects the geometry bucket and the [PLANE] marker")
+    out.add_argument("--dim", nargs=3, type=int, default=None, metavar=("X", "Y", "Z"),
+                     help="output shape (X Y Z). Default: the (modality, plane) bucket's own shape, "
+                          "the grid that bucket was trained on")
+    out.add_argument("--spacing", nargs=3, type=float, default=None, metavar=("X", "Y", "Z"),
+                     help="mm (X Y Z). Default: the (modality, plane) bucket's own spacing")
 
     sampler = p.add_argument_group("sampler and guidance")
     sampler.add_argument("--num-inference-steps", type=int, default=30, help="NVIDIA's own default")
@@ -93,7 +106,30 @@ def parse_args(argv=None):
         p.error("--cohort needs --out-dir")
     if args.cohort is None and args.out is None:
         p.error("--report/--report-file needs --out")
+    args.dim, args.spacing, args.geometry_source = resolve_output_geometry(args)
     return args
+
+
+def resolve_output_geometry(args):
+    """`(dim_xyz, spacing_mm_xyz, where_it_came_from)` for a free-form generation.
+
+    Unset `--dim`/`--spacing` resolve to the training bucket for `(--modality, --plane)`, not to a
+    256^3 @ 1 mm cube. Three things have to agree or the conditioning is a configuration the model
+    never saw: the numeric `spacing_tensor`, the `[SPACING]` marker in the text, and the grid the
+    volume is actually decoded onto. Defaulting to 1 mm while training T1w AXIAL at 0.94/0.94/1.09
+    mm made all three disagree at once.
+
+    An unknown (modality, plane) lands on `FALLBACK_GEOMETRY_KEY`, whose value *is* NVIDIA's shipped
+    256^3 @ 1 mm -- so the old default survives exactly where it was the right answer.
+    """
+    from ..data.geometry import GeometryPolicy, dhw_to_xyz
+
+    spec = GeometryPolicy(mode="per_modality_plane").resolve(args.modality, args.plane)
+    dim = list(args.dim) if args.dim else [int(v) for v in dhw_to_xyz(spec.target_shape)]
+    spacing = list(args.spacing) if args.spacing else [float(v) for v in dhw_to_xyz(spec.target_spacing)]
+    source = ("--dim/--spacing" if args.dim and args.spacing
+              else f"({args.modality}, {args.plane}) geometry bucket")
+    return dim, spacing, source
 
 
 def build_sampler(args):
@@ -196,8 +232,11 @@ def manifest_for(args, sampler, embedder, payload, extra: dict) -> dict:
         "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "seed": args.seed,
         "modality": args.modality,
+        "plane": args.plane,
         "dim_xyz": list(args.dim),
         "spacing_mm_xyz": list(args.spacing),
+        "geometry_source": args.geometry_source,
+        "report_formats_trained": list(trained_report_formats(payload)),
         "guidance": {
             "report_guidance_scale": args.report_guidance_scale,
             "modality_guidance_scale": args.modality_guidance_scale,
@@ -214,6 +253,40 @@ def manifest_for(args, sampler, embedder, payload, extra: dict) -> dict:
         "text_encoder": embedder.identity,
         **extra,
     }
+
+
+def trained_report_formats(payload: dict) -> tuple:
+    """Every format name the adapter was trained on. One name normally; several for a run trained
+    with a sampled spec (`--report-format a,b`). `()` if the checkpoint records none."""
+    stored = (payload.get("config") or {}).get("report_format")
+    if not stored:
+        return ()
+    from ..textenc.formats import parse_format_spec
+
+    return parse_format_spec(stored)
+
+
+def conditioning_text_for(report_text: str, payload: dict, modality, plane, spacing_mm_xyz):
+    """Raw report text -> the string the adapter was trained to be given, plus a note for the log.
+
+    This exists for the free-form path only (`--report` / `--report-file`, i.e. the challenge's
+    shape: a report arrives with no volume attached). A metadata format's `[MODALITY]/[PLANE]/
+    [SPACING]` prefix is part of what the model learned, so text without it is out of distribution
+    -- silently, since generation still succeeds and only the output is worse. Cohort text needs
+    nothing here: a cohort is *composed* under its own recorded format, and
+    `assert_report_format_matches` refuses it when that is not one of the trained ones.
+
+    Only the prefix is added. The section markers cannot be reconstructed from arbitrary prose, so
+    a free-form report is conditioned as-is below the prefix -- which is the honest representation
+    of a challenge request whose sectioning is unknown.
+    """
+    from ..textenc.formats import METADATA_DEPENDENT_FORMATS, meta_prefix_for
+
+    formats = trained_report_formats(payload)
+    if not any(name in METADATA_DEPENDENT_FORMATS for name in formats):
+        return report_text, None
+    prefix = meta_prefix_for(modality, plane, spacing_mm_xyz)
+    return f"{prefix}\n{report_text}", prefix
 
 
 def assert_report_format_matches(payload: dict, cohort, allow_mismatch: bool = False) -> None:
@@ -236,11 +309,18 @@ def assert_report_format_matches(payload: dict, cohort, allow_mismatch: bool = F
     built = fingerprint.get("report_format")
     if trained == built:
         return
+    # A run trained on a sampled spec ("a,b") saw both formats, so a cohort composed with either one
+    # is in distribution and is accepted. This is the one relaxation the contract allows, and it is
+    # not a loophole: the check still refuses any format the model was never trained on.
+    trained_names = trained_report_formats(payload)
+    if built and built in trained_names:
+        return
     message = (
         f"report-format mismatch: the adapter was trained on report_format={trained!r} but this "
         f"cohort's text was composed with report_format={built!r}. The conditioning strings differ, "
         f"which is silent at generation time and only shows up as a worse score.\n"
-        f"  Rebuild the cohort with `cli.preprocess --report-format {trained}`, or pass "
+        f"  Rebuild the cohort with `cli.preprocess --report-format "
+        f"{trained_names[0] if trained_names else trained}`, or pass "
         f"--allow-report-format-mismatch for a deliberate cross-format ablation."
     )
     if allow_mismatch:
@@ -268,8 +348,11 @@ def main(argv=None) -> int:
                     "reports, or use --report/--report-file"
                 )
             path = args.out_dir / f"{case.case_id}.nii.gz"
+            # The *case's* modality, not `--modality`: a cohort spans four sequences, and
+            # conditioning an SWI case on T1w is a wrong class label that still generates fine.
+            # `--modality` remains the flag for the free-form path, where there is no case to ask.
             volume = sampler.generate(report_text, tuple(case.shape), tuple(case.spacing_mm),
-                                      seed=args.seed, modality=args.modality)
+                                      seed=args.seed, modality=case.sequence)
             from ..sampling import save_volume
 
             save_volume(volume, case.spacing_mm, path)
@@ -281,6 +364,11 @@ def main(argv=None) -> int:
         return 0
 
     report_text = args.report if args.report is not None else args.report_file.read_text()
+    log.info("geometry: dim=%s spacing_mm=%s [X,Y,Z] (%s)", args.dim, args.spacing, args.geometry_source)
+    report_text, prefix = conditioning_text_for(report_text, payload, args.modality, args.plane,
+                                                args.spacing)
+    if prefix:
+        log.info("adapter trained on a metadata format; prepending %r", prefix)
     log.info("report: %d characters", len(report_text))
     if args.latent_only:
         latent = sampler.sample_latent(report_text, args.modality, tuple(args.dim), tuple(args.spacing),

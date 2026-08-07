@@ -122,6 +122,7 @@ python -m mrrate_r2v.cli.preprocess \
 | `--overwrite` | off | replace a non-empty output directory |
 | `--archive-access-mode` | `stream` | `stream` (no disk write) \| `node_local_cache` (`$TMPDIR`) |
 | `--report-sections` | `findings impression` | which sections become the conditioning text |
+| `--report-format` | — | a **single** named format from `textenc.formats`. Must be one the adapter was trained on, or `predict_r2v`/`generate_r2v` refuse the cohort — a cohort freezes composed text, so the format cannot be changed afterwards. |
 | `--dry-run` | off | select the cohort, print what would be written, stop |
 
 **Writes:** `cohort.json` (the contract + `cohort_id`, no identifiers — safe to share),
@@ -202,7 +203,8 @@ torchrun --nproc_per_node=4 -m mrrate_r2v.cli.train_r2v --num-gpus 4 ...  # same
 | `--manifest` | required¹ | manifest CSV from `build_manifest` |
 | `--report-index` | required¹ | report index CSV for `ShardReportStore` |
 | `--split` | `train` | which split to train on |
-| `--report-sections` | `findings impression` | concatenated into the conditioning text |
+| `--report-sections` | `findings impression` | concatenated into the conditioning text; ignored when `--report-format` is given |
+| `--report-format` | the `--conditioning` config's own (A/B: `findings_impression_meta,impression_findings_meta`) | one named format, or **several comma-separated to sample one per training sample**. Validation is pinned to the first name; the checkpoint records the whole spec. See `mrrate_r2v/README.md` §4.2.1. |
 | `--geometry-mode` | `per_modality_plane` | as in `preprocess`; per-bucket FOVs |
 | `--bucket-order` | `interleave` | `interleave` = each `(modality, plane)` bucket spread evenly across the epoch, so consecutive batches carry different modalities \| `shuffle` = one flat shuffle |
 | `--num-workers` | `4` | DataLoader workers |
@@ -356,7 +358,7 @@ python -m mrrate_r2v.cli.predict_r2v \
 | `--text-checkpoint` | whatever the adapter recorded | text encoder directory |
 | `--network-config` | NVIDIA's | |
 | `--model-name` | `report2volume` | recorded in the prediction set's provenance |
-| `--modality` | `T1w` | class label passed to the model — see the caveat below |
+| `--modality` | each case's own `sequence` | force one class label for every case instead |
 | `--num-inference-steps` | `30` | NVIDIA's own default |
 | `--report-guidance-scale` | `4.0` | `0` disables the report term and reproduces NVIDIA's guidance exactly |
 | `--modality-guidance-scale` | `10.0` | NVIDIA's `cfg_guidance_scale` for mr-brain |
@@ -366,10 +368,16 @@ python -m mrrate_r2v.cli.predict_r2v \
 | `--limit` | — | first N cases only, for a smoke test |
 | `--overwrite` | off | |
 
-> ⚠️ **`--modality` is one flag for the whole run.** Every case is generated with that class label,
-> while the prediction item records the case's *real* `sequence`. On a multi-bucket cohort that
-> means T2w/FLAIR/SWI cases are generated as T1w. Fine for a single-bucket run; wrong for the
-> default 10-bucket cohort.
+| `--allow-report-format-mismatch` | off | predict even when the cohort's `report_format` is not one the adapter was trained on |
+
+> **`--modality` now defaults to each case's own sequence.** It used to default to `T1w` for the
+> whole run, so on the default 10-bucket cohort every T2w/FLAIR/SWI case was generated with the T1w
+> class label while the prediction item recorded the case's real `sequence` — a wrong conditioning
+> input that generates perfectly well and scores as if the model were bad at three of four
+> sequences. Pass `--modality` only to force one label deliberately.
+>
+> The cohort's `report_format` is also checked here now (it was only checked in `generate_r2v`),
+> so the path that produces the numbers can no longer condition on differently-composed text.
 
 ### `generate_r2v` — free-form, no cohort needed
 
@@ -381,7 +389,7 @@ python -m mrrate_r2v.cli.generate_r2v \
     --base-checkpoint ... --vae-checkpoint ... --adapter <run>/adapter_last.pt \
     --text-checkpoint <ws>/pretrained/RadBERT-RoBERTa-4m \
     --report "Findings: 12 mm enhancing lesion in the right frontal lobe." \
-    --modality T1w --dim 256 256 256 --spacing 1 1 1 \
+    --modality T1w --plane AXIAL \
     --report-guidance-scale 4 --out <ws>/samples/case001.nii.gz
 ```
 
@@ -392,8 +400,11 @@ Same checkpoint/sampler/guidance flags as `predict_r2v`, plus:
 | `--report` / `--report-file` / `--cohort` | — | **exactly one.** `--cohort` generates one volume per case from its paired report. |
 | `--out` | — | output `.nii.gz` (with `--report`/`--report-file`) |
 | `--out-dir` | — | output directory (with `--cohort`) |
-| `--dim` | `256 256 256` | output shape, **X Y Z**. Must be divisible by the latent divisor (4). |
-| `--spacing` | `1 1 1` | mm, **X Y Z**. A real conditioning input to the model, not just header metadata. |
+| `--modality` | `T1w` | class label, geometry bucket, and the `[MODALITY]` marker |
+| `--plane` | `AXIAL` | geometry bucket and the `[PLANE]` marker |
+| `--dim` | the `(--modality, --plane)` bucket's shape | output shape, **X Y Z**. Must be divisible by the latent divisor (4). Unknown bucket → NVIDIA's `256 256 256`. |
+| `--spacing` | the bucket's spacing | mm, **X Y Z**. A real conditioning input to the model, not just header metadata — and, under a `*_meta` format, the `[SPACING]` marker too. |
+| `--allow-report-format-mismatch` | off | generate from a cohort composed under a format the adapter was not trained on |
 | `--text-encoder` | whatever the adapter recorded | `radbert` \| `mock` |
 | `--max-report-tokens` | the adapter's recorded value | |
 | `--no-batched-guidance` | (batched) | run the CFG branches as separate forwards — slower, identical numbers |
@@ -582,7 +593,6 @@ guidance only), `R2V_LATENT_ONLY=1` (skip the decode), `R2V_STEPS`, `R2V_MODALIT
 - **`--validate-every-steps` does nothing today.** `MRRateAdapterTrainer.fit(train_loader, validate)`
   only calls the hook when a callable is passed, and `train_r2v.py` calls `fit(train_loader)`. The
   plumbing exists; nothing is wired into it yet.
-- **`--modality` in `predict_r2v` / `generate_r2v --cohort` is global**, not per case (see above).
 - **`report_alignment` has no model.** `report_image_similarity_score` reports
   `available=False, reason="no validated MRI image-text model exists in this project yet"` rather
   than substituting a different model and calling the result report alignment.
