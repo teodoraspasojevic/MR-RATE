@@ -305,6 +305,8 @@ class MRRateAdapterTrainer:
         )
         self._nonfinite_streak = 0
         self.skipped_steps = 0
+        #: The reference constants are identical at every validation; the Table goes out once.
+        self._reference_table_logged = False
         # The gate that makes "only adapters train" a checked fact rather than an intention.
         assert_only_adapter_trainable(self._unwrapped(), self.optimizer, text_embedder)
         log.info("adapter training: %s", self.freeze_report.format())
@@ -517,34 +519,53 @@ class MRRateAdapterTrainer:
         """Run validation and act on it. Every rank calls this -- `validate` is responsible for its
         own sharding and gathering -- but only rank 0 writes checkpoints or logs.
 
-        **Only the headline metrics reach W&B, and they are split by pass.** A pass returns ~47
-        numbers (per plane, per bucket, rank flags, timings, counts, the sensitivity diagnostic);
-        logging all of them produced a dashboard nobody could read. So the curves are exactly six:
+        **Exactly three curves reach W&B**, and only from the quick pass:
 
-            val/quick/{fvd,fid_2p5d,ssim}   frequent, few samples
-            val/full/{fvd,fid_2p5d,ssim}    infrequent, many samples
+            val/quick/{fvd,fid_2p5d,ssim}
 
-        Two separate series rather than one, because a quick and a full pass measure the *same*
-        metric at different N -- and for a Frechet distance N is part of the number. Overlaying them
-        on one curve would draw a step change that is a sample-size artefact, not a model change.
-        All three metrics are computed on whichever samples a pass evaluates, so the two series are
-        each internally comparable.
+        A pass returns ~47 numbers (per plane, per bucket, rank flags, timings, counts, the
+        sensitivity diagnostic); logging all of them produced a dashboard nobody could read.
+
+        **Anything measured once is a summary entry, not a curve.** That covers the reference
+        constants (`val/reference/*`, computed once by `cli.validation_reference` and identical at
+        every step) and the full pass (`val/full/*`, which runs on the order of once per run). A
+        one-point series renders as a lone marker or, worse, a flat line that reads as "tracked and
+        unchanging" -- so those go to `run.summary`, which is a table.
+
+        Quick and full are never merged into one series in any case: they measure the *same* metric
+        at different N, and for a Frechet distance N is part of the number, so overlaying them would
+        draw a step change that is a sample-size artefact rather than a model change.
 
         Everything else stays in the returned payload and lands in `train_summary.json`.
         """
         from .validation import HEADLINE_METRICS
 
         validation = validate(self, self.optimizer_step, full)
-        kind = "full" if validation.get("val/full") else "quick"
-        curves = {}
+        is_full = bool(validation.get("val/full"))
+        curves, once = {}, {}
         for metric in HEADLINE_METRICS:
             value = validation.get(f"val/{metric}")
             if isinstance(value, (int, float)) and value == value:      # present and not NaN
-                curves[f"val/{kind}/{metric}"] = float(value)
-        # Reference lines are constants, so they belong on the same axes as the curves above.
-        curves.update({k: v for k, v in validation.items()
-                       if k.startswith("val/reference/") and isinstance(v, (int, float))})
-        self._log_metrics(curves, step=self.optimizer_step)
+                (once if is_full else curves)[f"val/{'full' if is_full else 'quick'}/{metric}"] = float(value)
+        if is_full:
+            once["val/full/n_cases"] = validation.get("val/n_cases")
+            once["val/full/optimizer_step"] = self.optimizer_step
+        once.update({k: v for k, v in validation.items()
+                     if k.startswith("val/reference/") and isinstance(v, (int, float))})
+        if curves:
+            self._log_metrics(curves, step=self.optimizer_step)
+        if once and self.local_rank == 0 and self.wandb_run is not None:
+            self.wandb_run.set_summary(once)
+            # `set_summary` only populates the Overview tab. The reference constants are meant to be
+            # read *together*, beside the curves they calibrate, so they also go out once as a real
+            # Table panel -- otherwise "it is in the table" means a key/value list on another page.
+            references = {k: v for k, v in once.items() if k.startswith("val/reference/")}
+            if references and not self._reference_table_logged:
+                self._reference_table_logged = True
+                self.wandb_run.log_table(
+                    "val/reference", ["reference", "value"],
+                    sorted((k.removeprefix("val/reference/"), v) for k, v in references.items()),
+                    step=self.optimizer_step)
         self._maybe_save_best(validation)
         return validation
 
@@ -598,12 +619,12 @@ class MRRateAdapterTrainer:
                                            "train/lr": metrics["lr"],
                                            "train/epoch": epoch + 1,
                                            "train/dropped_reports": metrics["n_dropped_reports"],
-                                           # One curve, cumulative. A skip is lost training signal,
-                                           # not a harmless retry: the gradient failure that caused
-                                           # it was confined to a single geometry bucket, so any
-                                           # nonzero value means one bucket is being trained on
-                                           # zero times. Healthy is a flat line at 0.
-                                           "train/skipped_steps": self.skipped_steps,
+                                           # No `train/skipped_steps` curve. In a healthy run it is
+                                           # a flat line at 0 -- a panel that costs attention and
+                                           # carries no information. A skip still emits its own
+                                           # WARNING naming the offending parameters, the cumulative
+                                           # count is in train_summary.json, and it is written to
+                                           # the W&B run summary at the end.
                                            "train/grad_norm": metrics["grad_norm"]},
                                           step=self.optimizer_step)
 

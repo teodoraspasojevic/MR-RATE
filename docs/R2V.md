@@ -493,6 +493,44 @@ step instead of ~0, and at accum 16 the LR would have been constant to within 12
 `training.py:557-565`, pinned by
 `test_r2v_training.py::test_the_schedule_horizon_is_counted_in_optimizer_steps_not_micro_steps`.
 
+### The four-configuration result (2026-08-09)
+
+Jobs 714497-500, `slurm/final/`: lr 1e-3, effective batch 256, 2 epochs (4,493 optimizer steps),
+2 nodes x 4 H200, **0 skipped steps in all four**. A, B and D completed; C reached step 4200 and was
+killed by a host-RAM OOM during its N=512 pass, after that pass and its checkpoint were written.
+All numbers below are the step-4200 full validation at N=512.
+
+| | SSIM | FVD | 2.5D FID | **sensitivity** | trainable |
+|---|---|---|---|---|---|
+| A `cxr_bert_cls` | 0.34734 | 16.34 | 24.89 | **+0.0418** | 8.08M |
+| B `cxr_bert_tokens` | 0.34228 | 16.52 | **24.36** | +0.00179 | 8.08M |
+| C `radbert_tokens` | 0.35201 | 16.65 | 24.70 | -0.00124 | 8.08M |
+| D `report2ct_style` | **0.35738** | **16.04** | 26.13 | +0.00506 | 11.75M |
+
+**Image quality does not separate these four; conditioning separates them by ~23x.** SSIM spans
+0.342-0.357, FVD 16.0-16.7, FID 24.4-26.1 -- all within a few percent, and the winner differs by
+metric. `ssim_advantage` (does the *correct* report pull the generation toward the *right* patient)
+is the only axis with a real gap, and only configuration A has one: +0.0348 / +0.0332 / +0.0418
+across its three measurements, the last on 512 cases. B and C sit at zero to within noise on every
+measurement including at N=512.
+
+**This inverts the prediction the B and C arms were built on.** The reasoning -- recorded in
+`slurm/configs/` -- was that A's single pooled token makes the cross-attention degenerate (softmax
+over one key is constant, so `to_q`/`to_k` receive no gradient and 33.8% of the adapter is inert),
+so keeping the token axis had to condition better. It does not. A plausible mechanism, untested: the
+CXR-BERT CLS vector was trained by a sentence-level CLIP objective and is already a usable summary,
+whereas the token path must learn what to attend to from scratch within 4,493 steps on an 8M
+adapter. Read this as "the token-sequence adapters did not converge to using their text here", not
+as "token attention cannot work".
+
+**Do not read D's SSIM/FVD lead as a conditioning win**: D trains 11.75M parameters against 8.08M
+(a 2560-wide fusion needs a wider `ContextProjection`), so it is not capacity-matched, and its
+sensitivity is 8x below A's.
+
+Caveats that bound all of it: report-volume *semantic* fidelity is still unmeasured (see the module
+docstring in `validation.py`), so `ssim_advantage` is a structural stand-in; one seed per arm; and
+FVD/FID at N=512 are still rank-deficient against 512- and 2048-d features.
+
 ### How often to validate, and on how many cases
 
 Every validation case costs a full diffusion sampling run, so this is a real budget. Measured at
@@ -500,11 +538,45 @@ N=16 on 4 ranks (`lrsweep_1e-5`, validation 1): 180.7 s total = ~72 s fixed over
 s/case** (generate + features + SSIM) + **21.0 s/case** for the condition-sensitivity swap, which is
 by far the most expensive part and belongs on its own rarer schedule.
 
-| | N | every | cost |
+That per-case model **underestimates a real pass by about 3x** and should not be used for budgeting.
+`val/seconds` from the sweep's own checkpoints is the number to trust: **572-765 s per pass at
+N=64** (jobs 711945, 713012), of which the recorded components account for only ~20%. The remainder
+is not the Frechet `sqrtm` (1.3 s at 512-d, 25 s at 2048-d across three planes, timed directly) —
+it is almost certainly re-reading and preprocessing the validation volumes every pass, so the cost
+scales with N.
+
+| | N | every | measured / budgeted cost |
 |---|---|---|---|
-| quick pass (SSIM curve + FVD/FID trend) | 128 | 400 optimizer steps | ~4.4 min, ~5% overhead; 11 points over a 2-epoch run |
-| condition sensitivity | 8 | 1200 optimizer steps | ~2.8 min |
-| full pass | 512 | end of run | ~13 min |
+| quick pass (SSIM curve + FVD/FID trend) | 128 | 600 optimizer steps | ~15-20 min; ~7 points over a 2-epoch run, ~2 h against ~11 h of training |
+| condition sensitivity | 8 | 1800 optimizer steps | 192-282 s measured |
+| full pass | 512 | once, late | expensive; the calibrated numbers come from `cli.evaluate` instead |
+
+**Raise the process-group timeout when you touch any of this.** Rank 0 computes every distribution
+metric alone after the `all_gather`, so the other ranks sit inside a collective for minutes. At
+NCCL's 600 s default that is indistinguishable from a hang: job 713012 completed all 600 optimizer
+steps and was then killed in its final validation by
+`WorkNCCL(SeqNum=240014, OpType=ALLGATHER) ran for 600011 milliseconds before timing out`.
+`cli/train_r2v.py` now passes `timeout=timedelta(hours=1)` to `init_process_group`.
+
+**The reference values, measured** (`cli.validation_reference`, val split, N=64, seed 0, job 713646):
+
+| | value | reading |
+|---|---|---|
+| `ssim_autoencoder` | **0.910 ± 0.035** | the frozen VAE round-trip. Every generated volume comes out through this decoder, so this is the practical structural ceiling — and models sitting at ~0.33 are nowhere near it. **Low SSIM here is not a decoder artefact.** |
+| `fvd_real_vs_real` | **30.01** | two disjoint halves of the *real* set; true answer 0 |
+| `fid_2p5d_real_vs_real` | **21.14** | as above |
+| `ssim_identity` / `shift_1vox` / `blur_sigma1` / `noise_sigma0p05` | 1.000 / 0.875 / 0.914 / 0.572 | SSIM responds to damage, in a sensible order |
+
+Two consequences. First, the `validation.py` warning that quoted a real-vs-real floor of "~6100" and
+declared the curve unusable was wrong by two orders of magnitude, and is now corrected against this
+measurement. But the honest reading is still cautious: measured **at the same N=64**, job 711945
+scored FVD 31.3 against a floor of 30.0 — the model is essentially *at* the FVD measurement floor,
+so that metric has almost no dynamic range here. FID (36.0 against a floor of 21.1) has more. SSIM
+remains the metric to rank on. (Model FVD of 43–58 quoted elsewhere was measured at N=16; Frechet
+values at different N are not comparable, which is exactly what `rank_level` exists to record.)
+Second, `real_vs_real_baseline` splits N in half, so an N=64 reference
+describes a **32-per-side** floor while the curve compares 64 against 64 — the reference must be run
+at twice the validation N to be like-for-like (N=256 for the final runs' N=128).
 
 **Read SSIM as the curve and FVD/FID as a trend.** `rank_status` (`validation_metrics.py:85`) calls
 a Frechet distance well-conditioned only at `N >= 2 x feature_dim` — 1024 volumes for FVD, 4096 for

@@ -165,7 +165,14 @@ def parse_args(argv=None):
     train.add_argument("--batch-size", type=int, default=1)
     train.add_argument("--lr", type=float, default=1e-5, help="NVIDIA's own diffusion_unet_train.lr")
     train.add_argument("--grad-accumulation-steps", type=int, default=1)
-    train.add_argument("--grad-clip-norm", type=float, default=None)
+    # Must match `TrainingConfig.grad_clip_norm`. It did not: argparse defaulted to None and
+    # `main` passes this value through unconditionally, so the CLI silently overrode the dataclass
+    # default of 1.0 and every run before 2026-08-09 trained with clipping OFF. Harmless in the
+    # event -- measured gradient norms are 0.003-0.017, so a clip at 1.0 never binds, and the
+    # non-finite *skip* guard is separate and did run (it calls clip_grad_norm_ with inf) -- but the
+    # recorded config said `grad_clip_norm: null` while the docs claimed 1.0. Pass 0 to disable.
+    train.add_argument("--grad-clip-norm", type=float, default=1.0,
+                       help="gradient-norm clip; 0 disables. Mainly a non-finite backstop")
     train.add_argument("--no-amp", dest="amp", action="store_false", help="disable mixed precision")
     train.add_argument("--amp-dtype", default="bfloat16", choices=["bfloat16", "float16"],
                        help="bfloat16 is the default and diverges from NVIDIA deliberately: "
@@ -341,7 +348,19 @@ def setup_distributed(args):
         torch.cuda.set_device(local_rank)
         device = torch.device(f"cuda:{local_rank}")
     if not dist.is_initialized():
-        dist.init_process_group(backend=backend, world_size=world_size, rank=rank)
+        # **A one-hour timeout, not NCCL's 600 s default, and validation is why.** After the ranks
+        # all_gather their per-case features, rank 0 alone computes the Frechet distances -- and
+        # `scipy.linalg.sqrtm` on the 2048x2048 InceptionV3 covariance is minutes of single-threaded
+        # work while every other rank sits inside the next collective. At 600 s the watchdog calls
+        # that a hung collective and aborts the job: job 713012 finished all 600 optimizer steps and
+        # then died in its final validation with
+        # `WorkNCCL(SeqNum=240014, OpType=ALLGATHER) ran for 600011 milliseconds before timing out`,
+        # losing its summary. The collective is not hung, it is waiting on honest CPU work, so the
+        # fix is to let it wait. This grows with --val-quick-samples and --val-full-samples.
+        from datetime import timedelta
+
+        dist.init_process_group(backend=backend, world_size=world_size, rank=rank,
+                                timeout=timedelta(hours=1))
     log.info("DDP rank %d/%d on %s (backend %s)", rank, world_size, device, backend)
     return device, rank, local_rank, world_size
 
@@ -778,6 +797,17 @@ def main(argv=None) -> int:
             indent=2, default=str,
         ))
         if wandb_run is not None:
+            # Run-level constants belong in the summary table, not on a time axis. `skipped_steps`
+            # in particular used to be a curve that is a flat line at 0 in every healthy run; the
+            # number still matters (a nonzero value means some geometry bucket trained zero times),
+            # so it is reported once here and in train_summary.json rather than plotted.
+            wandb_run.set_summary({
+                "train/skipped_steps": summary.get("skipped_steps"),
+                "train/optimizer_steps": summary.get("optimizer_steps"),
+                "train/epochs": summary.get("epochs"),
+                "train/hours": round(summary.get("seconds", 0.0) / 3600.0, 3),
+                "train/mean_loss": summary.get("mean_loss"),
+            })
             (args.out / "wandb_run.json").write_text(json.dumps(wandb_run.finish(), indent=2))
     if world_size > 1:
         import torch.distributed as dist

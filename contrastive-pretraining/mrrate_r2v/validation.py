@@ -361,14 +361,21 @@ class ValidationRunner:
         for name, dim in dims:
             n = self.config.n_quick
             if n < dim:
+                # The figure this warning used to quote ("~6100 at N=64 on 512-d features") was
+                # wrong by more than two orders of magnitude, and it mattered: it declared a usable
+                # curve unusable. `cli.validation_reference` at N=64 seed 0 on the val split
+                # measures the real-vs-real floor (true answer 0) at **FVD 30.0 / 2.5D FID 21.1**,
+                # against model scores of 43-58 in the same setup -- a real gap, not noise. The
+                # covariance is still rank-deficient, so a value is comparable only against others
+                # at the same N with the same extractor; that is a narrower claim than "unusable".
                 log.warning(
-                    "%s is enabled with --val-quick-samples %d against a %d-d feature. The "
-                    "covariance is rank-deficient and the sample-size bias dominates: measured "
-                    "real-vs-real (true answer 0) is ~6100 at N=64 on 512-d features, while a "
-                    "large genuine difference registers ~128. Treat this curve as unusable for "
-                    "ranking at this N -- rely on val/ssim for the frequent curve, and compute %s "
-                    "on a full pass with --val-full-samples >= %d or offline via cli.evaluate.",
-                    name, n, dim, name, dim,
+                    "%s is enabled with --val-quick-samples %d against a %d-d feature, so the "
+                    "covariance is rank-deficient and the absolute value is not calibrated. "
+                    "Compare it only against other values at the same N with the same extractor, "
+                    "and against the real-vs-real floor from cli.validation_reference (measured "
+                    "FVD 30.0 / FID 21.1 at N=64). For a calibrated number use --val-full-samples "
+                    ">= %d or cli.evaluate offline.",
+                    name, n, dim, dim,
                 )
 
     # -- setup -------------------------------------------------------------------------

@@ -39,6 +39,39 @@ class WandbRun:
             except Exception as e:  # noqa: BLE001
                 log.warning("W&B log() failed: %s", e)
 
+    def set_summary(self, data: dict) -> None:
+        """Write values into the run *summary* rather than as a time series.
+
+        For anything measured once -- reference constants, a single full-validation pass -- a curve
+        is the wrong shape: W&B draws one point, or a flat line implying it was tracked over time.
+        The summary is a table on the run's overview page, which is what a constant is.
+        """
+        if not self.enabled:
+            return
+        try:
+            for key, value in data.items():
+                self.run.summary[key] = value
+        except Exception as e:  # noqa: BLE001 - never crash a run over logging
+            log.warning("W&B set_summary() failed: %s", e)
+
+    def log_table(self, key: str, columns: list, rows: list, step: int | None = None) -> None:
+        """Log a real `wandb.Table` panel.
+
+        `set_summary` puts a value on the run's Overview tab as a key/value entry; it does **not**
+        create anything in the workspace. For a set of constants meant to be *read together* -- the
+        reference floors and ceilings a curve is judged against -- a Table panel is what actually
+        shows up next to the charts.
+        """
+        if not self.enabled:
+            return
+        try:
+            import wandb
+
+            self.run.log({key: wandb.Table(columns=list(columns), data=[list(r) for r in rows])},
+                         step=step)
+        except Exception as e:  # noqa: BLE001 - never crash a run over logging
+            log.warning("W&B log_table() failed: %s", e)
+
     def log_artifact(self, path: Path, name: str, artifact_type: str) -> None:
         if not self.enabled:
             return

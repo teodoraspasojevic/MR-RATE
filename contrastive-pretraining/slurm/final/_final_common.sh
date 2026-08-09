@@ -16,21 +16,50 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 WORKSPACE="${WORKSPACE:-/hnvme/workspace/y100dc19-nvidia-mri-brain}"
 
-# ---------------------------------------------------------------- the one free parameter
-# Deliberately unset. The sweep (jobs 711945, 713011-14) has not reported; see docs/R2V.md section 7.
+# ---------------------------------------------------------------- learning rate
+#
+# **1e-3**, from the five-arm sweep (jobs 711945, 713011-14; configuration B, 600 optimizer steps at
+# effective batch 256, 0 skipped steps in every arm). Best over each run:
+#
+#     lr      best ssim   best fvd   best fid      trajectory
+#     1e-3      0.3454      27.99      30.49       peaks at step 300
+#     3e-3      0.3370      26.14      27.77       declines from step 150 -- peaked before measurement
+#     1e-5      0.3354      31.28      35.99
+#     1e-4      0.3278      36.58      31.75
+#     3e-4      0.3225      33.33      30.84
+#
+# The robust finding is the *pair*: 1e-3 and 3e-3 beat the low-LR trio on every metric, and the
+# training loss separates nothing (0.9204-0.9212 across a 300x LR range), exactly as expected for a
+# random-timestep diffusion objective. Between the two the result is split -- 1e-3 wins SSIM, 3e-3
+# wins FVD/FID by ~7% -- and the margin is inside the within-arm wobble either way, so this is a
+# judgement call, not a measurement:
+#
+#   * SSIM is the least ambiguous metric at this N (paired, per-case, fixed seed), and 1e-3 wins it.
+#   * 3e-3's SSIM declines monotonically from its *first* validation, i.e. it peaked before step 150.
+#     That is a stability warning, and it matters more here than in the sweep: the final run is ~7.5x
+#     longer, so PolynomialLR holds the rate high for far more steps than 600.
+#   * Both sweeps now agree the optimum is at the high end; nothing below 1e-3 distinguished itself,
+#     and 1e-5 (NVIDIA's default, for training the whole 188M-parameter UNet) is not right for an
+#     8M adapter starting from a zero-init projection.
+#
+# **Caveat worth knowing when reading the final curves.** SSIM falls while report-sensitivity rises
+# (1e-3: ssim 0.3454 -> 0.3214 while ssim_advantage 0.0004 -> 0.0183). The model appears to start by
+# emitting generic average anatomy -- which scores well on a paired metric -- and to use the report
+# progressively more. For a report-to-volume task that trade is the desired direction, so do not read
+# a falling SSIM as failure on its own. Sensitivity is measured on 8 cases and is noisy.
 SMOKE="${SMOKE:-0}"
-if [[ "$SMOKE" != "1" && -z "${R2V_LR:-}" ]]; then
-    echo "R2V_LR is not set. This is the one hyperparameter the sweep has not settled." >&2
-    echo "  R2V_LR=3e-4 $0        # current best guess, pending jobs 711945 / 713011-14" >&2
-    echo "  SMOKE=1 $0            # short memory/throughput check, no LR needed" >&2
-    exit 1
-fi
+R2V_LR="${R2V_LR:-1e-3}"
 
 # ---------------------------------------------------------------- scale
 # 2 nodes x 4 H200. R2V_NGPU is the TOTAL rank count and the sbatch cross-checks it against
 # torchrun's WORLD_SIZE, so it must equal nodes x GPUs-per-node.
-NODES=2
-GPUS_PER_NODE=4
+#
+# Overridable so a SMOKE run can ask for one node: a 2-node 25-minute job backfills into far fewer
+# gaps than a 1-node one (Slurm projected 06:32 next morning for the 2-node smokes), and the
+# question a smoke actually answers -- does batch 8 fit, is the conditioning wired right -- is
+# per-GPU and does not need the second node. Leave it at 2 for the real runs.
+NODES="${NODES:-2}"
+GPUS_PER_NODE="${GPUS_PER_NODE:-4}"
 NGPU=$(( NODES * GPUS_PER_NODE ))
 
 # Effective batch = batch x accum x world_size = 8 x 4 x 8 = 256.
@@ -63,23 +92,36 @@ EPOCHS=2
 WALLTIME=24:00:00
 
 # ---------------------------------------------------------------- validation
-# Quick pass: ~4.4 min at N=128, once every 400 optimizer steps -- roughly 11 points across the run
-# at ~5% overhead. Read val/ssim as the curve; FVD and 2.5D FID are rank-deficient at any N that
-# fits in a training loop and are trend-only (validation_metrics.py rank_status).
-VALIDATE_EVERY=400
+#
+# **Budgeted from measurement, not from the earlier estimate, which was ~3x too optimistic.**
+# `val/seconds` recorded in the sweep's checkpoints: **572-765 s per pass at N=64** (jobs 711945,
+# 713012). The recorded components -- generate 26-28 s, features 9-73 s, SSIM 70-239 s, sensitivity
+# 192-282 s -- account for only ~20% of that; the rest is unattributed, and it is *not* the Frechet
+# `sqrtm` (timed locally at 1.3 s for 512-d and 25 s for 2048-d across three planes), so it is
+# almost certainly re-reading and preprocessing the validation volumes on every pass. That means the
+# cost grows with N rather than being fixed, so N=128 is budgeted at ~15-20 min per pass.
+#
+# Hence 600, not 400: ~7 points across a 2-epoch (~4,500 optimizer step) run is still plenty to see
+# a val curve turn over, and 7 x ~17 min is ~2 h against ~11 h of training rather than ~3 h.
+VALIDATE_EVERY=600
 VAL_QUICK=128
-# Full pass once per epoch (2 epochs ~ 4,500 optimizer steps).
-VALIDATE_FULL_EVERY=2250
+# One full pass late in training, not one per epoch: at N=512 a pass is expensive and the calibrated
+# distribution numbers come from `cli.evaluate` over a real cohort anyway.
+VALIDATE_FULL_EVERY=4000
 VAL_FULL=512
-# The condition-sensitivity swap costs a second generation per case (21 s/case measured), so it gets
-# its own rarer schedule. It is the diagnostic that says whether the report is used at all.
-SENSITIVITY_EVERY=1200
+# The condition-sensitivity swap costs a second generation per case and measured 192-282 s per pass,
+# so it gets its own rarer schedule. It is the diagnostic that says whether the report is used at all.
+SENSITIVITY_EVERY=1800
 SENSITIVITY_N=8
 
-# Real-vs-real noise floor from cli.validation_reference (job 713646; 711944 and 713010 both crashed
-# after computing it, so do not assume this file exists). Passed only if it does -- it is a reference
-# line on the curves, not something the run depends on.
-VALREF_JSON="$WORKSPACE/cache/r2v/validation_reference_n64_seed0.json"
+# Real-vs-real noise floor from cli.validation_reference (job 713833).
+#
+# **n256, not n64, and the factor of two is the point**: `real_vs_real_baseline` splits its sample in
+# half, so an n=256 reference describes a 128-per-side floor -- which is exactly what VAL_QUICK=128
+# compares. Measured FVD 10.22 / 2.5D FID 7.83 there, against 30.01 / 21.14 at n=64 (32 per side):
+# the floor falls by ~3x for a 4x larger sample, so a reference taken at the wrong N understates the
+# model's true margin badly. ssim_autoencoder is 0.915 +/- 0.036 (n=256), confirming 0.910 at n=64.
+VALREF_JSON="$WORKSPACE/cache/r2v/validation_reference_n256_seed0.json"
 
 # ---------------------------------------------------------------- reporting
 # The order-agnostic spec: [MODALITY]/[PLANE]/[SPACING] prefix, then findings/impression in one of
