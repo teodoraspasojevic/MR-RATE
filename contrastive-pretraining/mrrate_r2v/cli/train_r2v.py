@@ -39,6 +39,11 @@ log = logging.getLogger("train_r2v")
 
 
 def parse_args(argv=None):
+    # The dataclass is the single source of truth for the preprocessing defaults, so they are read
+    # off it rather than restated here -- restating is how the 15-vs-0 divergence became invisible
+    # in the first place. `torch` is already imported at module scope, so this costs nothing.
+    from ..data import R2VDatasetConfig
+
     p = argparse.ArgumentParser(
         description="Train the MR-RATE report-conditioning adapter on a frozen NV-Generate-MR-Brain UNet.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -58,6 +63,21 @@ def parse_args(argv=None):
                            "always uses the first name. Default: --report-sections joined, i.e. "
                            "the historical behaviour")
     data.add_argument("--geometry-mode", default="per_modality_plane", choices=["per_modality_plane", "fixed"])
+    data.add_argument("--posterior-shift-mm", type=float, default=R2VDatasetConfig.posterior_shift_mm,
+                      help="Defacing compensation: shifts the crop window posteriorly along the "
+                           "A-P axis. **This flag did not exist before 2026-08-10**, so every run "
+                           "up to and including the final four silently took the dataclass default "
+                           "(%(default)s mm) while `cli.preprocess` defaulted to 0 -- a "
+                           "train/test preprocessing divergence nobody could see. It only bites "
+                           "cases whose resampled A-P extent exceeds the bucket target (measured "
+                           "15.8%% of test cases, correlation 0.63-0.85 on those), because "
+                           "`crop_or_pad` clamps the shift away otherwise. It is recorded in the "
+                           "checkpoint config, so an evaluation cohort built at a different value "
+                           "is now detectable")
+    data.add_argument("--normalizer", default=R2VDatasetConfig.normalizer,
+                      choices=["percentile", "zscore", "minmax"],
+                      help="intensity normalizer. Must match the evaluation cohort's; also "
+                           "previously unreachable from this CLI")
     data.add_argument("--bucket-order", default="interleave", choices=["interleave", "shuffle"],
                       help="'interleave': consecutive batches carry different modalities; "
                            "'shuffle': one flat shuffle. Both use every series exactly once per "
@@ -418,6 +438,13 @@ def build_dataset(args, split: str, report_format):
         # only by class_labels/spacing_tensor -- is what stops the report adapter from absorbing
         # modality. The one-per-study modes exist for cohort construction, not for training.
         series_selection="all",
+        # Passed explicitly rather than left to the dataclass defaults. Both are hashed into an
+        # evaluation cohort's `cohort_id`, so a training run and its cohort silently disagreeing
+        # about them is exactly the class of bug the cohort contract exists to prevent -- and it
+        # happened: training took posterior_shift_mm=15.0 from the default while every R2V cohort
+        # was built at 0.
+        posterior_shift_mm=args.posterior_shift_mm,
+        normalizer=args.normalizer,
         dtype=torch.float32,
         seed=args.seed,
     )
@@ -793,6 +820,12 @@ def main(argv=None) -> int:
                "text_encoder": embedder.identity, "base_checkpoint": base_identity,
                "report_format": report_format, "conditioning": args.conditioning,
                "world_size": world_size,
+               # The preprocessing a cohort must match to be scored against this run. Recorded
+               # because they were previously invisible: nothing downstream could tell that
+               # training ran at posterior_shift_mm=15 while every cohort was built at 0.
+               "posterior_shift_mm": args.posterior_shift_mm,
+               "normalizer": args.normalizer,
+               "geometry_mode": args.geometry_mode,
                "effective_batch_size": args.batch_size * args.grad_accumulation_steps * world_size},
             indent=2, default=str,
         ))

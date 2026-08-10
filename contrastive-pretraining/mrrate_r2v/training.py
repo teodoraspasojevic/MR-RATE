@@ -158,7 +158,7 @@ class LatentEncoder:
     """MR-RATE volume `[B, 1, X, Y, Z]` -> the frozen autoencoder's latent, the same call
     `diff_model_create_training_data.py:170` makes (`encode_stage_2_inputs`, which samples from the
     posterior). Padding to the encoder's required divisor reuses this package's own
-    `required_spatial_divisor` and `pad_to_divisible`, so it matches `cli/predict_vae.py`.
+    `required_spatial_divisor` and `pad_to_divisible`, so it matches `cli/evaluate.py:reconstruct`.
     """
 
     def __init__(self, autoencoder, divisor: int, scale_factor: float, amp: bool = True,
@@ -176,7 +176,7 @@ class LatentEncoder:
     def encode(self, images: torch.Tensor) -> torch.Tensor:
         from .eval.geometry_contract import pad_to_divisible
 
-        # End-only padding, the same primitive and the same convention `cli/predict_vae.py` uses, so
+        # End-only padding, the same primitive and the same convention `cli/evaluate.py:reconstruct` uses, so
         # the encoder sees a training volume padded exactly as an evaluated one is.
         _padded_shape, record = pad_to_divisible(tuple(images.shape[2:]), self.divisor)
         if record is not None:
