@@ -15,6 +15,11 @@ On disk:
       volumes/<modality>__<plane>.npz  one compressed archive per bucket; members are
                            float32 [X, Y, Z] keyed by case_id (see volumes.py)
       reports.json         {case_id: conditioning text}
+      report_sections.json {case_id: {section: text}} -- the same report, *unjoined*. Only a
+                           sectioned-fusion configuration reads it; every other one uses
+                           reports.json. Optional, so a cohort written before this existed
+                           still loads (and a sectioned arm then fails loudly rather than
+                           being conditioned on one token instead of two).
 
 `cohort_id` is a hash over the whole contract, including the ordered case list. Quote it in
 a paper; two directories with the same `cohort_id` hold the same cases at the same geometry
@@ -44,6 +49,7 @@ COHORT_SCHEMA_VERSION = "2.0"
 COHORT_JSON = "cohort.json"
 INDEX_CSV = "index.csv"
 REPORTS_JSON = "reports.json"
+REPORT_SECTIONS_JSON = "report_sections.json"
 
 _INDEX_FIELDS = ("case_id", "study_key", "series_key", "sequence", "acquisition_plane",
                  "bucket", "shape", "spacing_mm")
@@ -215,12 +221,18 @@ class CohortSpec:
         return {"cohort_id": self.cohort_id(), **asdict(self)}
 
 
-def write_cohort(root, spec: CohortSpec, cases, reports: dict) -> Path:
-    """Write `cohort.json`, `index.csv` and `reports.json` once the case list is final.
+def write_cohort(root, spec: CohortSpec, cases, reports: dict, report_sections: dict | None = None) -> Path:
+    """Write `cohort.json`, `index.csv`, `reports.json` and `report_sections.json` once the case
+    list is final.
 
     Volumes are written separately, as they are produced, by a `volumes.VolumeWriter`. Counts are
     recorded per bucket as well as per sequence, because the per-bucket count is what the
     evaluation weights by and what generation has to match.
+
+    `report_sections` is `{case_id: {section: text}}` -- the same conditioning text `reports` holds,
+    left unjoined. It is written as a separate file and is **not** part of `cohort_id`: it carries
+    no information the joined text does not, so a cohort that gains it is still the same cohort and
+    stays comparable with results produced before it was added.
     """
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
@@ -244,6 +256,8 @@ def write_cohort(root, spec: CohortSpec, cases, reports: dict) -> Path:
             })
     # One file rather than one .txt per case: same inode pressure argument as the volume archives.
     (root / REPORTS_JSON).write_text(json.dumps(reports, indent=0, sort_keys=True))
+    if report_sections:
+        (root / REPORT_SECTIONS_JSON).write_text(json.dumps(report_sections, indent=0, sort_keys=True))
     (root / COHORT_JSON).write_text(json.dumps(spec.to_dict(), indent=2, sort_keys=True))
     return root / COHORT_JSON
 
@@ -275,6 +289,7 @@ class Cohort:
         self.cases = self._read_index()
         self._volumes = VolumeReader(self.root)
         self._reports = None
+        self._report_sections = None
 
     def _read_index(self):
         index_csv = self.root / INDEX_CSV
@@ -351,6 +366,29 @@ class Cohort:
             path = self.root / REPORTS_JSON
             self._reports = json.loads(path.read_text()) if path.is_file() else {}
         return self._reports.get(case_id, "")
+
+    @property
+    def has_report_sections(self) -> bool:
+        """Whether this cohort carries unjoined per-section text at all.
+
+        A sectioned-fusion arm needs it; asking the cohort up front lets `cli.predict_r2v` refuse
+        before loading a model rather than failing 2,000 sampling runs in.
+        """
+        return (self.root / REPORT_SECTIONS_JSON).is_file()
+
+    def load_report_sections(self, case_id: str) -> dict | None:
+        """`{section: text}` for one case, or None when this cohort has no `report_sections.json`.
+
+        None is deliberately distinct from `{}`: "this cohort predates sectioned conditioning" is a
+        different problem from "this case's sections are all empty", and only the first is a reason
+        to rebuild the cohort.
+        """
+        if self._report_sections is None:
+            path = self.root / REPORT_SECTIONS_JSON
+            self._report_sections = json.loads(path.read_text()) if path.is_file() else {}
+        if not self._report_sections:
+            return None
+        return self._report_sections.get(case_id, {})
 
     def verify_complete(self) -> list:
         """Case ids missing from their bucket archive. An incomplete cohort must never be scored

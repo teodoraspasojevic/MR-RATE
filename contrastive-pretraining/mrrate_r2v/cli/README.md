@@ -1,7 +1,6 @@
-# `mrrate_r2v.cli` — the eight entry points
+# `mrrate_r2v.cli` — the entry points
 
-Everything you run is here. Each script does one stage and writes one directory; the next stage
-reads that directory and nothing else.
+Everything you run is here.
 
 Full pipeline context: [`docs/R2V.md`](../../../docs/R2V.md). This file is the command reference —
 what each script does, every flag it takes, and what it leaves on disk.
@@ -21,33 +20,47 @@ python -m mrrate_r2v.cli.<script> ...
    ┌─ stage 0 ─────────────────────────────────────────────── once per storage location
    │  build_manifest      →  manifest.csv + report_index.csv       (an index; no pixels)
    │
-   ├─ stage 1 ─────────────────────────────────────────────── once per experiment set
-   │  preprocess          →  COHORT dir  (cohort.json, cohort_id)  (frozen ground truth)
+   ├─ train ──────────────────────────────────────────────────  report-to-volume only
+   │  train_r2v           →  adapter_last.pt
    │
-   ├─ training ───────────────────────────────────────────────  report-to-volume only
-   │  train_r2v           →  adapter_last.pt                       (reads the manifest directly,
-   │                                                                NOT the cohort)
-   ├─ stage 2 ─────────────────────────────────────────────── once per model
-   │  predict_vae         →  PREDICTION dir     VAE reconstruction
-   │  predict_generation  →  PREDICTION dir     NVIDIA unconditional generation
-   │  predict_r2v         →  PREDICTION dir     report-conditioned generation  ← ours
-   │  import_predictions  →  PREDICTION dir     someone else's .nii.gz files
-   │  generate_r2v        →  a .nii.gz          free-form, one report, no cohort needed
+   ├─ instrument ───────────────────────────────────────────── once, before any scoring
+   │  train_report_classifier → report_classifier.pt   (blinded, fitted on the TRAIN split)
    │
-   └─ stage 3 ─────────────────────────────────────────────── per prediction set
+   └─ test ───────────────────────────────────────────────────  per model
       evaluate --task ... →  RESULTS dir  (metrics_per_bucket.csv + summary + figures)
+      generate_r2v        →  a .nii.gz     free-form, one report, for eyeballing
 ```
 
-**Two things hold this together.** A cohort directory freezes the case list, FOV, sample count,
-normalizer and seed into a `cohort_id` hash. Every prediction set records the `cohort_id` it was
-produced against, and `evaluate` refuses to score a mismatch. There is no `--force` and no
-"close enough" — that refusal is the reason experiments are comparable.
+**Train and test are the same program up to the point of inference.** Both call
+`build_dataset`, both construct `R2VDatasetConfig` from the same flags, both resolve each case's
+grid through `dataset.geometry.resolve`. Where training calls `loss.backward()`, evaluation calls
+the sampler and then the metrics. There is no preprocess stage and no predict stage: nothing is
+frozen to disk in between, so nothing can go stale relative to anything else.
+
+```
+cli.train_r2v --split train   dataset → loader → encode → UNet → backward
+cli.evaluate  --split test    dataset → loader → encode → UNet → sample → metrics
+```
+
+**What makes two runs comparable** is `run_id`: a hash over the ordered case list, every
+preprocessing setting, the task, the sample cap, the seed and the model checkpoint. It replaces the
+old `cohort_id` and carries the same guarantee — but it is computed from the run rather than read
+from a directory, so it cannot go stale. `cli.evaluate` additionally compares its own preprocessing
+flags against what the adapter recorded and refuses a mismatch before any GPU work.
+
+**What is evaluated:** every case in the split, in a deterministic no-RNG order, unless
+`--n-per-bucket N` caps it — and the cap takes the *first* N per bucket in that same order, so a
+cheap run is a prefix of the full one, never a different sample.
+
+> **Removed 2026-08-10:** `preprocess`, `predict_vae`, `predict_generation`, `predict_r2v`,
+> `import_predictions`. They wrote and read cohort/prediction directories; `eval/live.py` replaces
+> all of them. `cohort.py`, `predictions.py` and `eval/runner.py` remain as the library for reading
+> results produced before the change.
 
 **Which scripts need which stack:** `build_manifest --source shards_parquet` needs pyarrow but not
-torch; `--source extracted_dir` needs torch but not pyarrow; `evaluate` needs neither the data stack
-nor a model (it reads `.npy` only); `train_r2v` / `generate_r2v` / `predict_r2v` additionally need
-`transformers` for the text encoder — on the cluster that means the `nvidia+redbert.sif` image, not
-the base one.
+torch; `--source extracted_dir` needs torch but not pyarrow; `train_r2v`, `generate_r2v` and
+`evaluate --task report2volume` need `transformers` for the text encoder — on the cluster that means
+the `nvidia+redbert.sif` image, not the base one.
 
 ---
 
@@ -556,7 +569,7 @@ check with its criterion id, and reports absent inputs as **SKIP, not PASS**.
 | `--task` | paired? | metric groups |
 |---|---|---|
 | `reconstruction` | yes | fidelity, perceptual, distribution, anatomy |
-| `report2volume` | yes | fidelity, perceptual, distribution, anatomy, report_alignment |
+| `report2volume` | yes | fidelity, perceptual, distribution, anatomy, report_alignment, report_consistency |
 | `generation` | **no** | distribution, anatomy |
 
 `generation` gets no voxelwise metric because no real patient corresponds to a generated volume.
@@ -624,7 +637,10 @@ guidance only), `R2V_LATENT_ONLY=1` (skip the decode), `R2V_STEPS`, `R2V_MODALIT
   plumbing exists; nothing is wired into it yet.
 - **`report_alignment` has no model.** `report_image_similarity_score` reports
   `available=False, reason="no validated MRI image-text model exists in this project yet"` rather
-  than substituting a different model and calling the result report alignment.
+  than substituting a different model and calling the result report alignment. The question it was
+  meant to answer is now covered by the **`report_consistency`** group instead (`--report-classifier`,
+  built by `cli.train_report_classifier`), which measures label agreement rather than embedding
+  similarity — a weaker claim, but one with a validated instrument behind it.
 
 ---
 

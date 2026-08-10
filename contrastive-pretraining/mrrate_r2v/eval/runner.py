@@ -94,6 +94,8 @@ class EvaluationInputs:
     skip_metric_groups: tuple = ()         # groups to drop from what the task declares
     save_figures: int = 3                  # example montages per sequence (0 = none)
     report_image_model: object = None     # must expose .score(text, volume) -> float
+    report_classifier: Path | None = None  # blinded pathology classifier (cli.train_report_classifier)
+    report_labels_csv: Path | None = None  # default: the repo's mrrate_merged_labels.csv
     save_nifti_cases: int = 0              # also export gt/pred/absdiff .nii.gz for the first N
     extra_run_metadata: dict = field(default_factory=dict)
 
@@ -339,9 +341,34 @@ def run_evaluation(inputs: EvaluationInputs) -> dict:
             (metric_rows if outcome == "row" else excluded).append(payload)
 
     # ---- distribution metrics
-    distribution_result = None
+    distribution_result, case_features = None, []
     if "distribution" in groups:
-        distribution_result = _run_distribution_metrics(inputs, paired_items)
+        distribution_result, case_features = _run_distribution_metrics(inputs, paired_items)
+
+    # ---- blinded classifier consistency (reuses the MedicalNet features extracted just above)
+    #
+    # Always produces a result object, never None: every task writes report_consistency.json, and a
+    # task that does not declare the group says so in it. "Not applicable here" and "the file is
+    # missing" must not look the same, and the result layout is identical across tasks by
+    # invariant (test_eval_tasks_and_runner.py::test_result_layout_is_identical_across_tasks).
+    if "report_consistency" not in groups:
+        report_consistency_result = {
+            "available": False,
+            "reason": (f"--task {task.name} does not declare report_consistency"
+                       if "report_consistency" not in task.metric_groups
+                       else "report_consistency was skipped by --skip-metric-groups"),
+        }
+    elif not case_features:
+        report_consistency_result = {
+            "available": False,
+            "reason": "no MedicalNet features available -- report_consistency reuses the "
+                      "distribution pass's features, so it needs --distribution-metrics and "
+                      "--medicalnet-checkpoint",
+        }
+        log.warning("report_consistency unavailable: %s", report_consistency_result["reason"])
+    else:
+        report_consistency_result = _run_report_consistency_metrics(
+            inputs, paired_items, case_features)
 
     # ---- anatomical plausibility (population-level, so it works for unpaired tasks too)
     anatomy_result = None
@@ -374,6 +401,7 @@ def run_evaluation(inputs: EvaluationInputs) -> dict:
         "paired_metrics_per_bucket": per_bucket,
         "bucket_geometry": {b: cohort.bucket_geometry(b) for b in cohort.buckets},
         "distribution_metrics": distribution_result,
+        "report_consistency": report_consistency_result,
         "anatomy": anatomy_result,
         "elapsed_sec": round(elapsed, 1),
         "figures": figures_written,
@@ -388,6 +416,25 @@ def run_evaluation(inputs: EvaluationInputs) -> dict:
     (out / "summary.json").write_text(json.dumps(summary, indent=2))
     if distribution_result is not None:
         (out / "distribution_metrics.json").write_text(json.dumps(distribution_result, indent=2))
+    # Its own file, like the other population-level groups: it carries a per-label table and a
+    # per-case column, both too wide for summary.json's inline view. The per-case CSV is written
+    # with a fixed header even when empty -- it is the input to the challenge's case-level
+    # permutation test, and a consumer should find an empty table rather than a missing path.
+    (out / "report_consistency.json").write_text(
+        json.dumps(report_consistency_result, indent=2, default=str))
+    _write_csv(out / "report_consistency_per_case.csv",
+               report_consistency_result.get("per_case") or [],
+               fieldnames=("case_id", "bucket", "consistency", "consistency_real"))
+    # The readable deliverable: one row per clinical label, generated score next to the same
+    # classifier's real-volume ceiling and the image-blind floor. This is the table to quote.
+    _write_csv(
+        out / "report_consistency_per_label.csv",
+        [{"label": name, **{k: v for k, v in entry.items() if k != "interpretation"}}
+         for name, entry in (report_consistency_result.get("per_label") or {}).items()],
+        fieldnames=("label", "auroc", "real_reference_auroc", "prevalence_baseline_auroc",
+                    "retention", "average_precision", "prevalence", "n", "n_positive",
+                    "mean_predicted_probability", "usable", "low_support"),
+    )
     if anatomy_result is not None:
         (out / "anatomy_metrics.json").write_text(json.dumps(anatomy_result, indent=2))
 
@@ -596,19 +643,125 @@ def _run_distribution_metrics(inputs: EvaluationInputs, paired_items):
 
     if not all_features:
         log.warning("no feature pairs available -- skipping distribution metrics")
-        return None
-    return DM.compute_distribution_metrics(
+        return None, []
+    result = DM.compute_distribution_metrics(
         all_features, cohort.sequences, min_subgroup_n=inputs.min_subgroup_n,
         n_bootstrap=inputs.fid_bootstrap, seed=inputs.seed, k_diversity=inputs.diversity_k,
         buckets=cohort.buckets,
     )
+    # The features are returned as well as consumed: `report_consistency` needs the very same
+    # MedicalNet vectors, and extracting them twice would double the GPU cost of an evaluation for
+    # nothing. They are per-case and keyed by case_id, so the two metrics cannot line up differently.
+    return result, all_features
 
 
-def _write_csv(path: Path, rows) -> None:
+def _run_report_consistency_metrics(inputs: EvaluationInputs, paired_items, case_features):
+    """The blinded-classifier metric: does a classifier trained only on real volumes read, off each
+    generated volume, the findings its conditioning report described?
+
+    Runs the same classifier over BOTH populations -- real and generated -- so the generated score
+    always arrives with the ceiling it should be read against. A classifier that cannot separate a
+    label on real volumes says nothing about generated ones, and `evaluate_consistency` marks those
+    labels rather than quietly averaging them in.
+
+    Returns a dict that is always written, even when it could not run: an unavailable metric with a
+    stated reason is information, a missing key is not.
+    """
+    from .report_classifier import (
+        auroc,
+        evaluate_consistency,
+        load_classifier_or_none,
+        per_case_consistency,
+        prevalence_baseline_auroc,
+    )
+    from .report_labels import ReportLabels
+
+    classifier, reason = load_classifier_or_none(inputs.report_classifier, inputs.device)
+    if classifier is None:
+        log.warning("report_consistency unavailable: %s", reason)
+        return {"available": False, "reason": reason}
+
+    cohort = inputs.cohort
+    try:
+        labels = ReportLabels(inputs.report_labels_csv)
+    except SystemExit as e:
+        return {"available": False, "reason": str(e)}
+    if tuple(labels.labels) != tuple(classifier.labels):
+        return {"available": False,
+                "reason": f"label set mismatch: classifier was fitted on {list(classifier.labels)}, "
+                          f"{labels.path} provides {list(labels.labels)}"}
+
+    joined = labels.for_cohort(cohort)
+    # Features are keyed by case_id and were built in paired_items order; rebuild the row order
+    # from the cases that have BOTH a label and a feature pair.
+    by_case = {cf.case_id: cf for cf in case_features}
+    rows = [(case, by_case[case.case_id]) for case, _item in paired_items
+            if case.case_id in by_case and case.case_id in joined
+            and by_case[case.case_id].medicalnet_real is not None
+            and by_case[case.case_id].medicalnet_gen is not None]
+    if not rows:
+        return {"available": False,
+                "reason": "no case had both a report label and a MedicalNet feature pair "
+                          "(is --medicalnet-checkpoint set? distribution metrics enabled?)"}
+
+    truth = np.array([joined[case.case_id] for case, _ in rows], dtype=np.int64)
+    probabilities_real = classifier.predict_proba(np.stack([cf.medicalnet_real for _, cf in rows]))
+    probabilities_gen = classifier.predict_proba(np.stack([cf.medicalnet_gen for _, cf in rows]))
+
+    real_reference = {
+        name: {"auroc": auroc(truth[:, i], probabilities_real[:, i])}
+        for i, name in enumerate(classifier.labels)
+    }
+    result = evaluate_consistency(
+        probabilities_gen, truth, classifier.labels,
+        real_reference=real_reference,
+        prevalence_baseline=prevalence_baseline_auroc(classifier.labels),
+    )
+    # The same computation on the real volumes, in full -- this is the ceiling row of the table,
+    # not a footnote.
+    result["real_reference"] = evaluate_consistency(
+        probabilities_real, truth, classifier.labels,
+        real_reference=real_reference,
+        prevalence_baseline=prevalence_baseline_auroc(classifier.labels),
+    )
+    per_case = per_case_consistency(probabilities_gen, truth, classifier.labels,
+                                    usable_labels=result["labels_usable"])
+    per_case_real = per_case_consistency(probabilities_real, truth, classifier.labels,
+                                         usable_labels=result["labels_usable"])
+    result.update({
+        "available": True,
+        "n_scored": len(rows),
+        "n_cases_without_labels": len(paired_items) - len(rows),
+        "label_coverage": labels.cohort_coverage(cohort),
+        "classifier": {
+            "path": str(inputs.report_classifier),
+            "labels": list(classifier.labels),
+            "provenance": vars(classifier.provenance),
+        },
+        # Per case, for the challenge's case-level permutation test. case_id only: no identifiers.
+        "per_case": [
+            {"case_id": case.case_id, "bucket": case.bucket,
+             "consistency": None if np.isnan(v) else float(v),
+             "consistency_real": None if np.isnan(r) else float(r)}
+            for (case, _), v, r in zip(rows, per_case, per_case_real)
+        ],
+    })
+    finite = per_case[~np.isnan(per_case)]
+    result["mean_per_case_consistency"] = float(finite.mean()) if finite.size else None
+    finite_real = per_case_real[~np.isnan(per_case_real)]
+    result["mean_per_case_consistency_real"] = float(finite_real.mean()) if finite_real.size else None
+    log.info("report_consistency: %d cases, macro AUROC %s (real reference %s) over %d usable labels",
+             len(rows), result["macro_auroc_usable_labels"],
+             result["real_reference"]["macro_auroc_usable_labels"], result["n_labels_usable"])
+    return result
+
+
+def _write_csv(path: Path, rows, fieldnames=None) -> None:
+    """`fieldnames` fixes the header so a table with no rows is still a readable, well-formed CSV
+    rather than a zero-byte file. Without it the columns are the union of the rows', as before."""
     with open(path, "w", newline="", encoding="utf-8") as f:
-        if not rows:
+        if not rows and not fieldnames:
             return
-        fieldnames = sorted({k for r in rows for k in r})
-        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w = csv.DictWriter(f, fieldnames=list(fieldnames or sorted({k for r in rows for k in r})))
         w.writeheader()
         w.writerows(rows)

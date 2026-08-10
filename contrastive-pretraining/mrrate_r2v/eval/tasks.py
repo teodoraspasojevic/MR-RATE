@@ -5,9 +5,10 @@ package chooses metrics, so a task's metric set cannot differ between two runs.
 
     task              paired?  metric groups
     ----------------  -------  -----------------------------------------------
-    reconstruction    yes      fidelity, perceptual, distribution
-    report2volume     yes      fidelity, perceptual, distribution, report_alignment
-    generation        no       distribution
+    reconstruction    yes      fidelity, perceptual, distribution, anatomy
+    report2volume     yes      fidelity, perceptual, distribution, anatomy,
+                               report_alignment, report_consistency
+    generation        no       distribution, anatomy
 
 **Why `generation` gets no fidelity metrics.** An unconditional generator is told "make a T1w
 brain" and nothing about any patient, so no specific real volume is the answer. Computing MAE
@@ -42,6 +43,15 @@ METRIC_GROUPS = {
     "report_alignment": {
         "needs_pair": True,
         "what": "does the volume match what the report says",
+    },
+    "report_consistency": {
+        # Paired because the conditioning report -- and therefore the label to agree with -- comes
+        # from the ground-truth case. An unconditional generation has no report to be consistent
+        # with, which is why `generation` does not declare this group.
+        "needs_pair": True,
+        "what": "does a classifier trained only on REAL volumes read, off a generated volume, the "
+                "clinical findings its conditioning report described (the local stand-in for the "
+                "challenge's Blinded Classifier Consistency) -- see report_classifier.py",
     },
     "anatomy": {
         "needs_pair": False,
@@ -92,7 +102,8 @@ TASKS = {
     "report2volume": TaskSpec(
         name="report2volume",
         paired=True,
-        metric_groups=("fidelity", "perceptual", "distribution", "report_alignment", "anatomy"),
+        metric_groups=("fidelity", "perceptual", "distribution", "report_alignment",
+                       "report_consistency", "anatomy"),
         summary="A model generated a volume from a report. The ground truth is the real series "
                 "that report describes, so paired metrics apply -- but expect much weaker "
                 "voxelwise agreement than reconstruction, since nothing constrains anatomy "

@@ -161,6 +161,18 @@ def build_sampler(args):
     # the checkpoint recorded.
     if args.text_encoder:
         stored_text = dict(stored_text, name=args.text_encoder)
+    # `--text-checkpoint` overrides where the encoder is loaded from. Every checkpoint written by
+    # `cli.train_r2v` already records an absolute path per encoder, and the encoder zoo resolves
+    # the rest from MRRATE_PRETRAINED_DIR, so the flag is only for a snapshot that has moved.
+    # Passing it out of habit is a live footgun: it is applied to whichever encoder the
+    # configuration names, so handing a RadBERT directory to a CXR-BERT arm loads RadBERT weights
+    # under the CXR-BERT slot. Warn rather than refuse -- a moved snapshot is a real use case.
+    if args.text_checkpoint:
+        log.warning(
+            "--text-checkpoint %s overrides the encoder path this adapter recorded. It is applied "
+            "to the configuration's own encoder, so make sure the snapshot really is that model.",
+            args.text_checkpoint,
+        )
     embedder = rebuild_embedder(
         stored_text,
         conditioning_name=stored_config.get("conditioning_name"),
@@ -187,6 +199,11 @@ def build_sampler(args):
         args.adapter, unet,
         base_checkpoint_sha256=sha256_file(args.base_checkpoint),
         allow_base_mismatch=args.allow_base_mismatch,
+        # The live embedder's identity, so `assert_conditioning_compatible` actually runs. Omitting
+        # it -- which this call used to do -- skips the check by design, and the check is the only
+        # thing that catches an encoder swap between two configurations of equal width: a 768x1
+        # `cxr_bert_cls` adapter loads cleanly onto a RadBERT embedder and generates nonsense.
+        text_encoder=embedder.identity,
     )
     unet.eval()
 
@@ -289,7 +306,8 @@ def conditioning_text_for(report_text: str, payload: dict, modality, plane, spac
     return f"{prefix}\n{report_text}", prefix
 
 
-def assert_report_format_matches(payload: dict, cohort, allow_mismatch: bool = False) -> None:
+def assert_report_format_matches(payload: dict, cohort, allow_mismatch: bool = False,
+                                 embedder=None) -> None:
     """The report text a cohort stores must have been composed the way the adapter was trained.
 
     A cohort's `reports.json` holds *already-composed* conditioning text, produced at preprocess
@@ -302,11 +320,26 @@ def assert_report_format_matches(payload: dict, cohort, allow_mismatch: bool = F
     and just scores worse. That is exactly the class of bug this repo's cohort contract exists to
     make impossible, so the default is to refuse.
     """
+    # A sectioned-fusion configuration never sees the joined string: it is handed
+    # `report_sections.json` and encodes each section on its own tokenizer. So the format that
+    # string was composed under is not an input to it, and comparing formats here would refuse
+    # every cohort -- configuration D records `report_format=None` by construction, which matches
+    # no cohort. What D actually needs is checked separately, by the caller, before any sampling:
+    # that the cohort HAS sections at all.
+    if embedder is not None and getattr(embedder, "needs_sections", False):
+        log.info("conditioning encodes report sections separately; the cohort's report_format is "
+                 "not an input to it, so no format check applies")
+        return
     trained = (payload.get("config") or {}).get("report_format")
-    fingerprint = (getattr(cohort, "spec", None) and getattr(cohort.spec, "geometry_fingerprint", None)) or {}
-    if not isinstance(fingerprint, dict):
-        fingerprint = {}
-    built = fingerprint.get("report_format")
+    # `cohort.spec` is the parsed cohort.json, a **dict**. This used to read
+    # `cohort.spec.geometry_fingerprint` -- an attribute a dict never has -- so `built` was
+    # unconditionally None and the check compared nothing: it passed silently whenever the adapter
+    # also recorded no format, and refused *every* cohort whenever it recorded one. The four final
+    # adapters all record one, so A, B and C could not have predicted against any cohort at all.
+    geometry = cohort.geometry if hasattr(cohort, "geometry") else {}
+    if not isinstance(geometry, dict):
+        geometry = {}
+    built = geometry.get("report_format")
     if trained == built:
         return
     # A run trained on a sampled spec ("a,b") saw both formats, so a cohort composed with either one
@@ -337,8 +370,18 @@ def main(argv=None) -> int:
         from ..cohort import Cohort
 
         cohort = Cohort(args.cohort)
-        assert_report_format_matches(payload, cohort, allow_mismatch=args.allow_report_format_mismatch)
+        assert_report_format_matches(payload, cohort,
+                                     allow_mismatch=args.allow_report_format_mismatch,
+                                     embedder=embedder)
         args.out_dir.mkdir(parents=True, exist_ok=True)
+        # Same up-front check `cli.predict_r2v` makes: a sectioned-fusion configuration needs the
+        # cohort's unjoined per-section text, and finding that out on case 1 of 2,000 is wasteful.
+        needs_sections = bool(getattr(embedder, "needs_sections", False))
+        if needs_sections and not cohort.has_report_sections:
+            raise SystemExit(
+                f"this adapter encodes report sections separately, but {args.cohort} has no "
+                f"report_sections.json. Rebuild the cohort with `cli.preprocess`."
+            )
         written = []
         for case in cohort.cases:
             report_text = cohort.load_report(case.case_id)
@@ -351,8 +394,11 @@ def main(argv=None) -> int:
             # The *case's* modality, not `--modality`: a cohort spans four sequences, and
             # conditioning an SWI case on T1w is a wrong class label that still generates fine.
             # `--modality` remains the flag for the free-form path, where there is no case to ask.
-            volume = sampler.generate(report_text, tuple(case.shape), tuple(case.spacing_mm),
-                                      seed=args.seed, modality=case.sequence)
+            volume = sampler.generate(
+                report_text, tuple(case.shape), tuple(case.spacing_mm),
+                seed=args.seed, modality=case.sequence,
+                report_sections=cohort.load_report_sections(case.case_id) if needs_sections else None,
+            )
             from ..sampling import save_volume
 
             save_volume(volume, case.spacing_mm, path)

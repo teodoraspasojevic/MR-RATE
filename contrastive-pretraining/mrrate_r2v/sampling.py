@@ -223,18 +223,32 @@ class ReportToVolumeSampler:
         seed: Optional[int] = None,
         modality: str = "T1w",
         report_sections: Optional[dict] = None,
+        postprocess: bool = True,
     ) -> np.ndarray:
-        """The contract `cli/predict_r2v.py` documents: report -> `np.ndarray[X, Y, Z]` on the given
-        grid, already postprocessed to the official MR intensity range.
+        """Report -> `np.ndarray[X, Y, Z]` on the given grid.
 
         `report_sections` is required by a sectioned-fusion configuration and ignored by every
         other one; `encode_reports` raises rather than guessing if it is missing when needed.
+
+        **`postprocess` decides which intensity space comes out, and the two are 1000x apart.**
+
+        - `True` (the default) applies `postprocess_mr`: NVIDIA's own int16 `[0, 1000]` MR range,
+          which is what a `.nii.gz` written by `cli.generate_r2v` must carry to match what their
+          `diff_model_infer.py` produces.
+        - `False` returns the decoder's native float `~[0, 1]`, which is the *cohort's* space --
+          the percentile-normalised model input every ground-truth volume is stored in.
+
+        Anything that will be compared against a cohort volume must pass `False`.
+        `cli.evaluate` does, `validation.py` bypasses this method for the same reason
+        (`_check_intensity_space` exists because the mistake is invisible: every metric consumes a
+        1000x-offset pair happily and returns a plausible number).
         """
         latent = self.sample_latent(report_text, modality, shape, spacing_mm, seed=seed,
                                     report_sections=report_sections)
         if self.autoencoder is None:
             raise RuntimeError("no autoencoder was provided, so a latent cannot be decoded to a volume")
-        return postprocess_mr(self.decode(latent))
+        volume = self.decode(latent)
+        return postprocess_mr(volume) if postprocess else volume.astype(np.float32, copy=False)
 
 
 __all__ = [

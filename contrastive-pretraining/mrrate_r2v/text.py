@@ -328,23 +328,32 @@ def rebuild_embedder(identity: dict, *, conditioning_name: Optional[str] = None,
     recorded name -- so a checkpoint trained with any other encoder silently loaded RadBERT and
     generated confident nonsense. There is now no second copy to drift.
 
-    Dispatch is on the recorded `kind`, so all three conditioning configurations round-trip:
+    Dispatch is on the recorded `kind`, so every conditioning configuration round-trips:
 
         kind="pooled"            -> PooledEmbedder over one encoder, with its recorded pooling
+        kind="tokens"            -> TokenSequenceEmbedder over one encoder, token axis kept
         kind="sectioned_fusion"  -> SectionedFusionEmbedder, recorded section and encoder order
         (absent)                 -> the historical single-encoder token-level path
+
+    **`tokens` used to be missing from that list**, and the consequence was not a crash. A token
+    identity records its encoder one level down and carries no top-level `name`/`checkpoint`, so it
+    fell through to the historical path, defaulted to `name="radbert"`, and -- given any
+    `--text-checkpoint` -- silently built RadBERT for a CXR-BERT-trained adapter. Both are 768-wide,
+    so the caller's `output_dim` guard passes and the run produces confident nonsense. That is
+    configurations B and C, i.e. half the final lineup.
     """
     kind = identity.get("kind")
-    if kind in ("pooled", "sectioned_fusion"):
+    if kind in ("pooled", "tokens", "sectioned_fusion"):
         from .textenc.conditioning import build_conditioning
 
         name = conditioning_name or identity.get("name")
-        if kind == "pooled" and not (name and name in _conditioning_names()):
-            # A pooled embedder records the encoder one level down, not a configuration name.
+        if kind in ("pooled", "tokens") and not (name and name in _conditioning_names()):
+            # A single-encoder embedder records the encoder one level down, not a configuration
+            # name, so the configuration is recovered by matching (kind, encoder, pooling).
             inner = identity.get("encoder") or {}
             name = next(
                 (key for key, spec in _conditioning_specs().items()
-                 if spec["kind"] == "pooled" and spec["encoders"] == (inner.get("name"),)
+                 if spec["kind"] == kind and spec["encoders"] == (inner.get("name"),)
                  and spec["pooling"] == identity.get("pooling")),
                 None,
             )

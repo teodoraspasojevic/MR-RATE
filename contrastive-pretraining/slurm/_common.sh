@@ -27,16 +27,24 @@ HOST_PYTHON="${R2V_HOST_PYTHON:-/apps/python/3.12-conda/envs/pytorch2.5.1/bin/py
 TEXTBENCH_ROOT="$WORKSPACE/cache/r2v/textbench"
 REPORT_CORPUS="$WORKSPACE/cache/r2v/report_analysis/reports_all.jsonl"
 
-# Persistent artifacts. Cohorts and predictions are large -- workspace only, never git or $HOME.
+# Persistent artifacts.
+#
+# **There is no COHORT_ROOT and no PRED_ROOT any more.** `cli.evaluate` builds the Dataset from
+# MANIFEST_CSV, generates and scores in one streaming pass, and writes only RESULT_ROOT -- a few
+# MB of CSV and JSON per run instead of ~39 GB of frozen volumes plus ~18 GB of predictions. The
+# case list is reproduced from the manifest on demand rather than stored, so nothing can go stale.
 MANIFEST_CSV="$DATA_WORKSPACE/r2v_manifest/manifest_shards_native.csv"
 REPORT_INDEX_CSV="$DATA_WORKSPACE/r2v_manifest/report_index_shards_native.csv"
-COHORT_ROOT="$WORKSPACE/cache/r2v/cohorts"
-PRED_ROOT="$WORKSPACE/cache/r2v/predictions"
 RESULT_ROOT="$WORKSPACE/cache/r2v/results"
 VAE_CHECKPOINT="$WORKSPACE/models/autoencoder_v1.pt"
 # NVIDIA stores this path relative to cwd in its env config, so it must be given absolutely.
 UNET_CHECKPOINT="$WORKSPACE/models/diff_unet_3d_rflow-mr-brain_v0.pt"
 MEDICALNET_CHECKPOINT="$WORKSPACE/pretrained/medicalnet/resnet_10_23dataset_statedict.pth"
+# The blinded pathology classifier behind `--task report2volume`'s report_consistency group, fitted
+# by slurm/14_train_report_classifier.sbatch on the TRAIN split. Passed by 05_evaluate only when
+# the file exists; the evaluator records the group unavailable with a reason otherwise, never a
+# faked number.
+REPORT_CLASSIFIER="${R2V_REPORT_CLASSIFIER:-$WORKSPACE/models/report_classifier_v2.pt}"
 # torchvision's r3d_18 Kinetics-400 weights, for the FVD-adaptation feature extractor. Staged here
 # rather than in $HOME/.cache so the containers see it and no job depends on a download.
 TORCH_HOME_DIR="$WORKSPACE/pretrained/torchhub"
@@ -87,7 +95,7 @@ setup() {
     echo "R2V_REPO=$R2V_REPO"
     setup_proxy
     preflight "$REPO_ROOT" "$CP_ROOT" "$WORKSPACE" "$SIF_IMAGE" "$REPO_ROOT/NV-Generate-CTMR"
-    mkdir -p "$WORKSPACE/slurm_logs" "$COHORT_ROOT" "$PRED_ROOT" "$RESULT_ROOT"
+    mkdir -p "$WORKSPACE/slurm_logs" "$RESULT_ROOT"
     APPTAINER_ARGS=(--nv
         --bind "$REPO_ROOT:$REPO_ROOT"
         --bind "$WORKSPACE:$WORKSPACE"

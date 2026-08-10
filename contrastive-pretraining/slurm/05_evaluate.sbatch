@@ -3,66 +3,164 @@
 #SBATCH --partition=h200
 #SBATCH --gres=gpu:h200:1
 #SBATCH --cpus-per-task=32
-#SBATCH --time=12:00:00
+#SBATCH --time=08:00:00
 #SBATCH --account=y100dc
 #SBATCH --qos=mq_health
 #SBATCH --export=NONE
 #SBATCH --output=/hnvme/workspace/y100dc19-nvidia-mri-brain/slurm_logs/r2v_evaluate_%j.out
 #SBATCH --error=/hnvme/workspace/y100dc19-nvidia-mri-brain/slurm_logs/r2v_evaluate_%j.err
 #
-# The single evaluator. One job script for every task.
+# The ONE evaluation job. Builds the dataset, generates, and scores -- no cohort, no prediction set.
 #
-#   sbatch slurm/05_evaluate.sbatch <task> <cohort_name> <pred_tag>
+#   sbatch slurm/05_evaluate.sbatch <task> <run_tag> [adapter.pt]
 #
-#   sbatch slurm/05_evaluate.sbatch reconstruction test_v1 vae_20260729
-#   sbatch slurm/05_evaluate.sbatch generation     test_v1 generation_20260729
-#   sbatch slurm/05_evaluate.sbatch report2volume  test_v1 r2v_ckpt3
+#     report2volume    a trained adapter, conditioned on each case's own report   (needs adapter.pt)
+#     reconstruction   the frozen NVIDIA autoencoder, encode then decode
+#     generation       the frozen base UNet from a modality label alone, report-blind
 #
-# A GPU is requested because the distribution metrics run feature extractors on it. Fidelity-only
-# runs (drop --distribution-metrics below) are fine on a CPU partition.
+# Examples:
+#   sbatch slurm/05_evaluate.sbatch reconstruction  vae_baseline
+#   sbatch slurm/05_evaluate.sbatch generation      nvidia_uncond
+#   sbatch slurm/05_evaluate.sbatch report2volume   r2v_A  $WS/runs/r2v_final_A_cxr_bert_cls/adapter_last.pt
 #
-# --cpus-per-task=32 and --workers are load-bearing: per-case scoring is CPU-compute-bound
-# (measured 1.6 s/case fidelity + 1.3 s/volume anatomy against 0.11 s to read one) and it
-# parallelizes near-linearly. Staging the cohort to node-local $TMPDIR would NOT help.
+# **What gets evaluated.** Every case in `--split test`, in a deterministic order with no RNG,
+# unless R2V_N_PER_BUCKET caps it -- and the cap takes the FIRST N per bucket in that same order,
+# so a cheap run is a prefix of the full one rather than a different sample. Per-case sampler noise
+# is `stable_seed(R2V_SEED, case_id)`, a function of the case, so a rerun reproduces every volume.
 #
-# Every metric group runs. `perceptual` (edge preservation, Laplacian variance, HF energy,
-# per-plane SSIM) used to be skipped here because it was ~40% of a 6.75 s/case cost at 256^3. At
-# the per-bucket FOVs that cost is 1.6 s/case, so the whole group adds ~40 s across 2000 cases at
-# 32 workers -- and it measures blur, which is a compressive VAE's primary failure mode. To skip
-# it again add `--skip-metric-groups perceptual`; summary.json records the omission either way, so
-# a partial run is never mistaken for a full one.
+#   R2V_N_PER_BUCKET=8     ~10 min   smoke test; no metric means anything at N=8 and the run says so
+#   R2V_N_PER_BUCKET=200   ~4 h      the scale the old cohort pipeline ran at (2,000 cases)
+#   unset (full split)     ~64 h     34,453 test-split series -- what CTFlow does on CT-RATE
+#
+# The walltime above (8 h) fits R2V_N_PER_BUCKET=200 with headroom. **Raise --time for a full-split
+# run**; measured 6.7 s/case at 30 inference steps on one H200, and the job is killed, not paused,
+# when the clock runs out.
+#
+# `#SBATCH --export=NONE` means a plain `VAR=x sbatch ...` does NOT reach the job -- pass overrides
+# through --export=ALL,... as the final_eval/ scripts do.
 
 unset SLURM_EXPORT_ENV
 set -euo pipefail
 
-# Absolute path, not $(dirname "$BASH_SOURCE"): Slurm runs a COPY of this script from
-# /var/tmp/slurmd_spool/job<id>/, where _common.sh does not exist. Override with R2V_REPO=/path.
 R2V_REPO="${R2V_REPO:-/home/hpc/y100dc/y100dc19/VLM3D-MRI-R2V-MICCAI-26/MR-RATE}"
 source "$R2V_REPO/contrastive-pretraining/slurm/_common.sh"
 setup
-TASK="${1:?usage: sbatch 05_evaluate.sbatch <task> <cohort_name> <pred_tag>}"
-NAME="${2:?missing cohort_name}"
-TAG="${3:?missing pred_tag}"
-COHORT="$COHORT_ROOT/$NAME"
-PRED="$PRED_ROOT/$TAG"
-RESULTS="$RESULT_ROOT/${TASK}_${NAME}_${TAG}"
-preflight "$COHORT/cohort.json" "$PRED/predictions.json"
 
-MEDICALNET_ARG=()
-[[ -f "$MEDICALNET_CHECKPOINT" ]] && MEDICALNET_ARG=(--medicalnet-checkpoint "$MEDICALNET_CHECKPOINT")
+TASK="${1:?usage: sbatch 05_evaluate.sbatch <task> <run_tag> [adapter.pt]}"
+TAG="${2:?usage: sbatch 05_evaluate.sbatch <task> <run_tag> [adapter.pt]}"
+ADAPTER="${3:-}"
 
-run_py mrrate_r2v.cli.evaluate \
-    --task "$TASK" --gt "$COHORT" --pred "$PRED" --out "$RESULTS" \
-    --distribution-metrics "${MEDICALNET_ARG[@]}" --device cuda \
-    --workers "${SLURM_CPUS_PER_TASK:-8}" \
-    --save-figures 3 --save-nifti-cases 1 \
+case "$TASK" in
+    report2volume|reconstruction|generation) ;;
+    *) echo "unknown task '$TASK' (report2volume | reconstruction | generation)" >&2; exit 1 ;;
+esac
+if [[ "$TASK" == "report2volume" && -z "$ADAPTER" ]]; then
+    echo "--task report2volume needs an adapter checkpoint as the third argument" >&2
+    exit 1
+fi
+
+OUT="$RESULT_ROOT/${TASK}_${TAG}"
+preflight "$MANIFEST_CSV" "$REPORT_INDEX_CSV" "$VAE_CHECKPOINT" "$MEDICALNET_CHECKPOINT"
+[[ -z "$ADAPTER" ]] || preflight "$ADAPTER"
+
+ARGS=(
+    --task "$TASK"
+    --manifest "$MANIFEST_CSV"
+    --report-index "$REPORT_INDEX_CSV"
+    --split "${R2V_SPLIT:-test}"
+    --out "$OUT"
+    --vae-checkpoint "$VAE_CHECKPOINT"
+    # Both are hashed into run_id and both are checked against what the adapter recorded, so a
+    # divergence like the 2026-08-10 posterior-shift one stops the job instead of skewing a bucket.
+    --posterior-shift-mm "${R2V_POSTERIOR_SHIFT:-15}"
+    --normalizer "${R2V_NORMALIZER:-percentile}"
+    --geometry-mode per_modality_plane
+    --report-sections findings impression
+    --medicalnet-checkpoint "$MEDICALNET_CHECKPOINT"
+    --seed "${R2V_SEED:-42}"
+    --device cuda
+    --save-figures "${R2V_SAVE_FIGURES:-3}"
     --overwrite
+)
+
+# `--report-format`: NOT a default, and omitting it is silent. The four final adapters were trained
+# on the order-agnostic *_meta spec, whose conditioning text carries a [MODALITY]/[PLANE]/[SPACING]
+# prefix; composing the text without that prefix is out of distribution for three of the four arms.
+# `assert_report_format_matches` refuses the pairing rather than scoring it -- but only because the
+# check exists. Configuration D ignores the format and reads the sections instead.
+[[ "$TASK" == "report2volume" ]] && ARGS+=(
+    --report-format "${R2V_REPORT_FORMAT:-findings_impression_meta}"
+    --checkpoint "$ADAPTER"
+    --base-checkpoint "$UNET_CHECKPOINT"
+    --num-inference-steps "${R2V_STEPS:-30}"
+    --report-guidance-scale "${R2V_REPORT_GUIDANCE:-4.0}"
+    --modality-guidance-scale "${R2V_MODALITY_GUIDANCE:-10.0}"
+)
+[[ "$TASK" == "generation" ]] && ARGS+=(--base-checkpoint "$UNET_CHECKPOINT")
+[[ -n "${R2V_N_PER_BUCKET:-}" ]] && ARGS+=(--n-per-bucket "$R2V_N_PER_BUCKET")
+[[ -n "${R2V_TRAIN_WORLD_SIZE:-}" ]] && ARGS+=(--train-world-size "$R2V_TRAIN_WORLD_SIZE")
+
+# The blinded classifier is passed only when it exists. Without it the report_consistency group is
+# recorded unavailable WITH A REASON -- never faked, never silently dropped.
+if [[ -f "$REPORT_CLASSIFIER" ]]; then
+    ARGS+=(--report-classifier "$REPORT_CLASSIFIER")
+    echo "blinded classifier: $REPORT_CLASSIFIER"
+else
+    echo "NOTE: $REPORT_CLASSIFIER not found -- report_consistency will be reported unavailable."
+    echo "      Fit it with: sbatch slurm/14_train_report_classifier.sbatch"
+fi
+
+WANDB_MODE_ARG="${R2V_WANDB:-disabled}"
+ARGS+=(--wandb-mode "$WANDB_MODE_ARG")
+if [[ "$WANDB_MODE_ARG" != "disabled" ]]; then
+    ARGS+=(--wandb-project "${R2V_WANDB_PROJECT:-mr-rate-r2v-eval}"
+           --wandb-group "${R2V_WANDB_GROUP:-mr-rate-$TASK}"
+           --wandb-name "${R2V_WANDB_NAME:-$TAG}"
+           --wandb-panels "${R2V_WANDB_PANELS:-6}")
+    [[ -n "${R2V_WANDB_ENTITY:-}" ]] && ARGS+=(--wandb-entity "$R2V_WANDB_ENTITY")
+    # Panels embed patient report text, so this must never point at a public project.
+    [[ "${R2V_WANDB_REPORTS:-0}" == "1" ]] && ARGS+=(--wandb-log-reports)
+    export WANDB_DIR="$OUT"
+    mkdir -p "$OUT"
+    APPTAINER_ARGS+=(--env "WANDB_DIR=$OUT" --env "WANDB__SERVICE_WAIT=300")
+    [[ -n "${WANDB_API_KEY:-}" ]] && APPTAINER_ARGS+=(--env "WANDB_API_KEY=$WANDB_API_KEY")
+fi
+
+if [[ "$WANDB_MODE_ARG" == "online" ]]; then
+    # Fail before the GPU work rather than after it. An unreachable W&B degrades to silence (see
+    # `setup_proxy`), so the run would burn its whole walltime and log nothing. 401/404 both mean
+    # "reached the server". Probed with `requests` -- the library wandb itself uses -- inside the
+    # container, so this tests the exact proxy handling the real call will get.
+    echo "=== W&B online: probing api.wandb.ai through the proxy ==="
+    code="$(apptainer exec "${APPTAINER_ARGS[@]}" "$SIF_IMAGE_TEXT" python3 -c \
+        'import requests,sys
+try: sys.stdout.write(str(requests.get("https://api.wandb.ai/", timeout=30).status_code))
+except Exception as e: sys.stdout.write("000"); sys.stderr.write(f"{type(e).__name__}: {e}\n")' || echo 000)"
+    echo "    api.wandb.ai -> HTTP $code"
+    if [[ "$code" == "000" ]]; then
+        echo "W&B unreachable from inside the container (proxy=$PROXY_URL). Fix the proxy, or use" >&2
+        echo "R2V_WANDB=offline and 'wandb sync $OUT/wandb' afterwards." >&2
+        exit 1
+    fi
+    [[ -n "${WANDB_API_KEY:-}" || -f "$HOME/.netrc" ]] || {
+        echo "W&B online needs credentials: export WANDB_API_KEY, or 'wandb login' once." >&2; exit 1; }
+fi
+
+echo "=== evaluating: task=$TASK tag=$TAG split=${R2V_SPLIT:-test} ==="
+echo "    n-per-bucket: ${R2V_N_PER_BUCKET:-<entire split>}"
+echo "    results     : $OUT"
+
+# run_py_text, not run_py: report2volume needs the text-encoder stack, and using one image for all
+# three tasks keeps the numbers produced under one environment.
+run_py_text mrrate_r2v.cli.evaluate "${ARGS[@]}"
 
 echo
-echo "=== metrics_per_bucket.csv (geometry + every metric, one row per bucket) ==="
-column -s, -t < "$RESULTS/metrics_per_bucket.csv" 2>/dev/null || cat "$RESULTS/metrics_per_bucket.csv"
+echo "=== acceptance gate (slurm/SUCCESS_CRITERIA.md) ==="
+# Never fatal: the metrics are already written and a checker that cannot run must not make a
+# completed evaluation look like a failed one. Read its verdict before reading any number.
+PYTHONPATH="$CP_ROOT" "$HOST_PYTHON" "$CP_ROOT/slurm/check_run.py" --results "$OUT" || true
+
 echo
-echo "=== metrics_summary.csv (per modality, then overall_macro / overall_weighted) ==="
-column -s, -t < "$RESULTS/metrics_summary.csv" 2>/dev/null || cat "$RESULTS/metrics_summary.csv"
-echo
+echo "=== headline CSVs ==="
+head -20 "$OUT/metrics_summary.csv" 2>/dev/null || true
 sacct -j "$SLURM_JOB_ID" --format=JobID,State,Elapsed,MaxRSS 2>&1 || true

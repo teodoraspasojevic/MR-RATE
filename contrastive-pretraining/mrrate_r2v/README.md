@@ -42,22 +42,34 @@ adds the report on top — instead of trying to relearn brain anatomy from 88k s
 
 ---
 
-## 2. The pipeline, in five stages
+## 2. The pipeline, in three steps
 
 ```
 stage 0   build_manifest    →  manifest.csv (+ report_index.csv)     once per storage location
-stage 1   preprocess        →  COHORT dir, cohort_id                 once per experiment set
- (train)  train_r2v         →  adapter_last.pt                       reads the manifest, not a cohort
-stage 2   predict_r2v       →  PREDICTION dir                        once per model
-stage 3   evaluate --task   →  RESULTS dir (CSV + summary + figures) per prediction set
+ train    train_r2v         →  adapter_last.pt                       --split train
+ test     evaluate --task   →  RESULTS dir (CSV + summary + figures) --split test
 ```
 
-Two on-disk **contracts** hold this together, and they are the reason the package is structured this
-way at all:
+**Train and test are the same program up to the point where one trains and the other infers.**
+Both call `build_dataset`, both construct `R2VDatasetConfig` from the same flags, both resolve a
+case's grid through `dataset.geometry.resolve`. Where training calls `loss.backward()`, evaluation
+calls the sampler and then the metrics. Nothing is written to disk in between — no cohort, no
+prediction set, no `.npy`. A case is preprocessed, generated, scored and released, one at a time.
 
-- **[`cohort.py`](cohort.py)** — a cohort directory freezes the case list, FOV, sample count,
-  normalizer and seed, hashed into a `cohort_id`. Quote that hash in a paper: two directories with
-  the same `cohort_id` hold the same cases at the same geometry with the same preprocessing.
+That is the structural reason the package looks like this. The old design had three artifacts that
+could drift, and one did: training ran at `posterior_shift_mm=15` while every cohort was built at
+`0`, displacing 15.8% of test cases, and nothing could see it because the value existed on only one
+side. Removing the intermediate artifacts removes the class of bug.
+
+What makes two runs comparable is **`run_id`** ([`eval/live.py`](eval/live.py)): a hash over the
+ordered case list, every preprocessing setting, the task, the sample cap, the seed and the model
+checkpoint. Equal `run_id` means the same cases at the same geometry under the same preprocessing —
+the guarantee `cohort_id` used to carry, computed from the run instead of stored, so it cannot go
+stale. On top of it, `cli.evaluate` compares its own preprocessing flags against what the adapter
+recorded and refuses a mismatch before any GPU work.
+
+[`cohort.py`](cohort.py) and [`predictions.py`](predictions.py) remain as the library for reading
+results produced before 2026-08-10.
 - **[`predictions.py`](predictions.py)** — a prediction set records the `cohort_id` it was produced
   against. `evaluate` hard-fails on a mismatch. **There is no `--force` and no "close enough"
   comparison, by design** — that refusal is what makes two experiments comparable.
@@ -282,6 +294,7 @@ There is **no validation metric**. Per step the trainer logs:
 | **distribution** | MedicalNet 3D FID (bootstrap CI), 2.5D Inception FID, Inception Score, precision / recall / density / coverage, intra-set MS-SSIM (mode-collapse probe) |
 | **anatomy** | L-R symmetry NCC, intracranial fraction, tissue-contrast separation, foreground compactness, background purity — compared to the real population by two-sample KS |
 | **report_alignment** | `report_image_similarity_score` — ⚠️ a **hook**, currently always `available=False` (no validated MRI image-text model exists in this project yet). It never substitutes a different model and calls the result report alignment. |
+| **report_consistency** | the blinded pathology classifier: per-label AUROC / average precision on generated volumes against the conditioning reports' labels, each next to the same classifier's score on the **real** volumes (the ceiling) and 0.5 (the image-blind floor), plus a per-case score for a case-level permutation test. The local stand-in for the challenge's Blinded Classifier Consistency — see `eval/report_classifier.py`. Needs `--report-classifier`; otherwise `available=False` with a reason. |
 
 Three properties worth stating explicitly:
 
@@ -404,49 +417,59 @@ adapter); then `1`, then `4`, on the same seed and report.
 
 ### 6.4 Score a checkpoint properly
 
-```bash
-# 1. a frozen ground-truth cohort (once per experiment set)
-python -m mrrate_r2v.cli.preprocess \
-    --manifest-csv <data_ws>/r2v_manifest/manifest_shards_native.csv \
-    --report-index-csv <data_ws>/r2v_manifest/report_index_shards_native.csv \
-    --split test --sequences T1w T2w FLAIR SWI --n-per-bucket 200 \
-    --report-format findings_impression_meta \
-    --out <ws>/cohorts/test_v1
-#   ^ must be one of the formats the adapter was trained on, or step 2 refuses the cohort. A cohort
-#     stores already-composed text, so the format cannot be changed after the fact.
+One command. It builds the dataset, generates one volume per case from that case's own report, and
+scores — there is no cohort to build first and no prediction set to hand off.
 
-# 2. one volume per case, from that case's own report and its own modality
-python -m mrrate_r2v.cli.predict_r2v \
-    --cohort <ws>/cohorts/test_v1 \
+```bash
+python -m mrrate_r2v.cli.evaluate --task report2volume \
+    --manifest     <data_ws>/r2v_manifest/manifest_shards_native.csv \
+    --report-index <data_ws>/r2v_manifest/report_index_shards_native.csv \
+    --split test \
     --checkpoint      <ws>/runs/r2v_adapter_v1/adapter_last.pt \
     --base-checkpoint <ws>/models/diff_unet_3d_rflow-mr-brain_v0.pt \
     --vae-checkpoint  <ws>/models/autoencoder_v1.pt \
-    --text-checkpoint <ws>/pretrained/RadBERT-RoBERTa-4m \
-    --out <ws>/predictions/r2v_v1 --limit 20        # drop --limit for the real run
-
-# 3. metrics
-python -m mrrate_r2v.cli.evaluate --task report2volume \
-    --gt <ws>/cohorts/test_v1 --pred <ws>/predictions/r2v_v1 \
-    --out <ws>/results/r2v_v1 \
-    --distribution-metrics --medicalnet-checkpoint <ws>/pretrained/medicalnet/*.pth \
-    --workers $SLURM_CPUS_PER_TASK --save-figures 3
+    --report-format findings_impression_meta \
+    --medicalnet-checkpoint <ws>/pretrained/medicalnet/resnet_10_23dataset_statedict.pth \
+    --report-classifier <ws>/models/report_classifier_v2.pt \
+    --out <ws>/results/report2volume_r2v_v1 \
+    --n-per-bucket 8        # drop this for the entire test split
 ```
+
+`--report-format` must be one the adapter was trained on, or the run is refused — the conditioning
+text would be composed differently from what the model saw, which is silent at generation time and
+only shows up as a worse score.
+
+**What gets evaluated:** every case in the split, in a deterministic order with **no RNG**, unless
+`--n-per-bucket N` caps it — and the cap takes the *first* N per bucket in that same order, so a
+cheap run is a prefix of the full one rather than a different sample. Sampler noise is
+`stable_seed(--seed, case_id)`, a function of the case, so a rerun reproduces every volume.
+
+| Scale | Cases | Wall clock (1×H200) |
+|---|---|---|
+| `--n-per-bucket 8` | 80 | ~10 min — wiring check; no metric means anything |
+| `--n-per-bucket 200` | 2,000 | ~4 h — the scale earlier results were produced at |
+| unset (**default**) | 34,453 | ~64 h — the entire test split |
 
 Then, **before** reading any number as a result:
 
 ```bash
-python3 slurm/check_run.py --cohort <ws>/cohorts/test_v1 \
-    --pred-vae <ws>/predictions/vae_v1 --results-recon <ws>/results/vae_v1
+python3 slurm/check_run.py --results <ws>/results/report2volume_r2v_v1
 ```
 
 It checks a finished run against [`slurm/SUCCESS_CRITERIA.md`](../slurm/SUCCESS_CRITERIA.md) and
 exits 0 only if every applicable check passes. Checks whose inputs are absent are reported as
 **SKIP, not PASS** — "not run" must never read as "fine".
 
-Useful baselines to score against the same cohort: `predict_vae` (`--task reconstruction`) is the
-upper bound any latent-space method can reach; `predict_generation` (`--task generation`) is
-NVIDIA's model with no report at all. If report-conditioned FID is not better than that, the report
-is not contributing.
+Two baselines, same command, same split, same case list:
+
+```bash
+# the upper bound any latent-space method can reach
+python -m mrrate_r2v.cli.evaluate --task reconstruction  --vae-checkpoint ... --out .../recon
+# NVIDIA's model with no report at all -- if report-conditioned FID is not better, the report
+# is not contributing
+python -m mrrate_r2v.cli.evaluate --task generation --base-checkpoint ... --vae-checkpoint ... \
+    --out .../generation
+```
 
 ---
 

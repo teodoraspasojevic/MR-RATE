@@ -32,37 +32,65 @@ All code lives in one package: `contrastive-pretraining/mrrate_r2v/`. Run everyt
          │                                              "what series exist and where"
          ▼
   ┌──────────────────────────────────────────────────────────────────────────────┐
-  │  stage 1   cli.preprocess                                                    │
-  │            picks the cases, preprocesses the volumes                         │
-  │                                                                              │
-  │            ────►  COHORT DIRECTORY  ◄──── the contract                       │
-  │                   cohort.json  volumes/*.npy  reports/*.txt  index.csv       │
+  │  ONE Dataset.  MRReportToVolumeDataset + R2VDatasetConfig, built by one       │
+  │  function from one set of flags. Training and testing both use it.           │
   └──────────────────────────────────────────────────────────────────────────────┘
          │                                                    │
-         │  stage 2                                           │  stage 3
+         │  --split train                                     │  --split test
          ▼                                                    ▼
-  cli.predict_vae          ────►  PREDICTION DIRECTORY  ────►  cli.evaluate
-  cli.predict_generation          predictions.json                --task <task>
-  cli.predict_r2v                 volumes/*.npy                   --gt <cohort>
-  cli.import_predictions                                           --pred <predictions>
+  cli.train_r2v                                        cli.evaluate --task ...
+    loader → encode → UNet → backward                    loader → encode → UNet
+    → adapter_last.pt                                    → sample → score → release
                                                                      │
                                                                      ▼
                                                               RESULTS DIRECTORY
                                                               metrics_per_bucket.csv
-                                                              metrics_summary.csv + 5 more
+                                                              metrics_summary.csv + 6 more
 ```
 
-Three properties follow from this shape, and they are the reason it exists:
+**Train and test are the same program up to the point where one trains and the other infers.**
+That is the whole design. Nothing is frozen to disk between preprocessing and metrics: no cohort
+directory, no prediction set, no `.npy` on disk. A case is preprocessed, generated, scored and
+released, one at a time.
+
+Three properties follow, and they are the reason it has this shape:
 
 | Property | How it is guaranteed |
 |---|---|
-| **Evaluation is always the same** | One `run_evaluation()` function. Every task, every model. |
-| **GT and predictions are always matched the same way** | By `case_id`, assigned once in stage 1. The evaluator never infers a pairing. |
-| **Same FOV, same sample count** | Both live in `cohort.json`. Stages 2 and 3 read them; neither can choose its own. |
+| **Test preprocesses exactly like train** | There is one `R2VDatasetConfig` and one `build_dataset`. Not a convention — there is no second code path that *could* differ. |
+| **Evaluation is always the same** | One `LiveEvaluator.run`. Every task, every model. `eval/tasks.py` decides the metric set from `--task` and nothing else does. |
+| **The same cases, every time** | Case selection uses **no RNG**: ordered by `(study_uid, series_id)` within each (modality, plane) bucket, round-robined across buckets. Prefix-stable, so `--n-per-bucket` is a prefix of the full run. |
+| **The same volumes, every time** | Sampler noise is `stable_seed(--seed, case_id)` — a function of the case, not of iteration order. A rerun, a resume, a `--n-per-bucket`, or a different world size all reproduce the same volume for the same case. |
 
-And one hard gate: a prediction directory records the `cohort_id` it was produced against.
-`cli.evaluate` **refuses to run** if it does not match the `--gt` cohort. You cannot accidentally
-compare two models that saw different data.
+And the gate that replaces the old `cohort_id` handshake: `run_id` hashes the ordered case list
+with every preprocessing setting, the task, the sample cap, the seed and the model checkpoint.
+Equal `run_id` means the same cases at the same geometry under the same preprocessing. On top of
+that, `cli.evaluate --task report2volume` compares its own `--posterior-shift-mm` / `--normalizer` /
+`--geometry-mode` against what the adapter recorded at training time and **refuses to run** on a
+mismatch, before any GPU work.
+
+> **Why this replaced the cohort pipeline (2026-08-10).** The old design froze a cohort directory,
+> wrote a prediction set, and scored the two against each other with a `cohort_id` handshake. It
+> had three artifacts that could drift, and one did: `cli.train_r2v` had no `--posterior-shift-mm`
+> flag, so every run took the dataclass default of 15 mm while `cli.preprocess` hardcoded 0.
+> Measured: **15.8% of test cases** displaced, correlation 0.63–0.85 on those, concentrated in the
+> coronal and sagittal buckets. Nothing could surface it, because the value existed on only one
+> side. Removing the intermediate artifacts removes the class of bug, and costs ~365 GB of disk per
+> experiment set as a bonus.
+
+### How much to evaluate
+
+| Scale | Cases | Wall clock (1×H200) | Use |
+|---|---|---|---|
+| `--n-per-bucket 8` | 80 | ~10 min | wiring check; no metric means anything and the run says so |
+| `--n-per-bucket 200` | 2,000 | ~4 h | the scale every earlier result was produced at |
+| unset (**default**) | 34,453 | ~64 h | the entire test split |
+
+Measured 6.7 s/case at 30 inference steps, plus ~1 s/case of scoring. **CTFlow** (Wang et al.,
+ICCV 2025 VLM3D, the CT-RATE report-to-volume model) evaluates on the *whole* CT-RATE validation
+set — 3,000 volumes, partitioned across 64 workers, no subsampling — which is the precedent for
+making the full split the default here. Note that CTFlow does not seed its sampler at all
+(`torch.randn` with no generator), so its individual volumes are not reproducible; ours are.
 
 ---
 
@@ -130,9 +158,9 @@ Set each job's `--time` from the smoke test's measured per-case rate rather than
 
 | `--task` | The model was given | Ground truth? | Metrics computed |
 |---|---|---|---|
-| `reconstruction` | a real volume, to encode and decode | yes, that exact volume | fidelity, perceptual, distribution |
-| `report2volume` | a report | yes, the series that report describes | fidelity, perceptual, distribution, report alignment |
-| `generation` | a modality label only | **no** | distribution only |
+| `reconstruction` | a real volume, to encode and decode | yes, that exact volume | fidelity, perceptual, distribution, anatomy |
+| `report2volume` | a report | yes, the series that report describes | fidelity, perceptual, distribution, anatomy, report alignment, **report consistency** |
+| `generation` | a modality label only | **no** | distribution, anatomy |
 
 **Why `generation` gets no voxelwise metrics.** An unconditional generator is told "make a T1w
 brain" and nothing about any patient. Computing MAE or SSIM against an arbitrary real scan would
@@ -272,8 +300,26 @@ never compare a per-bucket run's numbers with a fixed-mode run's.
 ```
 
 `--posterior-shift-mm` compensates for defacing, which removes anterior tissue and so pulls the
-intensity centroid backwards. It belongs to the contrastive pipeline; for R2V the default is **0**,
-measured: shifting by 15 mm lost on 8 of the 10 buckets.
+intensity centroid backwards.
+
+**An evaluation cohort must use whatever value the run it scores was TRAINED with — for the final
+four that is 15, not 0.** `cli.train_r2v` had no `--posterior-shift-mm` flag until 2026-08-10, so
+every run including the final four silently took `R2VDatasetConfig`'s default of **15.0**, while
+`02_preprocess.sbatch` hardcoded **0**. Nothing surfaced the divergence: the flag simply did not
+exist on one side.
+
+Measured effect (two 120-case cohorts differing only in this value): `crop_or_pad` clamps the shift
+away unless a volume's resampled A-P extent exceeds its bucket target, so **15.8% of test cases
+differ**, with correlation **0.63–0.85** on the affected ones. It is not uniform — T2w SAGITTAL and
+FLAIR CORONAL 5/12 each, T2w CORONAL 3/12, three buckets 0/12 — so scoring at 0 would have
+penalised the coronal and sagittal buckets specifically, for a displacement the model did not cause.
+
+`test_v2` (shift 0) is therefore superseded by **`test_v3` (shift 15)**. The earlier note that 0
+"won 8 of 10 buckets" was measured on cohort construction alone and never applied to training; it is
+not a reason to score a model on a grid it never saw. Both CLIs now expose the knob, the training
+flag's default is read off the dataclass so the two cannot drift, and the value is hashed into
+`cohort_id` so the two can never be mixed. Pinned by
+`test_r2v_inference_contracts.py::test_training_and_cohort_preprocessing_defaults_are_reachable_and_agree`.
 
 Heads up: the default percentile normalizer does **not** clip. Values above the 99.5th percentile
 exceed 1.0. PSNR's `data_range=1.0` is therefore a fixed reference scale, not a true ceiling —
@@ -343,6 +389,7 @@ why for every case. Nothing is ever silently dropped.
 | Intra-set SSIM (real vs produced) | mode collapse, the standard generation-literature probe | compare the two, not the absolute value | produced clearly **above** real = less variety than the data | mid-axial slices only, capped at 200 pairs per bucket |
 | Anatomy (L-R symmetry, intracranial fraction, tissue contrast, background purity) | does the output look like a brain at all | closer to the real column | a large KS statistic means the populations differ on that measure | heuristic masks, not a segmentation |
 | Report-image similarity | does the volume match the report | higher | **unavailable** | no validated MRI image-text model exists in this project; recorded as unavailable with a reason, never faked |
+| **Blinded classifier consistency** | does a classifier trained only on *real* volumes read, off a generated one, the findings its conditioning report described | higher | above 0.5; judge against the real-volume reference in the same table | needs `--report-classifier`. Per-label AUROC is only meaningful where the classifier is `usable` — i.e. where it can do that label on real data |
 
 ### Speed
 
@@ -598,6 +645,151 @@ budget. It is the single highest-value addition to the validation path.
 
 ---
 
+## 7b. Evaluating a trained adapter (the four-arm test run)
+
+Training produces `adapter_*.pt`; this is how those become numbers. Everything here postdates
+2026-08-09 — see "What a pre-2026-08-09 evaluation is worth" at the end of this section.
+
+### The three artifacts you need first
+
+```bash
+cd contrastive-pretraining
+
+# 1. the evaluated cohort -- test split, at the report format AND posterior shift training used
+sbatch slurm/02_preprocess.sbatch test_v3 200
+
+# 2 + 3. the blinded classifier's own data -- train and val splits, never test
+R2V_SPLIT=train sbatch slurm/02_preprocess.sbatch clf_train_v2 500
+R2V_SPLIT=val   sbatch slurm/02_preprocess.sbatch clf_val_v2   100
+sbatch slurm/14_train_report_classifier.sbatch clf_train_v2 clf_val_v2 report_classifier_v2
+```
+
+`02_preprocess.sbatch` now passes `--report-format findings_impression_meta` and writes
+`report_sections.json`. Both matter and neither is a default:
+
+- **`--report-format`**: A, B and C were trained on the order-agnostic `*_meta` spec, whose
+  conditioning text carries a `[MODALITY]/[PLANE]/[SPACING]` prefix. A cohort built without it holds
+  text with no prefix — out of distribution for three of the four arms.
+  `assert_report_format_matches` refuses that pairing rather than scoring it, so the symptom is a
+  hard exit. A cohort freezes **one** format, so build a second with `impression_findings_meta` if
+  you want to measure the order-robustness the two-format training was for.
+- **`report_sections.json`**: configuration D encodes findings and impression as two separate
+  cross-attention tokens and cannot recover them from the joined string. `cli.predict_r2v` refuses
+  up front on a cohort that has no sections rather than conditioning D on one token instead of two.
+
+Neither exists in the old `test_v1` (built 2026-07-30), which is why the cohort is rebuilt rather
+than reused.
+
+### Then the four runs
+
+```bash
+slurm/final_eval/run_A_cxr_bert_cls.sh
+slurm/final_eval/run_B_cxr_bert_tokens.sh
+slurm/final_eval/run_C_radbert_tokens.sh
+slurm/final_eval/run_D_report2ct_style.sh
+```
+
+Each submits **two** jobs — `13_predict_r2v.sbatch` then `05_evaluate.sbatch`, chained with
+`--dependency=afterok` so a failed prediction set can never be scored. The four `run_*.sh` scripts
+set `R2V_CONFIG` and nothing else; every other parameter lives in
+`slurm/final_eval/_final_eval_common.sh`, exactly as `slurm/final/_final_common.sh` does for
+training. "The only difference between the four evaluations is the conditioning mechanism" is
+enforced by construction rather than by four command lines staying in sync.
+
+`SMOKE=1 slurm/final_eval/run_A_cxr_bert_cls.sh` runs eight cases end to end (~30 min) and proves
+the conditioning rebuilds, the report format is accepted, and the intensity space is right. Do that
+once per arm before committing four long jobs.
+
+**Checkpoint selection**: `adapter_last.pt` where it exists, `adapter_step0004200.pt` for C — whose
+training job was killed by a host-RAM OOM in its final validation. So C is compared at 4,200
+optimizer steps against 4,493 for the others; quote that caveat wherever the four-way table appears,
+or set `CHECKPOINT_KIND=step4200` for the step-matched comparison.
+
+### 13 vs 07 — only one of them produces numbers
+
+| | writes | scoreable |
+|---|---|---|
+| `13_predict_r2v.sbatch` (`cli.predict_r2v`) | `predictions.json` + per-bucket `.npz`, in the cohort's percentile-normalised space | **yes** |
+| `07_generate_r2v.sbatch` (`cli.generate_r2v`) | `.nii.gz` + a generation manifest, in NVIDIA's int16 `[0, 1000]` range | no — use it to *look* at a sample |
+
+### W&B: one table, a few panels
+
+`slurm/final_eval/` logs to W&B by default (`R2V_WANDB=online`, project `mr-rate-r2v-eval`, one
+group for the four arms, run named after the arm). A hand-run `05_evaluate.sbatch` stays offline
+unless you set `R2V_WANDB`.
+
+| What | Where | Note |
+|---|---|---|
+| **`metrics/all`** | a `wandb.Table` panel | **every metric that ran**: per bucket, then per modality, then `overall`, then distribution / diversity / mode-collapse / anatomy / report-consistency, then provenance rows — including **`train_samples_seen`**, the volumes the optimizer actually consumed |
+| headline scalars | run summary + run table | `psnr_fg`, `ssim3d_whole`, `mae_fg`, `ncc_fg`, both FIDs, the report-consistency macro AUROC and its real-volume ceiling, `train_samples_seen`. These become sortable columns, so the four-arm comparison *is* the W&B run table |
+| example panels | `examples/<bucket>/<case_id>` | interactive ground-truth vs generated with a slice slider and the report text, rendered by the **same** `figures.validation_panel_html` the training loop uses |
+
+The same table is printed to stdout at the end of the job, so the Slurm log carries the full result
+rather than three scalars.
+
+**Panels are a sample, never the cohort.** `--wandb-panels` defaults to 6; 2,000 interactive panels
+is ~1 GB of base64 and an unusable workspace (measured: ~1.2 MB each). Cases are the worst, best and
+median by `--wandb-rank-metric` (default `psnr_fg`), spread across buckets, and each panel records
+*why* it was picked — an unlabelled panel invites reading a best case as typical.
+
+**Panels embed patient report text**, so they are gated behind `--wandb-log-reports`
+(`R2V_WANDB_REPORTS=1`, the default in `final_eval/`) exactly as in `cli.train_r2v`. Keep that
+project private, or set `R2V_WANDB_REPORTS=0` — the metrics table is logged either way and only the
+panels are withheld.
+
+**Why the training-sample count needs `cli.predict_r2v` to record it.** The evaluator reads only
+`.npy` and `.json` by design and must never open a checkpoint, so `predict_r2v` writes
+`model.training` into `predictions.json` (`models/adapter.py:training_provenance`). `samples_seen`
+is `optimizer_step x effective_batch_size` — 1,150,208 for these runs — and is *not* the dataset
+size; `samples_per_epoch` (~575k, matching the logged train split) is reported separately rather
+than conflated. `effective_batch_size` needs `world_size`, which lives in `train_summary.json`, not
+in the checkpoint: configuration C's job died before writing one, so `final_eval/` passes
+`--train-world-size 8` (the launch geometry recorded in `slurm/final/_final_common.sh`) and the
+prediction set records `world_size_source` so a supplied value is never mistaken for a read one.
+
+### The acceptance gate
+
+```bash
+python3 slurm/check_run.py --cohort <cohort> \
+    --pred-r2v <predictions> --results-r2v <results>
+```
+
+Four report-to-volume criteria: `ER1` every case scored and none excluded, `ER2` the predictions are
+in the cohort's intensity space (checked from the numbers, not trusted), `ER3` blinded-classifier
+consistency above chance on the usable labels, `ER4` the classifier was not fitted on the test
+split. Run it before reading any number as a result.
+
+### What a pre-2026-08-10 evaluation is worth
+
+Nothing — and there was no such evaluation, because two of these five defects made
+`cli.predict_r2v` refuse to start for three of the four arms. The other three were silent:
+
+1. **`cli.predict_r2v` wrote volumes in NVIDIA's int16 `[0, 1000]` range** against a `[0, 1]`
+   ground truth. Every paired metric consumes a 1000x-offset pair and returns a plausible number.
+   `predict_generation` had always divided by 1000 and `validation.py` had a guard; the evaluated
+   path had neither. It now generates with `postprocess=False` and asserts the space on case 1.
+2. **Configurations B and C could not be rebuilt at inference.** `rebuild_embedder` had no branch
+   for `kind="tokens"`, so those adapters fell through to a path that defaults to RadBERT — and
+   since CXR-BERT and RadBERT are both 768-wide, every downstream shape check passed. Given
+   `--text-checkpoint` (which `07_generate_r2v.sbatch` hardcoded) a CXR-BERT arm silently loaded
+   RadBERT. `load_adapter_checkpoint` is now also given the live embedder's identity, so
+   `assert_conditioning_compatible` actually runs.
+3. **Configuration D could not run at all**, since nothing passed it per-section text.
+4. **`assert_report_format_matches` compared nothing.** It read `cohort.spec.geometry_fingerprint`,
+   an attribute a parsed `cohort.json` — a plain dict — never has, so the cohort's format read as
+   `None` unconditionally. That is not a benign no-op: it passes silently when the adapter records
+   no format, and refuses *every* cohort when it records one. All four final adapters record one.
+   Its unit test survived because the test's stub cohort exposed the same wrong attribute.
+5. **The format check was applied to configuration D**, which never reads the joined string at all
+   and records `report_format=None` by construction — so it matched no cohort and D was refused
+   regardless. The check now takes the embedder and exempts a sectioned configuration; what D
+   actually needs (the cohort *has* sections) is checked separately, before any sampling.
+
+Pinned by `tests/test_r2v_inference_contracts.py`, which exists because three of these produced
+complete, valid-looking output and the other two were only reachable by running the thing.
+
+---
+
 ## 8. Testing
 
 ```bash
@@ -606,6 +798,14 @@ python -m pytest                          # everything, with coverage
 python -m pytest --no-cov -q              # faster
 python -m pytest tests/test_cohort_contract.py tests/test_eval_tasks_and_runner.py -v
 ```
+
+**The R2V tests are not in version control, and CI does not run them.** `.gitignore` ignores
+`/contrastive-pretraining/tests`, so only the 8 original *contrastive* test files are tracked; all
+33 R2V test files — including the two invariant files below — exist on the working machine only.
+This is deliberate and left as is, but it has two consequences worth knowing: the suite will not
+survive a fresh clone, and a change that breaks a load-bearing invariant will pass CI. Run
+`python -m pytest` locally before trusting any R2V change; three of the five defects fixed on
+2026-08-10 were test-visibility failures.
 
 No GPU, no real data, no checkpoints — a few seconds. Two files are worth knowing about:
 

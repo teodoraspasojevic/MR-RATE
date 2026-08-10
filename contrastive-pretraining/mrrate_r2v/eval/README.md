@@ -11,26 +11,50 @@ add a task.
 ## The shape of it
 
 ```
-cohort (frozen GT)  +  prediction set  +  --task   ──►  run_evaluation()  ──►  results/
+manifest ──► Dataset (the one training uses) ──► generate ──► score ──► results/
+                                     one case at a time, nothing stored
 ```
 
-`run_evaluation` in [`runner.py`](runner.py) is the only path. Both the CLI and the tests call it;
-there is no second implementation to drift.
+`LiveEvaluator.run` in [`live.py`](live.py) is the path. `cli/evaluate.py` and the tests both call
+it; there is no second implementation to drift.
 
-**It reads `.npy` files and nothing else.** No manifest, no archive, no Dataset, no model. That is
-deliberate: the evaluator cannot preprocess differently from the cohort, because it does not
-preprocess at all.
+**There is no cohort and no prediction set.** Evaluation builds the same
+`MRReportToVolumeDataset` that `cli.train_r2v` builds, from the same manifest and the same
+`R2VDatasetConfig`, and streams generate-then-score one case at a time. Volumes are never written.
+That is the point: the evaluator *cannot* preprocess differently from training, because there is
+only one description of the preprocessing and both read it from the same flags.
+
+> The old pipeline froze a cohort directory (`cli.preprocess`), wrote a prediction set
+> (`cli.predict_*`), and scored the two against each other with a `cohort_id` handshake. It worked,
+> but it had three artifacts that could drift, and one of them did: training ran at
+> `posterior_shift_mm=15` while every cohort was built at `0`, displacing 15.8% of test cases with
+> nothing able to see it. `run_evaluation` in [`runner.py`](runner.py) remains for reading results
+> produced before the change.
 
 ### What it does, in order
 
-1. **Refuses to run unless the prediction set's `cohort_id` matches the `--gt` cohort's.** Same
-   cases, same FOV, same count — or no numbers at all.
-2. **Refuses to run on an incomplete cohort or prediction set.** A missing volume file must never be
-   silently treated as a smaller sample.
-3. **For paired tasks: matches by `case_id`, then checks geometry** before any voxelwise metric. A
-   case that fails is excluded with a reason, never resized to fit.
-4. **Computes exactly the metric groups [`tasks.py`](tasks.py) declares** for the task.
-5. **Writes one canonical layout** — the same five files for every task.
+1. **Selects cases deterministically, with no RNG.** Ordered by `(study_uid, series_id)` within
+   each (modality, plane) bucket, round-robined across buckets. Prefix-stable, so `--n-per-bucket`
+   returns the first N of the full run rather than a different sample.
+2. **Generates**, seeded per case with `stable_seed(--seed, case_id)` — a function of the case, not
+   of iteration order, so a rerun, a resume or a different world size reproduces every volume.
+3. **Checks the intensity space on the first volume** and refuses the whole run if it is
+   `postprocess_mr`'s int16 `[0, 1000]` instead of the percentile `~[0, 1]` the ground truth is in.
+   Every metric consumes a 1000x-offset pair happily, so this cannot be caught by reading output.
+4. **Checks geometry per case** before any voxelwise metric. A mismatch is excluded with a reason,
+   never resized to fit.
+5. **Computes exactly the metric groups [`tasks.py`](tasks.py) declares** for the task.
+6. **Releases the volumes** and keeps only the metric row and the feature vectors.
+7. **Writes one canonical layout** — the same files for every task.
+
+### What replaces `cohort_id`
+
+`run_id` — `run_fingerprint()` hashes the ordered case list together with every preprocessing
+setting, the task, the sample cap, the seed and the model checkpoint. Equal `run_id` means the same
+cases at the same geometry under the same preprocessing, which is exactly the guarantee `cohort_id`
+carried. It is *computed* rather than stored, so unlike `cohort_id` it cannot go stale relative to
+anything. It appears in `summary.json` and `run_manifest.json` (and, for backward readability, also
+under the old `cohort_id` key).
 
 ---
 
@@ -106,7 +130,7 @@ The implementation this replaced resized two volumes whenever their shapes merel
 check for *why*. A score computed that way looks precise and proves nothing.
 
 Where padding is legitimately needed — the NVIDIA VAE requires axes divisible by a model-derived
-divisor — `predict_vae.py` pads at the end of each axis before encoding and crops back the *exact*
+divisor — `cli/evaluate.py:reconstruct` pads at the end of each axis before encoding and crops back the *exact*
 recorded amount after decoding, so the reconstruction returns on the cohort's own grid.
 
 ---
@@ -301,6 +325,54 @@ records `report_image_similarity_available=False` with a concrete reason. It is 
 substituted with a different model — a number attributed to report alignment would then be measuring
 something else. To wire one in, pass an object with `.score(report_text, volume) -> float` as
 `EvaluationInputs.report_image_model`.
+
+### Report consistency (the blinded classifier)
+
+`report_classifier.py` + `report_labels.py`. **This is the group that answers "does the volume say
+what the report said"**, and it is the local stand-in for the VLM3D challenge's Blinded Classifier
+Consistency metric.
+
+A frozen MedicalNet ResNet-10 — the same 512-d backbone this package's 3D FID already uses, so the
+features cost nothing extra — feeds a ~140k-parameter head fitted on **real train-split volumes
+only** (`cli.train_report_classifier`). At evaluation the head runs blind on the generated volumes
+and its verdict is compared against the 14 merged clinical labels of the report each volume was
+conditioned on.
+
+Four things decide whether the number means anything, and all four are enforced in code:
+
+| | why |
+|---|---|
+| the classifier sees the **image and nothing else** — no bucket, no modality | a head given the bucket scores well from `SWI AXIAL → hemorrhage is common` without looking at a voxel, and would rate a degenerate generator just as highly |
+| every score is reported next to `real_reference` — the same classifier on the **real** volumes | 0.58 against a real ceiling of 0.61 and 0.58 against 0.95 are opposite conclusions |
+| a label is `usable` iff the classifier can do it **on real data** (`MIN_REAL_AUROC`) | deciding usability from the generated score would let a model promote whichever labels flattered it |
+| unlabelled cases are excluded, never imputed negative | "not classified" ≠ "the report says no"; imputing deflates every prevalence |
+
+Outputs: `report_consistency.json` (per label + per case + provenance),
+`report_consistency_per_label.csv` (**the table to quote**), and
+`report_consistency_per_case.csv` (the input to a case-level permutation test). All three are
+written for every task — a task that does not declare the group says so inside the file rather than
+omitting it, because the result layout is identical across tasks by invariant.
+
+Without `--report-classifier` the group records `available=False` with a reason and every other
+metric still runs.
+
+### W&B reporting
+
+`wandb_evaluation.py` is the R2V-specific assembly on top of `wandb_logging.WandbRun`, which stays
+dataset-agnostic (it was ported unchanged). Two deliverables:
+
+- **`metrics/all`** — one `wandb.Table` holding every metric family that ran, per bucket then
+  aggregate, ending in provenance rows including `train_samples_seen`. The same table is printed by
+  `cli.evaluate` so the Slurm log carries the full result. `metrics_table()` builds it; every cell
+  is a finite float or None, because a numpy scalar or a NaN breaks `wandb.Table`.
+- **A few example panels** rendered by `figures.validation_panel_html` — the *same* renderer the
+  training loop uses, so an evaluation panel and a training panel are directly comparable. A
+  `_PanelCase` shim presents a cohort case in the shape that renderer already accepts rather than
+  refactoring it.
+
+`select_panel_cases()` picks the worst, best and median by a per-case metric, round-robin over
+buckets so a small `n_panels` still spans several anatomies, and labels each pick with its reason.
+Panels are withheld unless `log_reports=True` — they embed report text.
 
 ---
 

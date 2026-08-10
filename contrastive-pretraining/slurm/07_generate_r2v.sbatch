@@ -24,8 +24,13 @@
 #   R2V_REPORT_GUIDANCE=1        the plain report-conditioned prediction
 #   R2V_MODALITY_GUIDANCE=0      report guidance only, modality left conditioned
 #   R2V_LATENT_ONLY=1            skip the VAE decode (cheap check of the diffusion loop)
-#   R2V_COHORT=<cohort dir>      one volume per cohort case from its paired MR-RATE report,
-#                                writing a prediction set that cli.evaluate can score
+#   R2V_COHORT=<cohort dir>      one .nii.gz per cohort case from its paired MR-RATE report
+#
+# **This script does NOT produce anything cli.evaluate can score.** It writes .nii.gz files plus a
+# generation_manifest.json -- volumes you can open in a viewer, in NVIDIA's int16 [0, 1000] output
+# range. A prediction set (predictions.json + per-bucket .npz, in the cohort's percentile-
+# normalised space) comes from `slurm/13_predict_r2v.sbatch`, which runs cli.predict_r2v. Use this
+# one to look at a sample; use 13 to get numbers.
 
 unset SLURM_EXPORT_ENV
 set -euo pipefail
@@ -36,16 +41,22 @@ setup
 
 ADAPTER="${1:-${R2V_ADAPTER:-}}"
 [[ -n "$ADAPTER" ]] || { echo "usage: sbatch $0 <adapter_checkpoint.pt>" >&2; exit 1; }
-preflight "$ADAPTER" "$UNET_CHECKPOINT" "$VAE_CHECKPOINT" "$RADBERT_CHECKPOINT" "$SIF_IMAGE_TEXT"
+preflight "$ADAPTER" "$UNET_CHECKPOINT" "$VAE_CHECKPOINT" "$PRETRAINED_DIR" "$SIF_IMAGE_TEXT"
 
 OUT_DIR="$WORKSPACE/samples/${R2V_TAG:-r2v_${SLURM_JOB_ID:-local}}"
 mkdir -p "$OUT_DIR"
 REPORT="${R2V_REPORT:-Findings: A 12 mm peripherally enhancing lesion is seen in the right frontal lobe with surrounding vasogenic oedema. No midline shift. Impression: Solitary enhancing mass, most consistent with metastasis.}"
 
+# No --text-checkpoint. Every adapter records an absolute path for each of its encoders, and
+# _common.sh exports MRRATE_PRETRAINED_DIR for the rest, so the flag is only for a snapshot that
+# has moved. It used to be hardcoded to $RADBERT_CHECKPOINT here, which is applied to whichever
+# encoder the configuration names -- so a CXR-BERT arm loaded RadBERT weights under the CXR-BERT
+# slot, at matching width, and generated confident nonsense. Set R2V_TEXT_CHECKPOINT deliberately
+# if you really have moved a snapshot.
 COMMON=(--base-checkpoint "$UNET_CHECKPOINT"
         --vae-checkpoint "$VAE_CHECKPOINT"
         --adapter "$ADAPTER"
-        --text-checkpoint "$RADBERT_CHECKPOINT"
+        ${R2V_TEXT_CHECKPOINT:+--text-checkpoint "$R2V_TEXT_CHECKPOINT"}
         --modality "${R2V_MODALITY:-T1w}"
         --plane "${R2V_PLANE:-AXIAL}"
         --num-inference-steps "${R2V_STEPS:-30}"

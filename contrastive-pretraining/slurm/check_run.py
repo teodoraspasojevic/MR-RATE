@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Check a finished run against `SUCCESS_CRITERIA.md`. Exit 0 only if every applicable check passes.
 
-    python3 slurm/check_run.py --cohort <dir> [--pred-vae <dir>] [--pred-gen <dir>]
+    python3 slurm/check_run.py --results <results_dir> [--results ...]
                                [--results-recon <dir>] [--results-gen <dir>]
 
 Every check is named with its criterion id so a failure points straight at the table entry. Checks
@@ -207,15 +207,29 @@ def _buckets_figured(figures, buckets) -> set:
 def check_results(c: Checks, root: Path, task: str, recon_root: Path | None = None,
                   buckets=()):
     summary = json.loads((root / "summary.json").read_text())
-    prefix = "E" if task == "reconstruction" else "EG"
+    prefix = {"reconstruction": "E", "generation": "EG", "report2volume": "ER"}[task]
     n_scored = summary["n_scored"]
 
-    if task == "reconstruction":
-        c.add("E1", "2000 scored, 0 excluded",
-              n_scored == 2000 and summary["n_excluded"] == 0,
-              f"scored={n_scored} excluded={summary['n_excluded']}")
+    n_cases = summary.get("n_cohort_cases", 0)
+    scale = ("entire split" if summary.get("evaluated_full_split")
+             else f"{summary.get('n_per_bucket')}/bucket")
+
+    if task in ("reconstruction", "report2volume"):
+        # Every selected case must be scored with nothing excluded: the model is asked for the
+        # case's own grid, so a geometry exclusion means it emitted a grid that was not requested.
+        # The expected count is `n_cases` rather than a hardcoded 2000 -- the scale is now a run
+        # parameter (8/bucket smoke, 200/bucket, or the whole split), and pinning a literal here
+        # would fail every run that is not the old cohort size.
+        prefix_1 = "E1" if task == "reconstruction" else "ER1"
+        c.add(prefix_1, f"all {n_cases} selected cases scored, 0 excluded ({scale})",
+              n_cases > 0 and n_scored == n_cases and summary["n_excluded"] == 0,
+              f"scored={n_scored}/{n_cases} excluded={summary['n_excluded']}")
     else:
         c.add("E2a", "generation scored 0 paired cases", n_scored == 0, f"scored={n_scored}")
+
+    # The run must be able to say which cases produced it, without carrying an identifier.
+    c.add(f"{prefix}0", f"{task}: run_id recorded",
+          bool(summary.get("run_id")), str(summary.get("run_id")))
 
     per_bucket = read_csv(root / "metrics_per_bucket.csv")
     agg = read_csv(root / "metrics_summary.csv")
@@ -236,9 +250,17 @@ def check_results(c: Checks, root: Path, task: str, recon_root: Path | None = No
 
     metric = "psnr_fg" if task == "reconstruction" else "inception_2p5d_fid"
     macro, weighted = col(agg, "overall_macro", metric), col(agg, "overall_weighted", metric)
-    c.add(f"{prefix}4", f"{task}: macro != weighted on {metric}",
-          macro is not None and weighted is not None and abs(macro - weighted) > 1e-9,
-          f"macro={macro} weighted={weighted}")
+    if summary.get("evaluated_full_split"):
+        # On a full-split run the population counts ARE the scored counts, so the two aggregates
+        # coincide -- correctly, because there is no sampling artefact left to correct for. Only a
+        # capped run can show that the weighting is actually applied.
+        c.add(f"{prefix}4", f"{task}: macro == weighted on a full-split run (no sampling to correct)",
+              macro is not None and weighted is not None and abs(macro - weighted) < 1e-6,
+              f"macro={macro} weighted={weighted}")
+    else:
+        c.add(f"{prefix}4", f"{task}: macro != weighted on {metric}",
+              macro is not None and weighted is not None and abs(macro - weighted) > 1e-9,
+              f"macro={macro} weighted={weighted}")
 
     def bucket_vals(key):
         return {r["bucket"]: float(r[key]) for r in per_bucket if r.get(key, "") != ""}
@@ -296,6 +318,45 @@ def check_results(c: Checks, root: Path, task: str, recon_root: Path | None = No
         c.skip("E8", "FID backbone validity (cross-modality)",
                "run separately; measured: Inception 2.5D 1.75x, MedicalNet 1.00x (invalid)")
 
+    if task == "report2volume":
+        # ER2: the intensity-space guard, checked from the outside. A prediction set written in
+        # NVIDIA's int16 [0, 1000] range against a percentile-normalised [0, 1] cohort produces
+        # metrics that all look plausible, so this is checked on the numbers rather than trusted.
+        # MAE against a [0,1] ground truth cannot exceed ~2 for anything in the same space; a
+        # 1000x offset puts it in the hundreds.
+        mae = bucket_vals("mae_fg")
+        wrong_space = {b: round(v, 1) for b, v in mae.items() if v > 5.0}
+        c.add("ER2", "predictions are in the cohort's intensity space (mae_fg < 5)",
+              bool(mae) and not wrong_space,
+              f"{len(mae)}/{EXPECTED_BUCKETS} buckets; suspicious={wrong_space or 'none'}"
+              + ("" if mae else "; no mae_fg column at all"))
+
+        # ER3: the report-consistency group. Reported whether or not it ran -- an unavailable
+        # metric with a reason is a SKIP here, never a silent pass.
+        consistency_path = root / "report_consistency.json"
+        consistency = json.loads(consistency_path.read_text()) if consistency_path.is_file() else {}
+        if not consistency:
+            c.add("ER3", "report_consistency.json written", False, "file missing")
+        elif not consistency.get("available"):
+            c.skip("ER3", "blinded classifier consistency",
+                   consistency.get("reason", "unavailable, no reason recorded"))
+        else:
+            generated = consistency.get("macro_auroc_usable_labels")
+            reference = (consistency.get("real_reference") or {}).get("macro_auroc_usable_labels")
+            n_usable = consistency.get("n_labels_usable", 0)
+            # The floor is 0.5 (an image-blind guesser). Beating it is what "the generated volume
+            # carries the report's findings" means; how far it is from `reference` is how good.
+            c.add("ER3", "blinded classifier consistency above chance on usable labels",
+                  n_usable > 0 and generated is not None and generated > 0.5,
+                  f"macro AUROC {generated} over {n_usable} usable labels; "
+                  f"real-volume reference {reference}; floor 0.5")
+            c.add("ER4", "the classifier was fitted on a non-test split",
+                  (consistency.get("classifier", {}).get("provenance", {}).get("train_split")
+                   not in ("test", "", None)),
+                  f"train_split="
+                  f"{consistency.get('classifier', {}).get('provenance', {}).get('train_split')!r} "
+                  f"(fitting on test makes the metric circular)")
+
     figures = summary.get("figures", [])
     figured = _buckets_figured(figures, buckets)
     c.add(f"{prefix}9", f"{task}: figures for all 10 buckets",
@@ -305,31 +366,39 @@ def check_results(c: Checks, root: Path, task: str, recon_root: Path | None = No
 
 
 def main(argv=None) -> int:
+    """Check one or more results directories against SUCCESS_CRITERIA.md.
+
+    **The cohort and prediction stages are gone**, so there is nothing to check before the results:
+    `cli.evaluate` builds the dataset, generates and scores in one pass, and the properties the old
+    stage-1/stage-2 checks enforced on disk (right buckets, right FOV, one prediction per case, a
+    matching cohort_id) are now either impossible to violate or checked inside the run itself and
+    recorded in `run_manifest.json`.
+    """
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--cohort", type=Path, required=True)
-    p.add_argument("--pred-vae", type=Path, default=None)
-    p.add_argument("--pred-gen", type=Path, default=None)
-    p.add_argument("--results-recon", type=Path, default=None)
-    p.add_argument("--results-gen", type=Path, default=None)
+    p.add_argument("--results", type=Path, action="append", required=True,
+                   help="a results directory from cli.evaluate; repeatable")
     args = p.parse_args(argv)
 
     c = Checks()
-    print(f"=== checking against slurm/SUCCESS_CRITERIA.md ===\ncohort: {args.cohort}")
-    cohort = check_cohort(c, args.cohort)
-
-    for root, tag, paired in ((args.pred_vae, "vae", True), (args.pred_gen, "gen", False)):
-        if root and (root / "predictions.json").is_file():
-            check_predictions(c, root, cohort, tag, paired)
-        else:
-            pre = "R" if paired else "G"
-            c.skip(f"{pre}1-{pre}4", f"{tag} predictions", "not produced yet")
-
-    for root, task in ((args.results_recon, "reconstruction"), (args.results_gen, "generation")):
-        if root and (root / "summary.json").is_file():
-            check_results(c, root, task, recon_root=args.results_recon, buckets=cohort.buckets)
-        else:
-            c.skip("E*", f"{task} results", "not produced yet")
+    print("=== checking against slurm/SUCCESS_CRITERIA.md ===")
+    recon_root = next((r for r in args.results
+                       if (r / "summary.json").is_file()
+                       and json.loads((r / "summary.json").read_text()).get("task") == "reconstruction"),
+                      None)
+    for root in args.results:
+        summary_path = root / "summary.json"
+        if not summary_path.is_file():
+            c.skip("E*", f"{root.name}", "no summary.json -- the run did not finish")
+            continue
+        summary = json.loads(summary_path.read_text())
+        task = summary.get("task")
+        if task not in ("reconstruction", "generation", "report2volume"):
+            c.skip("E*", f"{root.name}", f"unknown task {task!r}")
+            continue
+        print(f"\n--- {root.name}: task={task} run_id={summary.get('run_id')}")
+        buckets = sorted((summary.get("bucket_geometry") or {}))
+        check_results(c, root, task, recon_root=recon_root, buckets=buckets)
 
     return c.report()
 
