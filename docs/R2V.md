@@ -84,7 +84,7 @@ mismatch, before any GPU work.
 |---|---|---|---|
 | `--n-per-bucket 8` | 80 | ~10 min | wiring check; no metric means anything and the run says so |
 | `--n-per-bucket 200` | 2,000 | ~4 h | the scale every earlier result was produced at |
-| unset (**default**) | 34,453 | ~64 h | the entire test split |
+| unset (**default**) | 29,027 | ~60 h | the entire test split |
 
 Measured 6.7 s/case at 30 inference steps, plus ~1 s/case of scoring. **CTFlow** (Wang et al.,
 ICCV 2025 VLM3D, the CT-RATE report-to-volume model) evaluates on the *whole* CT-RATE validation
@@ -214,7 +214,7 @@ asking for ten — bucket order can never shift another bucket's draw. See
 |---|---|---|---|
 | `one_per_study_per_bucket` | **(study, modality, plane)** | **evaluation** — one independent observation per bucket | 21,148, every bucket populated |
 | `one_per_study_per_sequence` | (study, sequence) | a single-plane study only | 17,583, but the planes collapse — see below |
-| `all` | eligible series | training, where you want maximum data | 34,453 |
+| `all` | eligible series | training, where you want maximum data | 29,027 |
 | `one_per_study_deterministic` | study, across all sequences | a single-sequence cohort only | 4,893, but **4,861 of them T1w** |
 | `one_per_study_random` | study, redrawn each epoch | training | 4,893/epoch, same modality skew |
 

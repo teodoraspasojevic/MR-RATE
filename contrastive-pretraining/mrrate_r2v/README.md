@@ -448,7 +448,7 @@ cheap run is a prefix of the full one rather than a different sample. Sampler no
 |---|---|---|
 | `--n-per-bucket 8` | 80 | ~10 min — wiring check; no metric means anything |
 | `--n-per-bucket 200` | 2,000 | ~4 h — the scale earlier results were produced at |
-| unset (**default**) | 34,453 | ~64 h — the entire test split |
+| unset (**default**) | 29,027 | ~60 h — the entire test split |
 
 Then, **before** reading any number as a result:
 

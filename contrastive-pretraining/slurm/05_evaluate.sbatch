@@ -30,7 +30,7 @@
 #
 #   R2V_N_PER_BUCKET=8     ~10 min   smoke test; no metric means anything at N=8 and the run says so
 #   R2V_N_PER_BUCKET=200   ~4 h      the scale the old cohort pipeline ran at (2,000 cases)
-#   unset (full split)     ~64 h     34,453 test-split series -- what CTFlow does on CT-RATE
+#   unset (full split)     ~60 h     29,027 cases (one per study per bucket) -- CTFlow's whole-split precedent
 #
 # The walltime above (8 h) fits R2V_N_PER_BUCKET=200 with headroom. **Raise --time for a full-split
 # run**; measured 6.7 s/case at 30 inference steps on one H200, and the job is killed, not paused,
@@ -98,6 +98,22 @@ ARGS=(
 )
 [[ "$TASK" == "generation" ]] && ARGS+=(--base-checkpoint "$UNET_CHECKPOINT")
 [[ -n "${R2V_N_PER_BUCKET:-}" ]] && ARGS+=(--n-per-bucket "$R2V_N_PER_BUCKET")
+[[ -n "${R2V_FRECHET_BATCH:-}" ]] && ARGS+=(--frechet-batch-size "$R2V_FRECHET_BATCH")
+# Keep the generated volumes so a later metric does not need a second 4-hour sampling run.
+# R2V_SAVE_VOLUMES=1 puts them next to the results; give a path to put them elsewhere.
+if [[ "${R2V_SAVE_VOLUMES:-0}" == "1" ]]; then
+    ARGS+=(--save-volumes "$OUT/volumes")
+elif [[ -n "${R2V_SAVE_VOLUMES:-}" && "${R2V_SAVE_VOLUMES}" != "0" ]]; then
+    ARGS+=(--save-volumes "$R2V_SAVE_VOLUMES")
+fi
+[[ -n "${R2V_SAVE_VOLUMES_DTYPE:-}" ]] && ARGS+=(--save-volumes-dtype "$R2V_SAVE_VOLUMES_DTYPE")
+# For the cross-format ablation only: A/B/C trained on the two *_meta formats, so the two
+# non-meta ones are out of distribution and `assert_report_format_matches` refuses them by
+# default. That refusal is the safety net -- override it only when the OOD degradation IS the
+# measurement, which is exactly what run_sweep.sh's format stage is doing.
+[[ "${R2V_ALLOW_FORMAT_MISMATCH:-0}" == "1" ]] && ARGS+=(--allow-report-format-mismatch)
+# Fail on a missing encoder zoo now, not after the queue wait.
+[[ "$TASK" != "report2volume" ]] || preflight "$PRETRAINED_DIR"
 [[ -n "${R2V_TRAIN_WORLD_SIZE:-}" ]] && ARGS+=(--train-world-size "$R2V_TRAIN_WORLD_SIZE")
 
 # The blinded classifier is passed only when it exists. Without it the report_consistency group is

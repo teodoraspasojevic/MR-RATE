@@ -457,7 +457,64 @@ def compute_2p5d_fid(all_features: list, n_bootstrap: int = 30, seed: int = 42) 
                                      n_bootstrap, seed)
 
 
-def compute_distribution_metrics(all_features: list, sequences: list, min_subgroup_n: int = 10, n_bootstrap: int = 30, seed: int = 42, k_diversity: int = 5, buckets=None) -> dict:
+#: Default batch size for the fixed-N Frechet estimate. 512 is large enough that the covariance is
+#: better conditioned than any per-bucket value, and small enough that a 2,000-case run still yields
+#: 3 batches (so a spread can be reported). Configurable per run.
+DEFAULT_FRECHET_BATCH_SIZE = 512
+
+
+def compute_batched_frechet(all_features: list, real_attr: str, gen_attr: str,
+                            batch_size: int = DEFAULT_FRECHET_BATCH_SIZE, seed: int = 42) -> dict:
+    """A Frechet distance at a **fixed N**, ignoring buckets entirely.
+
+    Every case is one sample of one population -- modality, plane and geometry are not consulted.
+    The population is split into consecutive batches of exactly `batch_size`, a Frechet distance is
+    computed per batch, and the mean and spread are reported.
+
+    **Why this exists next to `overall_pooled`.** Pooled uses however many cases the run happened to
+    evaluate, so its sample-size bias depends on the run's scale -- an 800-case run and a 34,000-case
+    run are not comparable on it. This is computed at a *fixed* N, so the bias term is identical
+    across runs and across arms, and the batch-to-batch `std` gives an honest error bar for ranking
+    models. The trade is that it is more biased than pooled (smaller N), so it is a *comparison*
+    number, not an absolute one.
+
+    Order is the deterministic case order the evaluation already used (bucket-interleaved), so a
+    batch is a bucket-balanced mixture rather than one modality -- and no RNG is involved. A
+    trailing remainder smaller than `batch_size` is dropped, and `n_dropped` says how many.
+    """
+    usable = [f for f in all_features if getattr(f, real_attr) and getattr(f, gen_attr)]
+    n_batches = len(usable) // batch_size if batch_size > 0 else 0
+    if n_batches < 1:
+        return {"available": False, "batch_size": batch_size, "n_batches": 0,
+                "n_usable": len(usable),
+                "reason": f"{len(usable)} usable cases is fewer than one batch of {batch_size}"}
+
+    per_batch = []
+    for b in range(n_batches):
+        chunk = usable[b * batch_size:(b + 1) * batch_size]
+        planes = []
+        for name, _axis in PLANE_AXES:
+            real = np.stack([getattr(f, real_attr)[name] for f in chunk])
+            gen = np.stack([getattr(f, gen_attr)[name] for f in chunk])
+            planes.append(frechet_distance(real, gen))
+        per_batch.append(float(np.mean(planes)))
+
+    return {
+        "available": True,
+        "value": float(np.mean(per_batch)),
+        "std": float(np.std(per_batch)) if len(per_batch) > 1 else None,
+        "batch_size": batch_size,
+        "n_batches": n_batches,
+        "n_usable": len(usable),
+        "n_dropped": len(usable) - n_batches * batch_size,
+        "per_batch": per_batch,
+        "note": "fixed-N Frechet, buckets ignored; every case is one sample of one population. "
+                "Comparable across runs of different scale because N is fixed; more biased than "
+                "the pooled value because N is smaller.",
+    }
+
+
+def compute_distribution_metrics(all_features: list, sequences: list, min_subgroup_n: int = 10, n_bootstrap: int = 30, seed: int = 42, k_diversity: int = 5, buckets=None, frechet_batch_size: int = DEFAULT_FRECHET_BATCH_SIZE) -> dict:
     """Per-bucket + per-sequence + overall aggregation, grouping the same way for every metric
     family so results line up in one report.
 
@@ -473,6 +530,7 @@ def compute_distribution_metrics(all_features: list, sequences: list, min_subgro
         groups[seq] = [f for f in all_features if f.sequence == seq]
 
     out = {}
+    batch_size = int(frechet_batch_size or 0)
     for group_name, feats in groups.items():
         if len(feats) < 2:
             out[group_name] = {"n": len(feats), "skipped": "fewer than 2 samples"}
@@ -512,6 +570,15 @@ def compute_distribution_metrics(all_features: list, sequences: list, min_subgro
             entry["inception_score_generated_or_reconstructed"] = inception_score(np.stack(probs_gen), seed=seed)
         if probs_real:
             entry["inception_score_real_reference"] = inception_score(np.stack(probs_real), seed=seed)
+
+        if group_name == "overall" and batch_size > 0:
+            # Buckets ignored on purpose here -- see `compute_batched_frechet`.
+            if any(f.inception_2p5d_real for f in feats):
+                entry["inception_2p5d_fid_batched"] = compute_batched_frechet(
+                    feats, "inception_2p5d_real", "inception_2p5d_gen", batch_size, seed)
+            if any(f.fvd_real for f in feats):
+                entry["fvd_batched"] = compute_batched_frechet(
+                    feats, "fvd_real", "fvd_gen", batch_size, seed)
 
         out[group_name] = entry
     return out

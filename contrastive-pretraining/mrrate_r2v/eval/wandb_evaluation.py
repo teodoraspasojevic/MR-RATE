@@ -198,6 +198,115 @@ def _rows_from_provenance(summary: dict, cohort, predictions) -> list:
     return rows
 
 
+#: The main table: one row per headline metric, one column per scope. Logged as `metrics/headline`.
+HEADLINE_TABLE_COLUMNS = ("metric", "direction", "overall_macro", "overall_weighted",
+                          "overall_pooled", "batched_fixed_n", "batched_std", "batch_size",
+                          "n_batches", "n_scored", "note")
+
+
+def _bucket_mean(distribution, buckets, getter, weights=None):
+    """Mean of a per-bucket value, optionally population-weighted. None when nothing is available."""
+    import numpy as _np
+
+    pairs = []
+    for b in buckets:
+        v = getter((distribution or {}).get(b) or {})
+        if isinstance(v, (int, float)) and _np.isfinite(v):
+            pairs.append((b, float(v)))
+    if not pairs:
+        return None
+    if weights is None:
+        return float(_np.mean([v for _b, v in pairs]))
+    num = sum(float(weights.get(b, 0.0)) * v for b, v in pairs)
+    den = sum(float(weights.get(b, 0.0)) for b, _v in pairs)
+    return num / den if den else None
+
+
+def headline_table(summary: dict, cohort) -> tuple:
+    """`(columns, rows)` for `metrics/headline` -- THE table to read.
+
+    One row per headline metric, one column per way of aggregating it:
+
+        overall_macro     unweighted mean of the per-bucket values
+        overall_weighted  population-weighted mean of the per-bucket values
+        overall_pooled    recomputed once over every case (buckets mixed)
+        batched_fixed_n   recomputed on consecutive batches of a FIXED size, buckets ignored;
+                          mean across batches, with the batch-to-batch std beside it
+
+    **For FID and FVD, read `overall_pooled` and `batched_fixed_n`; the two averaged columns are
+    diagnostics.** A Frechet distance carries a sample-size bias, not just noise, so averaging
+    per-bucket values leaves the bias untouched -- every bucket is inflated in the same direction.
+    Pooling cuts it by raising N; the fixed-N column keeps the bias *constant* so two runs of
+    different scale stay comparable and the std gives an error bar for ranking.
+
+    The blinded-classifier consistency is a single AUROC over all scored cases, so only the pooled
+    column is defined for it -- a per-bucket AUROC is undefined wherever a label has one class in
+    that bucket, and averaging over the buckets where it happens to exist would silently change the
+    population. That is stated in the row's note rather than filled with a number.
+    """
+    buckets = list(getattr(cohort, "buckets", []) or [])
+    weights = dict(getattr(cohort, "population_bucket_counts", {}) or {})
+    distribution = summary.get("distribution_metrics") or {}
+    pooled = distribution.get("overall") or {}
+    n_scored = summary.get("n_scored") or summary.get("n_cohort_cases")
+
+    def frechet_row(label, key, batched_key, note):
+        getter = (lambda e: (e.get(key) or {}).get("combined_unweighted_mean")) if key != "medicalnet_fid_3d" \
+            else (lambda e: (e.get(key) or {}).get("fid"))
+        batched = pooled.get(batched_key) or {}
+        return (
+            label, "lower is better",
+            _finite(_bucket_mean(distribution, buckets, getter)),
+            _finite(_bucket_mean(distribution, buckets, getter, weights)),
+            _finite(getter(pooled)),
+            _finite(batched.get("value")),
+            _finite(batched.get("std")),
+            batched.get("batch_size"),
+            batched.get("n_batches"),
+            pooled.get("n") or n_scored,
+            note if batched.get("available", True) else f"{note}. batched: {batched.get('reason')}",
+        )
+
+    rows = [
+        frechet_row("FVD (r3d18 / medicalnet)", "fvd", "fvd_batched",
+                    "MRI-volume adaptation of FVD -- Kinetics-400 r3d_18, not I3D. Per-plane, then "
+                    "the unweighted mean, matching the challenge's FID_2p5D_Avg shape"),
+        frechet_row("FID 2.5D (Inception)", "inception_2p5d_fid", "inception_2p5d_fid_batched",
+                    "the challenge's FID_2p5D_Avg shape exactly: per-plane Frechet, unweighted mean"),
+    ]
+
+    medicalnet_getter = lambda e: (e.get("medicalnet_fid_3d") or {}).get("fid")  # noqa: E731
+    rows.append((
+        "FID 3D (MedicalNet)", "lower is better",
+        _finite(_bucket_mean(distribution, buckets, medicalnet_getter)),
+        _finite(_bucket_mean(distribution, buckets, medicalnet_getter, weights)),
+        _finite(medicalnet_getter(pooled)), None, None, None, None,
+        pooled.get("n") or n_scored,
+        "UNVALIDATED at scale: the preprocessing fix (z-score + foreground crop) landed after the "
+        "last full run. Check FID(real T1w vs real T2w) > FID(real vs its own reconstruction) "
+        "before trusting it",
+    ))
+
+    consistency = summary.get("report_consistency") or {}
+    if consistency.get("available"):
+        real_ref = (consistency.get("real_reference") or {}).get("macro_auroc_usable_labels")
+        rows.append((
+            "Blinded classifier consistency (macro AUROC)", "higher is better",
+            None, None, _finite(consistency.get("macro_auroc_usable_labels")), None, None, None,
+            None, consistency.get("n_scored"),
+            f"one AUROC over all scored cases, so only the pooled column is defined. Read against "
+            f"the same classifier's REAL-volume ceiling = {_finite(real_ref)}; the image-blind "
+            f"floor is 0.5. {consistency.get('n_labels_usable')} usable labels",
+        ))
+    else:
+        rows.append((
+            "Blinded classifier consistency (macro AUROC)", "higher is better",
+            None, None, None, None, None, None, None, None,
+            f"UNAVAILABLE: {consistency.get('reason', 'not computed')}",
+        ))
+    return list(HEADLINE_TABLE_COLUMNS), rows
+
+
 def metrics_table(summary: dict, cohort, predictions) -> tuple:
     """`(columns, rows)` for `metrics/all` -- every metric family that ran, in one table.
 
@@ -322,6 +431,10 @@ def log_evaluation(run, summary: dict, cohort, predictions, *, metric_rows=(),
     logged as a warning. An evaluation that has already computed its metrics must not be lost to a
     logging problem.
     """
+    # The main table first: three headline metric families x four aggregation scopes. `metrics/all`
+    # stays as the exhaustive per-bucket view underneath it.
+    head_columns, head_rows = headline_table(summary, cohort)
+    run.log_table("metrics/headline", head_columns, head_rows)
     columns, rows = metrics_table(summary, cohort, predictions)
     run.log_table("metrics/all", columns, rows)
     scalars = headline_scalars(summary)
@@ -333,7 +446,8 @@ def log_evaluation(run, summary: dict, cohort, predictions, *, metric_rows=(),
     run.set_summary(scalars)
     run.log(scalars)
 
-    logged = {"table_rows": len(rows), "scalars": sorted(scalars), "panels": [],
+    logged = {"table_rows": len(rows), "headline_rows": len(head_rows),
+              "scalars": sorted(scalars), "panels": [],
               "panels_withheld_reason": None}
 
     if n_panels <= 0:
@@ -380,7 +494,9 @@ def log_evaluation(run, summary: dict, cohort, predictions, *, metric_rows=(),
 
 __all__ = [
     "DEFAULT_N_PANELS",
+    "HEADLINE_TABLE_COLUMNS",
     "TABLE_COLUMNS",
+    "headline_table",
     "headline_scalars",
     "log_evaluation",
     "metrics_table",

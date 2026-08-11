@@ -34,7 +34,7 @@ cheap run is a prefix of the full one rather than a different sample. Per-case s
 
     --n-per-bucket 8      ~10 min   smoke test, no metric means anything
     --n-per-bucket 200    ~3.7 h    the old cohort scale (2,000 cases over 10 buckets)
-    (unset, full split)   ~64 h     34,453 test-split series -- what CTFlow does on CT-RATE
+    (unset, full split)   ~60 h     29,027 cases (one per study per bucket) -- CTFlow's whole-split precedent
 
 Read `metrics_per_bucket.csv` and `metrics_summary.csv` first; `summary.json` is the machine-
 readable mirror and `run_manifest.json` is the record of what actually ran.
@@ -144,6 +144,12 @@ def parse_args(argv=None):
                          "FVD_CTNet. 'none' skips FVD")
     dm.add_argument("--torch-home", type=Path, default=None,
                     help="where torchvision's r3d_18 Kinetics-400 weights are staged")
+    dm.add_argument("--frechet-batch-size", type=int, default=512, metavar="N",
+                    help="batch size for the fixed-N FID/FVD estimate, which IGNORES buckets and "
+                         "treats every case as one sample of one population. Reported as "
+                         "`batched_fixed_n` with its batch-to-batch std. Fixed N means the "
+                         "sample-size bias is identical across runs of different scale, so two "
+                         "arms stay comparable; 0 disables it")
     dm.add_argument("--diversity-slices-per-bucket", type=int, default=None,
                     help="mid-slices retained per bucket for intra-set MS-SSIM (0 = no cap). The "
                          "only metric that cannot stream; the cap is logged when it binds")
@@ -155,6 +161,20 @@ def parse_args(argv=None):
                     help="blinded pathology classifier from cli.train_report_classifier")
     dm.add_argument("--report-labels-csv", type=Path, default=None)
     dm.add_argument("--device", default="cuda", choices=["cpu", "cuda"])
+
+    keep = p.add_argument_group("keeping the generated volumes")
+    keep.add_argument("--save-volumes", type=Path, default=None, metavar="DIR",
+                      help="keep every generated volume, so adding a metric later costs a read "
+                           "instead of a second sampling run. One compressed .npz per "
+                           "(modality, plane) bucket -- /hnvme has a FILE-COUNT quota, so 10 "
+                           "archives is cheap where 2,000 loose .npy files is not. Stored in the "
+                           "model-input percentile space, byte-identical to what the metrics "
+                           "consumed. A cache, not a contract: the run_id travels with it and a "
+                           "mismatched pair is refused")
+    keep.add_argument("--save-volumes-dtype", default="float16", choices=["float16", "float32"],
+                      help="float16 halves the footprint (~19 GB vs ~38 GB at 2,000 cases) at a "
+                           "worst relative error of ~5e-4 -- about 66 dB against a data range of "
+                           "1.0, three orders of magnitude below any metric here")
 
     fig = p.add_argument_group("example figures")
     fig.add_argument("--save-figures", type=int, default=3, metavar="N",
@@ -615,7 +635,8 @@ def main(argv=None) -> int:
         medicalnet_checkpoint=args.medicalnet_checkpoint, fid_bootstrap=args.fid_bootstrap,
         min_subgroup_n=args.min_subgroup_n, diversity_k=args.diversity_k,
         fvd_extractor=(None if args.fvd_extractor == "none" else args.fvd_extractor),
-        torch_home=args.torch_home,
+        torch_home=args.torch_home, frechet_batch_size=args.frechet_batch_size,
+        save_volumes=args.save_volumes, save_volumes_dtype=args.save_volumes_dtype,
         diversity_slices_per_bucket=(args.diversity_slices_per_bucket
                                      if args.diversity_slices_per_bucket is not None
                                      else DEFAULT_DIVERSITY_SLICES_PER_BUCKET),

@@ -378,6 +378,14 @@ class LiveEvalConfig:
     #: classifier, this pipeline's analogue of the challenge's `FVD_CTNet`. None disables FVD.
     fvd_extractor: str | None = "r3d18"
     torch_home: Path | None = None
+    #: Batch size for the fixed-N Frechet estimate (buckets ignored). 0 disables it.
+    frechet_batch_size: int = 512
+    #: Where to keep the generated volumes, so a later metric does not need a second sampling run.
+    #: None = keep nothing, which is the default and the normal case. See `VolumeCacheWriter`.
+    save_volumes: Path | None = None
+    #: float16 halves the footprint and is far below any metric's resolution -- see the class
+    #: docstring for the arithmetic. float32 is bit-exact if you need it.
+    save_volumes_dtype: str = "float16" 
     diversity_k: int = 5
     diversity_slices_per_bucket: int = DEFAULT_DIVERSITY_SLICES_PER_BUCKET
     skip_metric_groups: tuple = ()
@@ -393,6 +401,109 @@ class LiveEvalConfig:
     wandb_log_reports: bool = False
     log_every: int = 25
     extra_run_metadata: dict = field(default_factory=dict)
+
+
+# --------------------------------------------------------------------------- volume cache
+
+
+#: Volumes are written float16 by default. The arithmetic: values live in ~[0, 2] and float16 has a
+#: 10-bit mantissa, so the worst relative error is ~5e-4 -- an equivalent PSNR near 66 dB against a
+#: data range of 1.0. Measured PSNR in this project is 11-30 dB, and SSIM/FID/FVD all consume the
+#: same volumes, so the quantisation sits three orders of magnitude below any signal being measured.
+#: It is still a lossy round trip, it is recorded in the manifest, and float32 is one flag away.
+VOLUME_CACHE_DTYPES = ("float16", "float32")
+
+VOLUME_CACHE_MANIFEST = "volumes.json"
+
+
+class VolumeCacheWriter:
+    """Keep the generated volumes, so adding a metric later costs a read instead of a re-sample.
+
+    **This is a cache, not a contract.** The cohort/prediction pipeline was removed precisely
+    because a stored artifact can go stale relative to the run that produced it. So this stores the
+    `run_id` alongside the volumes and `assert_matches_run` refuses a mismatched pair -- the cache
+    can be thrown away at any time and the evaluation is unaffected, which is the property that
+    makes it safe to have at all.
+
+    **One compressed archive per (modality, plane) bucket**, via the same `volumes.VolumeWriter` the
+    old cohorts used. Not one file per case: `/hnvme` enforces a **file-count** quota (61k soft),
+    not a space quota, so 2,000 loose `.npy` files is the expensive shape and 10 archives is the
+    cheap one.
+
+    **The stored intensity space is the model-input percentile space (~[0, 1])** -- byte-identical
+    to what the metrics consumed, never `postprocess_mr`'s int16 [0, 1000]. Anything else would put
+    a 1000x offset between a cached volume and the ground truth it is scored against, which no
+    metric detects. Use `cli.generate_r2v` if you want a viewer-ready NIfTI instead.
+
+    Footprint at 2,000 cases: ~19 GB at float16, ~38 GB at float32 (per-bucket FOVs, compressed).
+    """
+
+    def __init__(self, root, run_id: str, dtype: str = "float16") -> None:
+        from ..volumes import VolumeWriter
+
+        if dtype not in VOLUME_CACHE_DTYPES:
+            raise SystemExit(f"--save-volumes-dtype must be one of {list(VOLUME_CACHE_DTYPES)}")
+        self.root = Path(root)
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.run_id = run_id
+        self.dtype = dtype
+        self._writer = VolumeWriter(self.root)
+        self._n = 0
+
+    def add(self, case: LiveCase, volume: np.ndarray) -> None:
+        self._writer.add(case.bucket, case.case_id, volume.astype(self.dtype, copy=False))
+        self._n += 1
+
+    def close(self, cases, task: str, model: dict) -> dict:
+        self._writer.close()
+        manifest = {
+            "run_id": self.run_id,
+            "task": task,
+            "model": model,
+            "n_volumes": self._n,
+            "dtype": self.dtype,
+            "axis_order": "XYZ",
+            "intensity_space": "model_input_percentile",
+            "intensity_note": "the Dataset's percentile-normalised space (~[0, 1], not clipped), "
+                              "byte-identical to what the metrics consumed. NOT postprocess_mr's "
+                              "int16 [0, 1000].",
+            "cases_sha256": cases_fingerprint(cases),
+            "bucket_counts": self._writer.counts(),
+            "cases": [{"case_id": c.case_id, "bucket": c.bucket, "sequence": c.sequence,
+                       "acquisition_plane": c.acquisition_plane,
+                       "shape_xyz": list(c.shape), "spacing_mm_xyz": list(c.spacing_mm)}
+                      for c in cases],
+        }
+        (self.root / VOLUME_CACHE_MANIFEST).write_text(json.dumps(manifest, indent=2, default=str))
+        log.info("saved %d volumes (%s) -> %s", self._n, self.dtype, self.root)
+        return manifest
+
+
+def read_volume_cache(root):
+    """`(manifest, VolumeReader)` for a saved run. Read a volume with `reader.read(bucket, case_id)`."""
+    from ..volumes import VolumeReader
+
+    root = Path(root)
+    path = root / VOLUME_CACHE_MANIFEST
+    if not path.is_file():
+        raise SystemExit(f"{root} is not a saved volume set (no {VOLUME_CACHE_MANIFEST})")
+    return json.loads(path.read_text()), VolumeReader(root)
+
+
+def assert_matches_run(manifest: dict, run_id: str) -> None:
+    """Refuse a cache produced by a different run.
+
+    The one rule that keeps this a cache rather than a second source of truth: volumes from run A
+    must never be scored as if they came from run B. Same guarantee the old `cohort_id` handshake
+    gave, on an artifact that is now optional and disposable.
+    """
+    stored = manifest.get("run_id")
+    if stored != run_id:
+        raise SystemExit(
+            f"saved volumes were produced by run_id={stored!r}, but this evaluation is "
+            f"run_id={run_id!r}. Different cases, geometry, preprocessing or model -- the two are "
+            f"not comparable. Delete the cache and re-generate, or point at the matching one."
+        )
 
 
 # --------------------------------------------------------------------------- the harness
@@ -576,6 +687,16 @@ class LiveEvaluator:
         # Sharded by position, so every rank generates a disjoint subset and no case twice. The
         # gather below restores a single deterministic order, so results are independent of the
         # world size -- a 4-GPU run and a 1-GPU run produce the same numbers.
+        # Sharded, so each rank writes only its own cases. Under DDP that means one archive set
+        # per rank directory -- ranks cannot share a zip handle safely.
+        volume_cache = None
+        if config.save_volumes:
+            root = Path(config.save_volumes)
+            if world_size() > 1:
+                root = root / f"rank{rank()}"
+            volume_cache = VolumeCacheWriter(root, self.cohort.cohort_id, config.save_volumes_dtype)
+            log.info("saving generated volumes (%s) -> %s", config.save_volumes_dtype, root)
+
         mine = [(n, c) for n, c in enumerate(self.cases) if n % world_size() == rank()]
         started = time.time()
         timings = {"generate": 0.0, "score": 0.0}
@@ -616,6 +737,9 @@ class LiveEvaluator:
                                        inception, sequence)
             timings["score"] += time.time() - clock
 
+            if volume_cache is not None:
+                volume_cache.add(case, produced)
+
             panel = self._render_panel(case, sample, real, produced)
             if panel:
                 outcome["panel_html"] = panel
@@ -634,6 +758,10 @@ class LiveEvaluator:
                      "(intra-set MS-SSIM uses the first %d; every other metric uses all cases)",
                      bucket, dropped, config.diversity_slices_per_bucket,
                      config.diversity_slices_per_bucket)
+
+        if volume_cache is not None:
+            volume_cache.close([c for _n, c in mine], task.name,
+                               dict(config.extra_run_metadata.get("model") or {}))
 
         gathered = gather_objects(records)
         order = {c.case_id: i for i, c in enumerate(self.cases)}
@@ -665,6 +793,7 @@ class LiveEvaluator:
                 case_features, self.cohort.sequences, min_subgroup_n=config.min_subgroup_n,
                 n_bootstrap=config.fid_bootstrap, seed=config.seed,
                 k_diversity=config.diversity_k, buckets=self.cohort.buckets,
+                frechet_batch_size=config.frechet_batch_size,
             )
         elif "distribution" in groups:
             log.warning("no features available -- distribution metrics skipped")
@@ -942,11 +1071,16 @@ __all__ = [
     "LiveEvalConfig",
     "LiveEvaluator",
     "RESULT_FILES",
+    "VOLUME_CACHE_DTYPES",
+    "VOLUME_CACHE_MANIFEST",
+    "VolumeCacheWriter",
+    "assert_matches_run",
     "assert_metric_intensity_space",
     "build_cases",
     "case_id_for",
     "cases_fingerprint",
     "check_case_geometry",
+    "read_volume_cache",
     "run_fingerprint",
     "select_eval_cases",
     "stable_seed",

@@ -40,7 +40,7 @@ RUNS="$WORKSPACE/runs"
 #
 #   SMOKE=1        8/bucket      80 cases     ~10 min   wiring check; no metric means anything
 #   (default)      200/bucket    2,000 cases  ~4 h      the scale every earlier result was produced at
-#   FULL_SPLIT=1   entire split  34,453 cases ~64 h     what CTFlow does on CT-RATE's validation set
+#   FULL_SPLIT=1   entire split  29,027 cases ~60 h     what CTFlow does on CT-RATE's validation set
 #
 # 200/bucket is the default because it is what the four arms have always been compared at, and
 # because per-bucket FID at N=200 is already stable enough to rank them. Quote the full-split run
@@ -63,6 +63,13 @@ SPLIT="${SPLIT:-test}"
 # set CHECKPOINT_KIND=step4200.
 CHECKPOINT_KIND="${CHECKPOINT_KIND:-last}"
 
+# **The fallback is not a guess.** Verified 2026-08-11 by hashing the `adapter_state_dict` of every
+# candidate C carries: `adapter_step0004200.pt`, `adapter_best_fvd.pt`, `adapter_best_ssim.pt` and
+# `adapter_best_fid_2p5d.pt` all hold BYTE-IDENTICAL weights (sha 1014a763c1fe4771, 74 tensors,
+# optimizer_step 4200) -- the step-4200 validation pass improved all three metrics at once, so every
+# "best" marker points at the same weights. `adapter_step0003600.pt` hashes differently, which is
+# what shows the comparison is discriminating. So there is no better checkpoint for C to fall back
+# to; 4200 IS its best available, and the only cost is 6.5% fewer optimizer steps than A/B/D.
 resolve_checkpoint() {
     local run_dir="$1"
     case "$CHECKPOINT_KIND" in

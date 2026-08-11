@@ -170,6 +170,22 @@ def aggregate_rows(cohort, rows, metric_columns, distribution=None) -> list:
             "combined_unweighted_mean")
         pooled["fvd"] = (overall.get("fvd") or {}).get("combined_unweighted_mean")
         out.append(pooled)
+
+        # Fixed-N, buckets ignored. Comparable across runs of different scale; see
+        # `distribution.compute_batched_frechet`.
+        batched_fid = overall.get("inception_2p5d_fid_batched") or {}
+        batched_fvd = overall.get("fvd_batched") or {}
+        if batched_fid.get("available") or batched_fvd.get("available"):
+            batched = {"scope": f"overall_batched_n{batched_fid.get('batch_size') or batched_fvd.get('batch_size')}",
+                       "n_buckets": len(rows),
+                       "n_scored": (batched_fid.get("n_batches") or batched_fvd.get("n_batches", 0))
+                       * (batched_fid.get("batch_size") or batched_fvd.get("batch_size") or 0),
+                       "n_population": macro["n_population"]}
+            for c in metric_columns:
+                batched[c] = None
+            batched["inception_2p5d_fid"] = batched_fid.get("value")
+            batched["fvd"] = batched_fvd.get("value")
+            out.append(batched)
     return out
 
 

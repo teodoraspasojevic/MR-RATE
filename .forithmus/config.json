@@ -1,0 +1,10 @@
+{
+  "challenge": "mr-volume-generation",
+  "challenge_title": "MR Volume Generation",
+  "phase": "main",
+  "phase_id": "0edb5ef1-2030-4556-ab59-b26f94d3646a",
+  "phase_name": "Main",
+  "submission_type": "docker",
+  "data_schema": {},
+  "ranking_config": {}
+}
