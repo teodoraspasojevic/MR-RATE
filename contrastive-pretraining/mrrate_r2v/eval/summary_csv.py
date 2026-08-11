@@ -7,10 +7,12 @@ paste into a paper.
                              the sample counts, and every metric
     metrics_summary.csv      the aggregate rows: per modality, then two overall rows
 
-Two overall rows, deliberately, because they answer different questions and disagree here:
+Three overall rows, deliberately, because they answer different questions and disagree here:
 
     overall_macro       unweighted mean across buckets -- every anatomy counts equally
-    overall_weighted    weighted by the ELIGIBLE POPULATION counts recorded in cohort.json
+    overall_weighted    weighted by the ELIGIBLE POPULATION counts
+    overall_pooled      recomputed once over ALL cases at once, not averaged from the buckets.
+                        **For FID and FVD this is the row to quote** -- see `aggregate_rows`.
 
 The cohort is sampled to equal size per bucket (so per-bucket FID is stable), which means cohort
 counts are a sampling artefact and must not be used as weights. `population_bucket_counts` holds
@@ -85,6 +87,7 @@ def bucket_rows(cohort, metric_rows, metric_names, distribution, anatomy) -> lis
         d = (distribution or {}).get(bucket, {})
         row["medicalnet_fid"] = (d.get("medicalnet_fid_3d") or {}).get("fid")
         row["inception_2p5d_fid"] = (d.get("inception_2p5d_fid") or {}).get("combined_unweighted_mean")
+        row["fvd"] = (d.get("fvd") or {}).get("combined_unweighted_mean")
         row["intra_set_ssim_real"] = (d.get("intra_set_ms_ssim_real") or {}).get("mean")
         row["intra_set_ssim_produced"] = (d.get("intra_set_ms_ssim_produced") or {}).get("mean")
 
@@ -97,12 +100,28 @@ def bucket_rows(cohort, metric_rows, metric_names, distribution, anatomy) -> lis
     return out
 
 
-def aggregate_rows(cohort, rows, metric_columns) -> list:
-    """Per-modality means, then `overall_macro` and `overall_weighted`.
+def aggregate_rows(cohort, rows, metric_columns, distribution=None) -> list:
+    """Per-modality means, then `overall_macro`, `overall_weighted` and `overall_pooled`.
 
-    `overall_weighted` uses the eligible-population counts, not the cohort counts -- see the module
-    docstring. If a bucket has no population count recorded it falls back to its cohort count so a
-    weight is never silently zero.
+    **Three overall rows, and for a Frechet distance only one of them is the right one.**
+
+    - `overall_macro` / `overall_weighted` average the per-bucket values. That is correct for a
+      per-case metric (PSNR, SSIM, an anatomy measure): each bucket's value is an unbiased mean and
+      averaging them is just a re-weighting.
+    - `overall_pooled` is the metric recomputed **once over every case at once**, taken from
+      `distribution["overall"]` rather than derived from the bucket rows.
+
+    For FID and FVD, `overall_pooled` is the number to quote and the averaged rows are diagnostics.
+    A Frechet distance carries a sample-size **bias** (roughly proportional to feature_dim / N), not
+    just noise, and averaging biased estimates does not remove the bias -- every bucket's estimate is
+    inflated in the same direction, so their mean is inflated by the same amount. Pooling instead
+    multiplies N by the bucket count and cuts the bias roughly in proportion. Measured on 512-d
+    features with a known-zero ground truth: N=200 sits around 2,400 while N=2,000 sits around 240.
+
+    It is also what the field does. The VLM3D challenge's own `ranking_config` exposes exactly
+    `FID_2p5D_{XY,XZ,YZ}` and `FID_2p5D_Avg` -- per *plane*, averaged -- with **no** per-anatomy or
+    per-sequence stratification, i.e. one pooled number per plane over the whole test set. CTFlow
+    (ICCV 2025 VLM3D) likewise reports a single FID/FVD over all 3,000 CT-RATE validation volumes.
     """
     pop = cohort.population_bucket_counts
     out = []
@@ -136,6 +155,21 @@ def aggregate_rows(cohort, rows, metric_columns) -> list:
                 den += w
         weighted[c] = num / den if den else None
     out.append(weighted)
+
+    # Pooled: every case in one population. Only the population-level metrics have one -- a paired
+    # metric's pooled value IS its weighted mean, so those cells stay blank rather than repeating.
+    overall = (distribution or {}).get("overall") or {}
+    if overall:
+        pooled = {"scope": "overall_pooled", "n_buckets": len(rows),
+                  "n_scored": overall.get("n", macro["n_scored"]),
+                  "n_population": macro["n_population"]}
+        for c in metric_columns:
+            pooled[c] = None
+        pooled["medicalnet_fid"] = (overall.get("medicalnet_fid_3d") or {}).get("fid")
+        pooled["inception_2p5d_fid"] = (overall.get("inception_2p5d_fid") or {}).get(
+            "combined_unweighted_mean")
+        pooled["fvd"] = (overall.get("fvd") or {}).get("combined_unweighted_mean")
+        out.append(pooled)
     return out
 
 
@@ -157,7 +191,7 @@ def write_summary_csv(out_dir, cohort, metric_rows, metric_names, distribution, 
     metric_columns = [c for c in fields if c not in (
         "bucket", "modality", "plane", "shape_xyz", "spacing_mm_xyz", "fov_mm_xyz",
         "n_cohort", "n_scored", "n_population", "nvidia_train_n", "nvidia_low_train_n")]
-    aggs = aggregate_rows(cohort, rows, metric_columns)
+    aggs = aggregate_rows(cohort, rows, metric_columns, distribution)
     summary = out_dir / "metrics_summary.csv"
     agg_fields = ["scope", "n_buckets", "n_scored", "n_population"] + metric_columns
     with open(summary, "w", newline="", encoding="utf-8") as f:

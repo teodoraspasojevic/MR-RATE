@@ -358,6 +358,10 @@ class CaseFeatures:
     inception_2p5d_gen: dict | None = None
     inception_mid_probs_real: np.ndarray | None = None
     inception_mid_probs_gen: np.ndarray | None = None
+    # FVD-family sequence features, {plane: vec}. Same shape as inception_2p5d_*, so the two
+    # aggregate through the same code. Populated only when a sequence extractor is supplied.
+    fvd_real: dict | None = None
+    fvd_gen: dict | None = None
     # Mid-axial slices, kept from the same volume load the features came from, so the intra-set
     # diversity probe costs no extra I/O. Not written to the feature cache (they are pixels, not
     # features, and would inflate it ~100x).
@@ -423,20 +427,34 @@ def extract_2p5d_inception_features(volume: np.ndarray, extractor: "InceptionFea
     return out
 
 
-def compute_2p5d_fid(all_features: list, n_bootstrap: int = 30, seed: int = 42) -> dict:
-    """Per-plane Frechet distance over the volume-weighted pooled features, plus an unweighted
-    mean across the 3 planes -- an unweighted mean, not sample-count-weighted, because every
-    plane is a full, equally-valid view of every volume (not a variable-count sample of anything).
+def compute_per_plane_frechet(all_features: list, real_attr: str, gen_attr: str,
+                              n_bootstrap: int = 30, seed: int = 42) -> dict:
+    """Per-plane Frechet distance plus an unweighted mean across the 3 planes.
+
+    Unweighted, not sample-count-weighted, because every plane is a full, equally-valid view of
+    every volume (not a variable-count sample of anything). **This per-plane-then-average shape is
+    what the VLM3D challenge itself reports** -- its `ranking_config` exposes `FID_2p5D_XY`,
+    `FID_2p5D_XZ`, `FID_2p5D_YZ` and the headline `FID_2p5D_Avg` -- so it is matched here
+    deliberately rather than invented.
+
+    Shared by the 2.5D Inception FID and the FVD-family sequence features: both are
+    `{plane: vector}` per volume, so both aggregate identically.
     """
     out = {}
     for name, _axis in PLANE_AXES:
-        real = np.stack([f.inception_2p5d_real[name] for f in all_features if f.inception_2p5d_real])
-        gen = np.stack([f.inception_2p5d_gen[name] for f in all_features if f.inception_2p5d_gen])
+        real = np.stack([getattr(f, real_attr)[name] for f in all_features if getattr(f, real_attr)])
+        gen = np.stack([getattr(f, gen_attr)[name] for f in all_features if getattr(f, gen_attr)])
         out[name] = frechet_distance_with_diagnostics(real, gen, n_bootstrap, seed)
     finite = [out[name]["fid"] for name, _ in PLANE_AXES if out[name].get("fid") is not None]
     out["combined_unweighted_mean"] = float(np.mean(finite)) if finite else None
-    out["combination_method"] = "unweighted mean across sagittal/coronal/axial plane-level FID (see module docstring)"
+    out["combination_method"] = "unweighted mean across sagittal/coronal/axial plane-level distance"
     return out
+
+
+def compute_2p5d_fid(all_features: list, n_bootstrap: int = 30, seed: int = 42) -> dict:
+    """The 2.5D Inception FID: per-plane, then the unweighted mean. See `compute_per_plane_frechet`."""
+    return compute_per_plane_frechet(all_features, "inception_2p5d_real", "inception_2p5d_gen",
+                                     n_bootstrap, seed)
 
 
 def compute_distribution_metrics(all_features: list, sequences: list, min_subgroup_n: int = 10, n_bootstrap: int = 30, seed: int = 42, k_diversity: int = 5, buckets=None) -> dict:
@@ -470,6 +488,13 @@ def compute_distribution_metrics(all_features: list, sequences: list, min_subgro
 
         if any(f.inception_2p5d_real for f in feats) and any(f.inception_2p5d_gen for f in feats):
             entry["inception_2p5d_fid"] = compute_2p5d_fid(feats, n_bootstrap, seed)
+
+        # FVD, on the same per-plane-then-average shape. Offline FVD did not exist before
+        # 2026-08-10: it was computed only in the training-time validation loop, which meant the
+        # challenge's own headline metric family had no offline counterpart.
+        if any(f.fvd_real for f in feats) and any(f.fvd_gen for f in feats):
+            entry["fvd"] = compute_per_plane_frechet(feats, "fvd_real", "fvd_gen",
+                                                     n_bootstrap, seed)
 
         sl_real = [f.mid_slice_real for f in feats if f.mid_slice_real is not None]
         sl_gen = [f.mid_slice_gen for f in feats if f.mid_slice_gen is not None]

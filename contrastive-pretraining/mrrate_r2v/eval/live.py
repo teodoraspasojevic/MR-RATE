@@ -373,6 +373,11 @@ class LiveEvalConfig:
     medicalnet_checkpoint: Path | None = None
     fid_bootstrap: int = 30
     min_subgroup_n: int = 10
+    #: FVD-family sequence extractor. `r3d18` is torchvision's Kinetics-400 network (the primary,
+    #: and the closest available analogue of standard FVD's I3D); `medicalnet` is the domain 3D
+    #: classifier, this pipeline's analogue of the challenge's `FVD_CTNet`. None disables FVD.
+    fvd_extractor: str | None = "r3d18"
+    torch_home: Path | None = None
     diversity_k: int = 5
     diversity_slices_per_bucket: int = DEFAULT_DIVERSITY_SLICES_PER_BUCKET
     skip_metric_groups: tuple = ()
@@ -444,7 +449,8 @@ class LiveEvaluator:
 
     # -- per-case work -----------------------------------------------------------------
 
-    def _extract_features(self, case: LiveCase, real, produced, medicalnet, inception):
+    def _extract_features(self, case: LiveCase, real, produced, medicalnet, inception,
+                          sequence=None):
         """One `CaseFeatures` for this case. Both populations, so `report_consistency` gets the
         real-volume ceiling from the same forward passes the FID already paid for."""
         from . import distribution as DM
@@ -457,6 +463,8 @@ class LiveEvaluator:
             if medicalnet is not None:
                 setattr(cf, f"medicalnet_{tag}", medicalnet.extract(arr))
             setattr(cf, f"inception_2p5d_{tag}", DM.extract_2p5d_inception_features(arr, inception))
+            if sequence is not None:
+                setattr(cf, f"fvd_{tag}", sequence.extract(arr))
             slice_2d = DM.mid_slice(arr, axis=2)
             _feats, probs = inception.extract_batch(slice_2d[None])
             setattr(cf, f"inception_mid_probs_{tag}", probs[0])
@@ -476,7 +484,8 @@ class LiveEvaluator:
         self._diversity_dropped[bucket] = self._diversity_dropped.get(bucket, 0) + 1
         return False
 
-    def _score_case(self, case: LiveCase, sample, real, produced, groups, medicalnet, inception):
+    def _score_case(self, case: LiveCase, sample, real, produced, groups, medicalnet,
+                    inception, sequence=None):
         """Everything one case contributes: a metric row or an exclusion, features, anatomy."""
         from . import anatomy as A
 
@@ -505,7 +514,8 @@ class LiveEvaluator:
             outcome["row"] = row
 
         if "distribution" in groups or "report_consistency" in groups:
-            outcome["features"] = self._extract_features(case, real, produced, medicalnet, inception)
+            outcome["features"] = self._extract_features(case, real, produced, medicalnet,
+                                                         inception, sequence)
         if "anatomy" in groups:
             # Real measures come from the ground truth even for an unpaired task: the real
             # population is the reference distribution the KS test compares against.
@@ -538,7 +548,7 @@ class LiveEvaluator:
             log.warning("metric groups SKIPPED by request: %s -- recorded in summary.json",
                         list(config.skip_metric_groups))
 
-        medicalnet = inception = None
+        medicalnet = inception = sequence = None
         if "distribution" in groups or "report_consistency" in groups:
             from . import distribution as DM
 
@@ -548,6 +558,20 @@ class LiveEvaluator:
             else:
                 log.warning("no --medicalnet-checkpoint: the 3D FID and the blinded-classifier "
                             "consistency group cannot be computed (2.5D Inception FID still can)")
+            if config.fvd_extractor and "distribution" in groups:
+                try:
+                    from .video_features import build_sequence_extractor
+
+                    sequence = build_sequence_extractor(
+                        config.fvd_extractor, device=config.device,
+                        torch_home=str(config.torch_home) if config.torch_home else None,
+                        checkpoint_path=config.medicalnet_checkpoint,
+                    )
+                    log.info("FVD extractor: %s",
+                             json.dumps(sequence.configuration(), default=str))
+                except Exception as exc:  # noqa: BLE001 -- FVD is one metric, not the run
+                    log.warning("FVD extractor unavailable (%s): FVD will be omitted. Stage "
+                                "r3d_18 into --torch-home first.", exc)
 
         # Sharded by position, so every rank generates a disjoint subset and no case twice. The
         # gather below restores a single deterministic order, so results are independent of the
@@ -588,7 +612,8 @@ class LiveEvaluator:
                 real = sample["image"].squeeze(0).float().numpy().astype(np.float32)
 
             clock = time.time()
-            outcome = self._score_case(case, sample, real, produced, groups, medicalnet, inception)
+            outcome = self._score_case(case, sample, real, produced, groups, medicalnet,
+                                       inception, sequence)
             timings["score"] += time.time() - clock
 
             panel = self._render_panel(case, sample, real, produced)

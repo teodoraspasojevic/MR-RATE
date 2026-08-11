@@ -137,6 +137,13 @@ def parse_args(argv=None):
     dm.add_argument("--fid-bootstrap", type=int, default=30)
     dm.add_argument("--min-subgroup-n", type=int, default=10)
     dm.add_argument("--diversity-k", type=int, default=5)
+    dm.add_argument("--fvd-extractor", default="r3d18", choices=["r3d18", "medicalnet", "none"],
+                    help="FVD-family sequence extractor. r3d18 = torchvision Kinetics-400, the "
+                         "closest available analogue of standard FVD's I3D; medicalnet = the "
+                         "domain 3D classifier, this pipeline's analogue of the VLM3D challenge's "
+                         "FVD_CTNet. 'none' skips FVD")
+    dm.add_argument("--torch-home", type=Path, default=None,
+                    help="where torchvision's r3d_18 Kinetics-400 weights are staged")
     dm.add_argument("--diversity-slices-per-bucket", type=int, default=None,
                     help="mid-slices retained per bucket for intra-set MS-SSIM (0 = no cap). The "
                          "only metric that cannot stream; the cap is logged when it binds")
@@ -607,6 +614,8 @@ def main(argv=None) -> int:
         seed=args.seed, device=args.device, distribution_metrics=distribution,
         medicalnet_checkpoint=args.medicalnet_checkpoint, fid_bootstrap=args.fid_bootstrap,
         min_subgroup_n=args.min_subgroup_n, diversity_k=args.diversity_k,
+        fvd_extractor=(None if args.fvd_extractor == "none" else args.fvd_extractor),
+        torch_home=args.torch_home,
         diversity_slices_per_bucket=(args.diversity_slices_per_bucket
                                      if args.diversity_slices_per_bucket is not None
                                      else DEFAULT_DIVERSITY_SLICES_PER_BUCKET),
