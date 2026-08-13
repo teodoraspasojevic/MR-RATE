@@ -1,0 +1,101 @@
+{
+  "challenge": "ct-volume-generation",
+  "challenge_title": "CT Volume Generation",
+  "phase": "main-2026",
+  "phase_id": "8f03fe47-c475-47ce-9ef4-5f78b99e3ffe",
+  "phase_name": "Main",
+  "submission_type": "docker",
+  "data_schema": {
+    "input": {
+      "keys": {
+        "report": "string",
+        "input_image_name": "string"
+      },
+      "type": "json",
+      "filename": "prompts.json",
+      "structure": "array",
+      "entry_count": 100,
+      "case_id_field": "input_image_name"
+    },
+    "output": {
+      "type": "flat_files",
+      "flat_files": {
+        "count": 100,
+        "format": "nifti",
+        "pattern": "*.nii.gz"
+      }
+    },
+    "_mapping": {
+      "type": "one_to_one",
+      "mock_count": 5
+    }
+  },
+  "ranking_config": {
+    "formula": null,
+    "metrics": [
+      {
+        "key": "FVD_CTNet",
+        "label": "FVD (CTNet)",
+        "direction": "asc"
+      },
+      {
+        "key": "FID_2p5D_Avg",
+        "label": "FID 2.5D (Avg)",
+        "direction": "asc"
+      },
+      {
+        "key": "CLIPScore_mean",
+        "label": "CT-CLIPScore (Avg)",
+        "direction": "desc"
+      },
+      {
+        "key": "FID_2p5D_XY",
+        "label": "FID 2.5D (XY)",
+        "hidden": true,
+        "direction": "asc"
+      },
+      {
+        "key": "FID_2p5D_XZ",
+        "label": "FID 2.5D (XZ)",
+        "hidden": true,
+        "direction": "asc"
+      },
+      {
+        "key": "FID_2p5D_YZ",
+        "label": "FID 2.5D (YZ)",
+        "hidden": true,
+        "direction": "asc"
+      },
+      {
+        "key": "CLIPScore_I2I",
+        "label": "CT-CLIPScore (I2I)",
+        "hidden": true,
+        "direction": "desc"
+      },
+      {
+        "key": "CLIPScore",
+        "label": "CT-CLIPScore (T2I)",
+        "hidden": true,
+        "direction": "desc"
+      }
+    ],
+    "weights": null,
+    "metric_labels": {
+      "CLIPScore": "CT-CLIPScore (T2I)",
+      "FVD_CTNet": "FVD (CTNet)",
+      "FID_2p5D_XY": "FID 2.5D (XY)",
+      "FID_2p5D_XZ": "FID 2.5D (XZ)",
+      "FID_2p5D_YZ": "FID 2.5D (YZ)",
+      "FID_2p5D_Avg": "FID 2.5D (Avg)",
+      "CLIPScore_I2I": "CT-CLIPScore (I2I)",
+      "CLIPScore_mean": "CT-CLIPScore (Avg)"
+    },
+    "primary_metric": "FVD_CTNet",
+    "ranking_method": "mean_rank",
+    "display_metrics": [
+      "FVD_CTNet",
+      "FID_2p5D_Avg",
+      "CLIPScore_mean"
+    ]
+  }
+}

@@ -1,0 +1,22 @@
+[
+  {
+    "report": "sample_report",
+    "input_image_name": "case_001"
+  },
+  {
+    "report": "sample_report",
+    "input_image_name": "case_002"
+  },
+  {
+    "report": "sample_report",
+    "input_image_name": "case_003"
+  },
+  {
+    "report": "sample_report",
+    "input_image_name": "case_004"
+  },
+  {
+    "report": "sample_report",
+    "input_image_name": "case_005"
+  }
+]

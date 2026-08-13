@@ -1,0 +1,23 @@
+# Build context for submission/Dockerfile, which is built from this repository root.
+#
+# Deny-all then re-include, rather than listing exclusions: the repo root also holds
+# data-preprocessing/, docs/, logs/, mr_challenge_template/ and ~105 MB of NVIDIA assets/figures,
+# none of which belong in a submission image. An allowlist means adding a directory to the repo
+# cannot silently grow the image.
+*
+
+!NV-Generate-CTMR/scripts/
+!NV-Generate-CTMR/configs/
+!NV-Generate-CTMR/LICENSE
+!NV-Generate-CTMR/LICENSE.weights
+!contrastive-pretraining/mrrate_r2v/
+!submission/predict.py
+!submission/routing.py
+!submission/entrypoint.sh
+
+# Re-excluded inside the allowlisted trees.
+**/__pycache__/
+**/*.pyc
+**/.pytest_cache/
+**/.ipynb_checkpoints/
+**/*.ipynb

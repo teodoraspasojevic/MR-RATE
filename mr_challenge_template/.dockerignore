@@ -1,0 +1,8 @@
+weights.zip
+submission_v*.tar.gz
+sample_outputs_10/
+test_output/
+__pycache__/
+**/__pycache__/
+*.pyc
+.forithmus/test_data/

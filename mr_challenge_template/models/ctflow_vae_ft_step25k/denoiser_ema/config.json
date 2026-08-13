@@ -1,0 +1,36 @@
+{
+  "_class_name": "DiffuserSTDiT",
+  "_diffusers_version": "0.30.3",
+  "_name_or_path": "/hnvme/workspace/b180dc44-3d_CT_2/experiments/lvfm_STDiT-L2_16f8_ft_vae_16node_3/checkpoint-224000/denoiser_ema",
+  "caption_channels": 768,
+  "class_dropout_prob": 0.0,
+  "decay": 0.9999,
+  "depth": 24,
+  "drop_path": 0.0,
+  "enable_flashattn": false,
+  "hidden_size": 1024,
+  "in_channels": 32,
+  "input_size": [
+    16,
+    32,
+    32
+  ],
+  "inv_gamma": 1.0,
+  "min_decay": 0.0,
+  "mlp_ratio": 4.0,
+  "model_max_length": 1,
+  "no_temporal_pos_emb": false,
+  "num_heads": 16,
+  "optimization_step": 28001,
+  "out_channels": 16,
+  "patch_size": [
+    2,
+    2,
+    2
+  ],
+  "power": 0.6666666666666666,
+  "space_scale": 1.0,
+  "time_scale": 1.0,
+  "update_after_step": 0,
+  "use_ema_warmup": false
+}

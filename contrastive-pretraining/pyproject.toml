@@ -1,6 +1,9 @@
 [tool.pytest.ini_options]
-# "." makes `mrrate_r2v` importable; the rest are the non-package script/lib dirs.
-pythonpath = [".", "mr_rate", "vision_encoder", "scripts"]
+# "." makes `mrrate_r2v` importable; the next three are the non-package script/lib dirs.
+# "../submission" is the challenge Docker submission (repo root, outside this submodule): its
+# `routing`/`predict` modules are plain scripts that the container runs with no arguments, so their
+# invariants are only checkable from a test.
+pythonpath = [".", "mr_rate", "vision_encoder", "scripts", "../submission"]
 testpaths = ["tests"]
 addopts = "--cov=mrrate_r2v --cov=mr_rate --cov=vision_encoder --cov-report=term-missing"
 
