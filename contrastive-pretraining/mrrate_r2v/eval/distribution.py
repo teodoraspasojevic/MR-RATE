@@ -253,7 +253,21 @@ def frechet_distance_with_diagnostics(features_real: np.ndarray, features_gen: n
     if n_real < 2 or n_gen < 2:
         return {"fid": None, "n_real": n_real, "n_gen": n_gen, "feature_dim": feature_dim, "skipped": "fewer than 2 samples"}
 
-    point_estimate = _fd(features_real, features_gen)
+    # **The point estimate is allowed to fail.** `frechet_distance` raises when the covariance is
+    # too ill-conditioned to trust -- which is the right call for the NUMBER, and the wrong call
+    # for the RUN: this is reached from `_finish`, after every volume has been generated and
+    # scored, so an uncaught raise here discards hours of completed sampling to report one metric.
+    # Jobs 731337/731339 died exactly this way on 2026-08-12, after 85 minutes of generation, at
+    # 50 cases/bucket against a 512-d MedicalNet feature (rank <= 49). The bootstrap loop below
+    # already treated the same exception as a datum rather than a fault; this now matches it.
+    try:
+        point_estimate = _fd(features_real, features_gen)
+    except Exception as e:  # noqa: BLE001 - a metric that cannot be computed is a result, not a crash
+        log.warning("Frechet point estimate failed (n_real=%d n_gen=%d dim=%d): %s",
+                    n_real, n_gen, feature_dim, e)
+        return {"fid": None, "n_real": n_real, "n_gen": n_gen, "feature_dim": feature_dim,
+                "covariance_rank_deficient": n_real < feature_dim or n_gen < feature_dim,
+                "skipped": f"point estimate failed: {e}"}
     rng = np.random.RandomState(seed)
     boot_vals = []
     for _ in range(n_bootstrap):
@@ -489,22 +503,41 @@ def compute_batched_frechet(all_features: list, real_attr: str, gen_attr: str,
                 "n_usable": len(usable),
                 "reason": f"{len(usable)} usable cases is fewer than one batch of {batch_size}"}
 
+    # Same rule as the point estimate: an ill-conditioned batch is a batch that does not
+    # contribute, never an exception that unwinds a finished evaluation. Dropped batches are
+    # counted so a value averaged over 2 of 4 batches cannot be read as one averaged over 4.
     per_batch = []
+    n_failed_batches = 0
     for b in range(n_batches):
         chunk = usable[b * batch_size:(b + 1) * batch_size]
         planes = []
         for name, _axis in PLANE_AXES:
             real = np.stack([getattr(f, real_attr)[name] for f in chunk])
             gen = np.stack([getattr(f, gen_attr)[name] for f in chunk])
-            planes.append(frechet_distance(real, gen))
-        per_batch.append(float(np.mean(planes)))
+            try:
+                planes.append(frechet_distance(real, gen))
+            except Exception as e:  # noqa: BLE001
+                log.warning("batched Frechet failed (batch %d, plane %s): %s", b, name, e)
+        if len(planes) == len(PLANE_AXES):
+            per_batch.append(float(np.mean(planes)))
+        else:
+            n_failed_batches += 1
+
+    if not per_batch:
+        return {"available": False, "batch_size": batch_size, "n_batches": n_batches,
+                "n_usable": len(usable), "n_failed_batches": n_failed_batches,
+                "reason": "every batch was too ill-conditioned to compute a Frechet distance"}
 
     return {
         "available": True,
+        # `n_batches` is the count `value` was actually averaged over, so the two can never
+        # disagree; the attempted count sits beside it rather than replacing it.
+        "n_batches": len(per_batch),
+        "n_batches_attempted": n_batches,
+        "n_failed_batches": n_failed_batches,
         "value": float(np.mean(per_batch)),
         "std": float(np.std(per_batch)) if len(per_batch) > 1 else None,
         "batch_size": batch_size,
-        "n_batches": n_batches,
         "n_usable": len(usable),
         "n_dropped": len(usable) - n_batches * batch_size,
         "per_batch": per_batch,

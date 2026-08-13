@@ -28,6 +28,14 @@ from mrrate_r2v.volumes import VolumeReader, split_bucket  # noqa: E402
 EXPECTED_BUCKETS = 10
 EXPECTED_N_PER_BUCKET = 200
 
+# The aggregate scopes `eval/summary_csv.py` writes on top of the per-modality ones. Named rather
+# than counted, so a run that silently loses `overall_pooled` -- the column FID and FVD should
+# actually be read from -- fails the check instead of passing on an unchanged row count.
+# `overall_batched_n<N>` carries the frechet batch size in its name, so it is matched by prefix:
+# hardcoding n512 would fail any run that passed --frechet-batch-size.
+EXPECTED_OVERALL_SCOPES = ("overall_macro", "overall_weighted", "overall_pooled")
+BATCHED_SCOPE_PREFIX = "overall_batched_n"
+
 # Spline resampling undershoots slightly at sharp edges, so a percentile-normalized volume has
 # background voxels a hair below zero. Measured on the real cohort: worst -6.2e-05, typically
 # ~1e-7. The threshold has to sit above that noise floor and still well below any real sign error
@@ -233,9 +241,22 @@ def check_results(c: Checks, root: Path, task: str, recon_root: Path | None = No
 
     per_bucket = read_csv(root / "metrics_per_bucket.csv")
     agg = read_csv(root / "metrics_summary.csv")
-    c.add(f"{prefix}3", f"{task}: CSVs have 10 + 6 rows",
-          len(per_bucket) == EXPECTED_BUCKETS and len(agg) == 6,
-          f"{len(per_bucket)} bucket rows, {len(agg)} aggregate rows")
+    # 4 modality scopes + 4 overall scopes. It was 6 until `overall_pooled` and
+    # `overall_batched_n512` were added on 2026-08-11; this checker was not updated with them, so
+    # every valid run since then has been failing E3/EG3 on a stale constant and reporting
+    # "do not read the numbers as a result" over a correct CSV. Counted, not hardcoded to 8, so
+    # adding a fifth modality does not resurrect the same false alarm.
+    scopes = {str(r.get("scope", "")) for r in agg}
+    modality_scopes = {s for s in scopes if s.startswith("modality:")}
+    batched_scopes = {s for s in scopes if s.startswith(BATCHED_SCOPE_PREFIX)}
+    expected_agg = len(modality_scopes) + len(EXPECTED_OVERALL_SCOPES) + len(batched_scopes)
+    missing = [s for s in EXPECTED_OVERALL_SCOPES if s not in scopes]
+    if not batched_scopes:
+        missing.append(f"{BATCHED_SCOPE_PREFIX}<N>")
+    c.add(f"{prefix}3", f"{task}: CSVs have {EXPECTED_BUCKETS} + {expected_agg} rows",
+          len(per_bucket) == EXPECTED_BUCKETS and len(agg) == expected_agg and not missing,
+          f"{len(per_bucket)} bucket rows, {len(agg)} aggregate rows"
+          + (f"; missing scopes {missing}" if missing else ""))
 
     if task == "generation":
         voxelwise = [k for k in (per_bucket[0] if per_bucket else {})

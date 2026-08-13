@@ -337,14 +337,36 @@ def headline_scalars(summary: dict) -> dict:
         value = _finite((overall.get(name) or {}).get("mean"))
         if value is not None:
             out[f"eval/{name}"] = value
+    # **The three Frechet families do not share a value key, and assuming they did is what kept
+    # FVD and the 2.5D FID out of W&B entirely.** `medicalnet_fid_3d` is a single distance, so its
+    # value is under "fid". `inception_2p5d_fid` and `fvd` are per-plane structures whose headline
+    # number is the unweighted mean across sagittal/coronal/axial, under
+    # "combined_unweighted_mean" -- a `.get("fid")` on those returns None and the metric silently
+    # vanishes. Measured on the 2026-08-12 baselines: the only scalar that ever reached W&B was
+    # `medicalnet_fid_3d`, the one metric SUCCESS_CRITERIA E8 flags as an invalid backbone
+    # (1.00x cross-modality separation, against 1.75x for Inception 2.5D).
     distribution = (summary.get("distribution_metrics") or {}).get("overall") or {}
-    for key, label in (("medicalnet_fid_3d", "medicalnet_fid_3d"),
-                       ("inception_2p5d_fid", "inception_2p5d_fid")):
+    for key, value_key in (("medicalnet_fid_3d", "fid"),
+                           ("inception_2p5d_fid", "combined_unweighted_mean"),
+                           ("fvd", "combined_unweighted_mean")):
         block = distribution.get(key)
         if isinstance(block, dict):
-            value = _finite(block.get("fid"))
+            value = _finite(block.get(value_key))
             if value is not None:
-                out[f"eval/{label}"] = value
+                out[f"eval/{key}"] = value
+    # The fixed-N column too: `headline_table`'s own docstring says FID and FVD should be read
+    # from `overall_pooled` and `batched_fixed_n`, so the column runs are ranked on belongs in the
+    # sortable run table rather than only inside a logged table panel. The std comes with it --
+    # a ranking without its error bar invites reading a 0.2 gap as a result.
+    for key in ("inception_2p5d_fid", "fvd"):
+        batched = distribution.get(f"{key}_batched")
+        if isinstance(batched, dict) and batched.get("available"):
+            value = _finite(batched.get("value"))
+            if value is not None:
+                out[f"eval/{key}_batched_fixed_n"] = value
+                std = _finite(batched.get("std"))
+                if std is not None:
+                    out[f"eval/{key}_batched_fixed_n_std"] = std
     consistency = summary.get("report_consistency") or {}
     if consistency.get("available"):
         for key in ("macro_auroc_usable_labels", "macro_retention_usable_labels",

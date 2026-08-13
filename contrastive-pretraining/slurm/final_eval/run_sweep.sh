@@ -4,23 +4,31 @@
 #   slurm/final_eval/run_sweep.sh cfg       # stage 1: best guidance scale per arm      (20 jobs)
 #   slurm/final_eval/run_sweep.sh format    # stage 2: report-format robustness         (12 jobs)
 #   slurm/final_eval/run_sweep.sh headline  # stage 3: the four-way result               (4 jobs)
-#   slurm/final_eval/run_sweep.sh all       # all three, chained by dependency
 #
-# **This is deliberately NOT the full 4 x 5 x 4 = 80-run grid.** That costs ~340 GPU-hours and most
-# of it answers nothing: guidance scale and report format are close to independent, so the grid
-# spends 16 runs re-measuring each format at a guidance scale that is already known to be wrong for
-# that arm. Factorising into three stages answers the same three questions for ~87 GPU-hours:
+# **This is deliberately NOT the full 4 x 5 x 4 = 80-run grid.** Guidance scale and report format
+# are close to independent, so the grid spends 16 runs re-measuring each format at a guidance scale
+# already known to be wrong for that arm. Factorising into three stages answers the same three
+# questions in 36 jobs:
 #
-#     which guidance scale is best for each arm?   stage 1, cheap N, all arms x all scales
+#     which guidance scale is best for each arm?   stage 1, all arms x all scales
 #     how much does the report format cost?        stage 2, each arm at ITS best scale
-#     which conditioning wins?                     stage 3, each arm at its best, full scale
+#     which conditioning wins?                     stage 3, each arm at its best
 #
-# Stage 2 and 3 read stage 1's answer, so run them in order (or use `all`, which chains them with
-# `--dependency=afterany` and expects you to fill in BEST_CFG below once stage 1 lands).
+# Stage 2 and 3 read stage 1's answer, so run them in that order and pass BEST_CFG_* explicitly.
+# There is no `all`: see the case below for why chaining cannot replace reading stage 1.
 #
-# Every stage keeps the four arms on the SAME cases: selection is deterministic and prefix-stable,
-# so a stage-1 run at 50/bucket is literally the first 50 per bucket of the stage-3 run. Nothing has
-# to be held fixed by hand.
+# **Every job in every stage runs on the SAME 2,000 cases** (200/bucket x 10 buckets), and so do
+# the reconstruction and generation baselines. Verified rather than assumed: all four dataset
+# configurations -- with and without --report-format, in either section order -- select an
+# identical ordered case list (sha 19e94f024c80bc2e), matching the 2,000 cases the completed
+# reconstruction baseline actually scored, set and order. --report-format changes how the report
+# text is composed, never which samples exist.
+#
+# Cost at that N, from the two completed baselines (5:04 and 6:31 for 2,000 cases):
+#     stage 1  20 jobs  ~120 GPU-h        stage 2  12 jobs  ~72 GPU-h
+#     stage 3   4 jobs   ~24 GPU-h        total    36 jobs  ~216 GPU-h
+# CFG_VALUES="1.0 4.0 7.0" samples the guidance curve more coarsely for ~168 GPU-h total; it trims
+# the axis rather than the population, which is the only trim that keeps the runs comparable.
 
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/_final_eval_common.sh"
@@ -88,6 +96,7 @@ submit() {   # submit <arm> <tag suffix> <n_per_bucket> <cfg> <format> <walltime
     [[ -f "$adapter" ]] || { echo "missing checkpoint: $adapter" >&2; exit 1; }
     tag="$(arm_tag "$arm")_${suffix}"
 
+    [[ -n "$n" ]] || { echo "every stage runs at a fixed N; got an empty one for $arm" >&2; exit 1; }
     local exports="ALL,R2V_STEPS=${STEPS},R2V_REPORT_GUIDANCE=${cfg}"
     exports+=",R2V_MODALITY_GUIDANCE=${MODALITY_GUIDANCE},R2V_SEED=${SEED}"
     exports+=",R2V_SPLIT=${SPLIT},R2V_POSTERIOR_SHIFT=${POSTERIOR_SHIFT}"
@@ -96,10 +105,10 @@ submit() {   # submit <arm> <tag suffix> <n_per_bucket> <cfg> <format> <walltime
     exports+=",R2V_WANDB=${WANDB_MODE},R2V_WANDB_PROJECT=${WANDB_PROJECT}"
     exports+=",R2V_WANDB_GROUP=sweep_${STAGE},R2V_WANDB_NAME=${tag}"
     exports+=",R2V_WANDB_PANELS=${WANDB_PANELS},R2V_WANDB_REPORTS=${WANDB_REPORTS}"
-    [[ -n "$n" ]] && exports+=",R2V_N_PER_BUCKET=${n}"
-    # A small run cannot fill a 512-case batch, so the fixed-N column would be unavailable. 256
-    # keeps two batches at 50/bucket, which is what gives the sweep an error bar to rank on.
-    [[ -n "$n" && "$n" -le 100 ]] && exports+=",R2V_FRECHET_BATCH=256"
+    exports+=",R2V_N_PER_BUCKET=${n}"
+    # No `--frechet-batch-size` override any more. It existed because the old 50/bucket stage could
+    # not fill a 512-case batch; every stage now runs at N_PER_BUCKET so the default 512 applies
+    # everywhere, which is what keeps `overall_batched_n512` comparable across every job.
     # Keep the volumes for the headline runs only -- ~19 GB each at float16, and the cheap sweep
     # stages exist to be thrown away. SAVE_VOLUMES=1 forces it on for every stage.
     [[ "${SAVE_VOLUMES:-0}" == "1" || "$STAGE" == "headline" ]] && exports+=",R2V_SAVE_VOLUMES=1"
@@ -123,13 +132,17 @@ TRAINED_FORMAT="${TRAINED_FORMAT:-findings_impression_meta}"
 
 case "$STAGE" in
 cfg)
-    # 4 arms x 5 scales at 50/bucket (500 cases, ~1 h each) = 20 jobs, ~20 GPU-h.
-    # Cheap N is defensible here because every arm is compared at the SAME N, and what is being
-    # ranked is one arm against itself across scales. Do not quote these FIDs as absolute numbers.
-    echo "=== stage 1: guidance-scale sweep (${CFG_VALUES}) at ${CFG_N_PER_BUCKET:-50}/bucket"
+    # 4 arms x 5 scales at N_PER_BUCKET (2,000 cases, ~6 h each) = 20 jobs, ~120 GPU-h.
+    #
+    # **This stage used to run at 50/bucket and could not work.** Per-bucket FID compares two
+    # 512-d MedicalNet covariances; 50 samples estimates one of rank <= 49, `frechet_distance`
+    # rejects the resulting matrix square root as untrustworthy, and on 2026-08-12 that took out
+    # all 20 jobs -- 18 to walltime grinding through failing bootstrap resamples, 2 to an uncaught
+    # raise that discarded 85 minutes of finished sampling. The cheap-N discount was never real.
+    echo "=== stage 1: guidance-scale sweep (${CFG_VALUES}) at ${N_PER_BUCKET}/bucket"
     for arm in $ALL_ARMS; do
         for cfg in $CFG_VALUES; do
-            submit "$arm" "cfg${cfg}" "${CFG_N_PER_BUCKET:-50}" "$cfg" "$TRAINED_FORMAT" 02:00:00
+            submit "$arm" "cfg${cfg}" "$N_PER_BUCKET" "$cfg" "$TRAINED_FORMAT" "$WALLTIME"
         done
     done
     echo
@@ -143,26 +156,30 @@ format)
     echo "    arms: $FORMAT_ARMS   (D excluded: sectioned fusion never reads the joined string)"
     for arm in $FORMAT_ARMS; do
         for fmt in $FORMATS_IN_DIST; do
-            submit "$arm" "fmt_${fmt}" "$N_PER_BUCKET" "${BEST_CFG[$arm]}" "$fmt" 08:00:00 0
+            submit "$arm" "fmt_${fmt}" "$N_PER_BUCKET" "${BEST_CFG[$arm]}" "$fmt" "$WALLTIME" 0
         done
         for fmt in $FORMATS_OOD; do
-            submit "$arm" "fmt_${fmt}_ood" "$N_PER_BUCKET" "${BEST_CFG[$arm]}" "$fmt" 08:00:00 1
+            submit "$arm" "fmt_${fmt}_ood" "$N_PER_BUCKET" "${BEST_CFG[$arm]}" "$fmt" "$WALLTIME" 1
         done
     done
     ;;
 headline)
-    # The result table: 4 arms, each at its own best scale, one fixed format, full scale.
-    echo "=== stage 3: headline four-way at ${HEADLINE_N_PER_BUCKET:-$N_PER_BUCKET}/bucket"
+    # The result table: 4 arms, each at its own best scale, one fixed format.
+    echo "=== stage 3: headline four-way at ${N_PER_BUCKET}/bucket"
     for arm in $ALL_ARMS; do
-        submit "$arm" "headline" "${HEADLINE_N_PER_BUCKET:-$N_PER_BUCKET}" \
-            "${BEST_CFG[$arm]}" "$TRAINED_FORMAT" "${HEADLINE_WALLTIME:-08:00:00}"
+        submit "$arm" "headline" "$N_PER_BUCKET" \
+            "${BEST_CFG[$arm]}" "$TRAINED_FORMAT" "$WALLTIME"
     done
-    echo
-    echo "FULL_SPLIT: re-run with HEADLINE_N_PER_BUCKET= and HEADLINE_WALLTIME=72:00:00"
-    echo "            (~29,027 cases per arm at one_per_study_per_bucket, ~60 GPU-h each)"
     ;;
 all)
-    "$0" cfg; echo; "$0" format; echo; "$0" headline
+    # **Removed, not fixed.** It submitted all three stages at once and its own header claimed
+    # they were chained with --dependency=afterany. They were not, and could not be: stages 2 and
+    # 3 read BEST_CFG, which does not exist until a human has read stage 1's metrics_summary.csv.
+    # `all` therefore silently pinned 16 of the 36 jobs to the incumbent 4.0 and answered a
+    # question nobody asked. A dependency cannot substitute for the judgement in between.
+    echo "'all' is gone: stages 2 and 3 need BEST_CFG_* from stage 1, which is a human decision." >&2
+    echo "Run:  run_sweep.sh cfg   ->  read metrics_summary.csv  ->  BEST_CFG_A=... run_sweep.sh format" >&2
+    exit 1
     ;;
 *)
     echo "unknown stage '$STAGE' (cfg | format | headline | all)" >&2; exit 1 ;;

@@ -1,0 +1,24 @@
+2026-08-13 10:37:19,182 INFO    MainThread:1355000 [wandb_setup.py:_flush():81] Current SDK version is 0.28.1
+2026-08-13 10:37:19,182 INFO    MainThread:1355000 [wandb_setup.py:_flush():81] Configure stats pid to 1355000
+2026-08-13 10:37:19,182 INFO    MainThread:1355000 [wandb_setup.py:_flush():81] Loading settings from environment variables
+2026-08-13 10:37:19,182 INFO    MainThread:1355000 [wandb_init.py:setup_run_log_directory():729] Logging user logs to /home/hpc/y100dc/y100dc19/VLM3D-MRI-R2V-MICCAI-26/MR-RATE/contrastive-pretraining/wandb/run-20260813_103719-gfja5f6l/logs/debug.log
+2026-08-13 10:37:19,183 INFO    MainThread:1355000 [wandb_init.py:setup_run_log_directory():730] Logging internal logs to /home/hpc/y100dc/y100dc19/VLM3D-MRI-R2V-MICCAI-26/MR-RATE/contrastive-pretraining/wandb/run-20260813_103719-gfja5f6l/logs/debug-internal.log
+2026-08-13 10:37:19,183 INFO    MainThread:1355000 [wandb_init.py:init():772] calling init triggers
+2026-08-13 10:37:19,184 INFO    MainThread:1355000 [wandb_init.py:init():777] wandb.init called with sweep_config: {}
+config: {'_wandb': {}}
+2026-08-13 10:37:19,184 INFO    MainThread:1355000 [wandb_init.py:init():820] starting backend
+2026-08-13 10:37:19,184 INFO    MainThread:1355000 [wandb_init.py:init():835] sending inform_init request
+2026-08-13 10:37:19,298 INFO    MainThread:1355000 [wandb_init.py:init():840] backend started and connected
+2026-08-13 10:37:19,300 INFO    MainThread:1355000 [wandb_init.py:init():910] updated telemetry
+2026-08-13 10:37:19,313 INFO    MainThread:1355000 [wandb_init.py:init():933] communicating run to backend with 90.0 second timeout
+2026-08-13 10:37:19,858 INFO    MainThread:1355000 [wandb_init.py:init():978] starting run threads in backend
+2026-08-13 10:37:20,010 INFO    MainThread:1355000 [wandb_run.py:_console_start():2621] atexit reg
+2026-08-13 10:37:20,010 INFO    MainThread:1355000 [wandb_run.py:_redirect():2471] redirect: wrap_raw
+2026-08-13 10:37:20,011 INFO    MainThread:1355000 [wandb_run.py:_redirect():2540] Wrapping output streams.
+2026-08-13 10:37:20,011 INFO    MainThread:1355000 [wandb_run.py:_redirect():2563] Redirects installed.
+2026-08-13 10:37:20,014 INFO    MainThread:1355000 [wandb_init.py:init():1016] run started, returning control to user process
+2026-08-13 10:37:20,014 INFO    MainThread:1355000 [wandb_run.py:_finish():2383] finishing run mri-report2volume-miccai/mr-rate-test-unreachable/gfja5f6l
+2026-08-13 10:37:20,015 INFO    MainThread:1355000 [wandb_run.py:_atexit_cleanup():2588] got exitcode: 0
+2026-08-13 10:37:20,015 INFO    MainThread:1355000 [wandb_run.py:_restore():2570] restore
+2026-08-13 10:37:20,015 INFO    MainThread:1355000 [wandb_run.py:_restore():2576] restore done
+2026-08-13 10:37:20,865 INFO    MainThread:1355000 [wandb_run.py:_footer_sync_info():3993] logging synced files

@@ -48,6 +48,23 @@ RUNS="$WORKSPACE/runs"
 N_PER_BUCKET="${N_PER_BUCKET:-200}"
 SPLIT="${SPLIT:-test}"
 
+# **Every evaluation job runs at this N, with no cheap-N stage anywhere.** Two reasons, both
+# learned on 2026-08-12:
+#
+#   comparability  a result is only readable against another result on the same population.
+#                  Selection is prefix-stable, so 50/bucket was a nested subset rather than a
+#                  different draw -- but a subset is still not the same 2,000 cases.
+#   arithmetic     per-bucket FID compares two 512-d MedicalNet covariances. Below ~512 samples
+#                  the estimate is rank-deficient; at 50 it is hopeless, and `frechet_distance`
+#                  correctly refuses it. The 20-job cheap sweep did not produce cheap numbers,
+#                  it produced no numbers.
+#
+# **Walltime.** 08:00:00, measured rather than estimated: generation runs at 1.55 s/case (500
+# cases in 85 min, job 731337), and the two completed 2,000-case baselines took 5:04 and 6:31
+# end to end. Scoring, not sampling, is the long pole -- the earlier 2 h box was set from a
+# sampling-only estimate and every job that used it died. The h200 partition caps at 24:00:00.
+WALLTIME="${WALLTIME:-08:00:00}"
+
 # ---------------------------------------------------------------- which checkpoint
 #
 # **`adapter_last.pt` where it exists, `adapter_step0004200.pt` for C.**
@@ -169,15 +186,22 @@ submit_final_eval() {
     # earlier estimate was 4x too optimistic: `val/time/generate` in the training checkpoints works
     # out to 1.62 GPU-s/case, but that timer excludes the VAE decode -- a sliding-window inferer at
     # 80^3 with 0.4 overlap, which dominates. Scoring adds ~1 s/case on top.
-    walltime=08:00:00
+    walltime="$WALLTIME"
     if [[ "${SMOKE:-0}" == "1" ]]; then
+        # A wiring check, never a result -- 8/bucket is far below what any distribution metric can
+        # estimate, and the run says so itself. 02:00:00, not the old 00:40:00: even 80 cases
+        # timed out there (job 731328), because the fixed cost is model loading and scoring, not
+        # the case count.
         run_tag="smoke_${run_tag}"
         n_per_bucket=8
-        walltime=00:40:00
+        walltime=02:00:00
     elif [[ "${FULL_SPLIT:-0}" == "1" ]]; then
-        run_tag="full_${run_tag}"
-        n_per_bucket=""              # empty => the entire split
-        walltime=72:00:00
+        # Kept as a refusal rather than removed, so the intent stays discoverable: 29,027 cases at
+        # the measured end-to-end rate is ~40-70 h, and the h200 partition's ceiling is 24:00:00.
+        # The old 72:00:00 request could never have been accepted by the scheduler.
+        echo "FULL_SPLIT=1 cannot run here: ~29,027 cases needs 40h+, h200 caps --time at 24:00:00." >&2
+        echo "Shard it across jobs, or use a partition with a longer ceiling." >&2
+        exit 1
     fi
 
     echo "=== config $config"
