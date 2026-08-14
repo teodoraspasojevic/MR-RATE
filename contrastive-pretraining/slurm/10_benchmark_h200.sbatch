@@ -39,7 +39,7 @@ if [[ -n "${R2V_BENCH_ENV_ONLY:-}" ]]; then
 fi
 
 run_py_text mrrate_r2v.cli.benchmark_h200 \
-    --configs ${R2V_BENCH_CONFIGS:-cxr_bert_cls radbert_mean report2ct_style} \
+    --configs ${R2V_BENCH_CONFIGS:-cxr_bert_cls radbert_mean report2ct_style report2ct_style_meta} \
     --batch-sizes ${R2V_BENCH_BATCHES:-1 2 4 8} \
     --shape ${R2V_BENCH_SHAPE:-256 256 256} \
     --steps "${R2V_BENCH_STEPS:-12}" \

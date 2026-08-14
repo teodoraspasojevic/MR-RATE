@@ -39,6 +39,15 @@ SECTION_MARKERS = {
     "impression": "IMPRESSION",
 }
 
+#: The name of the *pseudo*-section carrying acquisition metadata as text
+#: (`[MODALITY] .. [PLANE] .. [SPACING] ..`, i.e. `meta_prefix_for`'s output).
+#:
+#: Not a released report field, which is why it is not in `REPORT_SECTION_NAMES`: the values come
+#: from the manifest row and the resolved geometry, exactly as they do for the `*_meta` formats.
+#: It exists because a sectioned-fusion configuration never composes a joined string and so has
+#: nowhere to put that prefix -- it gets its own conditioning token instead (configuration E).
+ACQUISITION_SECTION = "acquisition"
+
 
 def _text(record, field: str) -> str:
     value = getattr(record, field, None)
@@ -227,7 +236,23 @@ def meta_prefix_for(modality: Optional[str], plane: Optional[str],
     return _meta_prefix(modality, plane, spacing_mm_xyz)
 
 
+def with_acquisition_section(sections, modality: Optional[str], plane: Optional[str],
+                             spacing_mm_xyz: Optional[Sequence[float]] = None) -> dict:
+    """`sections` plus the `acquisition` pseudo-section, holding exactly what `meta_prefix_for`
+    returns. The one place an *inference* path composes that section, so the text a submission
+    sends and the text the Dataset produced during training cannot drift apart.
+
+    Additive by construction: `SectionedFusionEmbedder` encodes the sections it was *built* with
+    and ignores every other key, so a caller may call this unconditionally rather than branching on
+    whether the loaded configuration declares the section.
+    """
+    out = dict(sections or {})
+    out[ACQUISITION_SECTION] = _meta_prefix(modality, plane, spacing_mm_xyz)
+    return out
+
+
 __all__ = [
+    "ACQUISITION_SECTION",
     "DEFAULT_REPORT_FORMAT",
     "FORMAT_SPEC_SEPARATOR",
     "METADATA_DEPENDENT_FORMATS",
@@ -239,4 +264,5 @@ __all__ = [
     "format_report",
     "meta_prefix_for",
     "parse_format_spec",
+    "with_acquisition_section",
 ]

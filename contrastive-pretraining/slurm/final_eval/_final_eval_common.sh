@@ -1,9 +1,9 @@
-# Every parameter of the four final EVALUATIONS, in one file.
+# Every parameter of the final EVALUATIONS, in one file.
 #
-# The mirror of `slurm/final/_final_common.sh`, and for the same reason: the four `run_*.sh`
-# scripts set R2V_CONFIG and nothing else, so "the only difference between the four evaluations is
-# the conditioning mechanism" is enforced by construction rather than by four command lines staying
-# in sync. Same split, same case list, same seed, same guidance, same sampler steps, same
+# The mirror of `slurm/final/_final_common.sh`, and for the same reason: each `run_*.sh` script
+# sets R2V_CONFIG and nothing else, so "the only difference between the evaluations is the
+# conditioning mechanism" is enforced by construction rather than by command lines staying in
+# sync. Same split, same case list, same seed, same guidance, same sampler steps, same
 # checkpoint rule.
 #
 # Usage (from contrastive-pretraining/):
@@ -119,7 +119,8 @@ NORMALIZER="${NORMALIZER:-percentile}"
 
 # `report_format`: the order-agnostic *_meta spec A, B and C were trained on. Omitting it is silent
 # -- the text would carry no [MODALITY]/[PLANE]/[SPACING] prefix and be out of distribution for
-# three of the four arms. D ignores it and reads the sections instead.
+# three of the arms. D and E ignore it and read the sections instead -- E's acquisition section
+# carries the same [MODALITY]/[PLANE]/[SPACING] values, composed per case by the Dataset.
 REPORT_FORMAT="${REPORT_FORMAT:-findings_impression_meta}"
 
 # ---------------------------------------------------------------- sampling
@@ -165,7 +166,8 @@ run_dir_for() {
         B) echo "$RUNS/r2v_final_B_cxr_bert_tokens" ;;
         C) echo "$RUNS/r2v_final_C_radbert_tokens" ;;
         D) echo "$RUNS/r2v_final_D_report2ct_style" ;;
-        *) echo "unknown config '$1' (expected A, B, C or D)" >&2; exit 1 ;;
+        E) echo "$RUNS/r2v_final_E_report2ct_style_meta" ;;
+        *) echo "unknown config '$1' (expected A, B, C, D or E)" >&2; exit 1 ;;
     esac
 }
 

@@ -657,10 +657,14 @@ def synthetic_loader(steps: int, latent_channels: int = 4, latent: int = 8):
         "Findings: No acute infarct. Mild chronic microangiopathic change.",
         "Findings: 12 mm enhancing lesion in the right frontal lobe. Impression: Neoplasm.",
     ]
+    # `acquisition` is the metadata pseudo-section (configuration E); a configuration that does not
+    # declare it simply never reads the key.
     sections = [
         {"findings": "No acute infarct. Mild chronic microangiopathic change.",
-         "impression": "No acute intracranial abnormality."},
-        {"findings": "12 mm enhancing lesion in the right frontal lobe.", "impression": ""},
+         "impression": "No acute intracranial abnormality.",
+         "acquisition": "[MODALITY] T1w [PLANE] AXIAL [SPACING] 1.00 1.00 1.00"},
+        {"findings": "12 mm enhancing lesion in the right frontal lobe.", "impression": "",
+         "acquisition": "[MODALITY] T1w [PLANE] AXIAL [SPACING] 1.00 1.00 1.00"},
     ]
     batches = []
     for i in range(steps):

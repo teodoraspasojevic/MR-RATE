@@ -10,7 +10,7 @@
 #SBATCH --output=/hnvme/workspace/y100dc19-nvidia-mri-brain/slurm_logs/r2v_cond_%j.out
 #SBATCH --error=/hnvme/workspace/y100dc19-nvidia-mri-brain/slurm_logs/r2v_cond_%j.err
 #
-# Trains the report-conditioning adapter under one of the three supported configurations
+# Trains the report-conditioning adapter under one of the supported configurations
 # (slurm/configs/). The frozen NVIDIA denoiser and the text encoders are never updated -- the trainer
 # asserts that before the first step and logs both parameter counts.
 #
@@ -44,10 +44,12 @@ source "$R2V_REPO/contrastive-pretraining/slurm/_common.sh"
 setup
 
 # ---------------------------------------------------------------- configuration
-CONFIG="${R2V_CONFIG:?set R2V_CONFIG to A, B or C (see slurm/configs/README.md)}"
+CONFIG="${R2V_CONFIG:?set R2V_CONFIG to A, B, C, D or E (see slurm/configs/README.md)}"
 case "$CONFIG" in
-    # The four-arm lineup. A is the pooled-conditioning baseline (one token, degenerate attention);
-    # B and C keep the token axis; D is the sectioned multi-encoder fusion.
+    # The lineup. A is the pooled-conditioning baseline (one token, degenerate attention);
+    # B and C keep the token axis; D is the sectioned multi-encoder fusion, and E is D plus a third
+    # token carrying [MODALITY]/[PLANE]/[SPACING] -- the metadata A/B/C get from their format prefix
+    # and D structurally cannot.
     #
     # **The letters changed on 2026-08-07.** C used to mean report2ct_style and B used to mean
     # radbert_mean. If you have an older submission script, re-read it before reusing it -- an
@@ -56,6 +58,7 @@ case "$CONFIG" in
     B|b) CONFIG_FILE="B_cxr_bert_tokens.sh" ;;
     C|c) CONFIG_FILE="C_radbert_tokens.sh" ;;
     D|d) CONFIG_FILE="D_report2ct_style.sh" ;;
+    E|e) CONFIG_FILE="E_report2ct_style_meta.sh" ;;
     *)   CONFIG_FILE="${CONFIG}.sh" ;;
 esac
 CONFIG_PATH="$CP_ROOT/slurm/configs/$CONFIG_FILE"
@@ -100,7 +103,7 @@ ARGS=(
     --num-gpus "$NGPU"
     --device cuda
 )
-# Empty for configuration C, which encodes sections separately rather than joining them.
+# Empty for configurations D and E, which encode sections separately rather than joining them.
 [[ -n "${R2V_REPORT_FORMAT:-}" ]] && ARGS+=(--report-format "$R2V_REPORT_FORMAT")
 [[ "$MAX_STEPS" != "0" ]] && ARGS+=(--max-steps "$MAX_STEPS")
 [[ -n "${R2V_SAVE_EVERY:-}" ]] && ARGS+=(--save-every-steps "$R2V_SAVE_EVERY")

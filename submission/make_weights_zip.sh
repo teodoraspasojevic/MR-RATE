@@ -24,7 +24,7 @@ OUT_DIR="${OUT_DIR:-${WS}/submission}"
 
 usage() {
     cat >&2 <<'EOF'
-usage: make_weights_zip.sh <A|B|C|D> [adapter_checkpoint_filename]
+usage: make_weights_zip.sh <A|B|C|D|E> [adapter_checkpoint_filename]
 
   A  cxr_bert_cls      pooled CLS,     768x1     encoders: BiomedVLP-CXR-BERT-specialized
   B  cxr_bert_tokens   token sequence, 768x512   encoders: BiomedVLP-CXR-BERT-specialized
@@ -32,6 +32,7 @@ usage: make_weights_zip.sh <A|B|C|D> [adapter_checkpoint_filename]
   D  report2ct_style   sectioned fusion, 2560x2  encoders: MedEmbed-large-v0.1,
                                                            Bio_ClinicalBERT,
                                                            BiomedVLP-CXR-BERT-specialized
+  E  report2ct_style_meta  D + acquisition token, 2560x3   same three encoders
 EOF
     exit 2
 }
@@ -41,6 +42,7 @@ case "$ARM" in
     B) RUN=r2v_final_B_cxr_bert_tokens;  ENCODERS=("BiomedVLP-CXR-BERT-specialized") ;;
     C) RUN=r2v_final_C_radbert_tokens;   ENCODERS=("RadBERT-RoBERTa-4m") ;;
     D) RUN=r2v_final_D_report2ct_style;  ENCODERS=("MedEmbed-large-v0.1" "Bio_ClinicalBERT" "BiomedVLP-CXR-BERT-specialized") ;;
+    E) RUN=r2v_final_E_report2ct_style_meta; ENCODERS=("MedEmbed-large-v0.1" "Bio_ClinicalBERT" "BiomedVLP-CXR-BERT-specialized") ;;
     *) usage ;;
 esac
 

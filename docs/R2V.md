@@ -574,6 +574,19 @@ as "token attention cannot work".
 (a 2560-wide fusion needs a wider `ContextProjection`), so it is not capacity-matched, and its
 sensitivity is 8x below A's.
 
+**Configuration E (`report2ct_style_meta`) was added after this table and has not run yet.** It is
+D plus a third conditioning token holding `[MODALITY] .. [PLANE] .. [SPACING] ..` as text -- the
+prefix A, B and C carry at the head of their joined string and D structurally could not, since it
+never composes one. Same three encoders, same masked-mean pooling, same feature-axis order, same
+trainable count as D; findings and impression keep sequence indices 0 and 1, so **D vs E is a
+one-token difference and nothing else**. The information is not new to the model (modality is
+already a class label, spacing already a `spacing_tensor`, plane implied by the bucket geometry) --
+only its entry point is, as a cross-attention key the adapter can weight per voxel -- so a null
+result is an honest possible outcome rather than a wiring bug. Run it with
+`slurm/final/run_E_report2ct_style_meta.sh` and score it with
+`slurm/final_eval/run_E_report2ct_style_meta.sh`; both source the same common files A-D used, so
+the arm is comparable by construction.
+
 Caveats that bound all of it: report-volume *semantic* fidelity is still unmeasured (see the module
 docstring in `validation.py`), so `ssim_advantage` is a structural stand-in; one seed per arm; and
 FVD/FID at N=512 are still rank-deficient against 512- and 2048-d features.
@@ -673,9 +686,12 @@ sbatch slurm/14_train_report_classifier.sbatch clf_train_v2 clf_val_v2 report_cl
   `assert_report_format_matches` refuses that pairing rather than scoring it, so the symptom is a
   hard exit. A cohort freezes **one** format, so build a second with `impression_findings_meta` if
   you want to measure the order-robustness the two-format training was for.
-- **`report_sections.json`**: configuration D encodes findings and impression as two separate
+- **`report_sections.json`**: configurations D and E encode findings and impression as separate
   cross-attention tokens and cannot recover them from the joined string. `cli.predict_r2v` refuses
   up front on a cohort that has no sections rather than conditioning D on one token instead of two.
+  E additionally needs the `acquisition` section; the Dataset composes it per case, and the
+  cohort path fills it in from the case's own modality/plane/spacing
+  (`cli/generate_r2v.py` -> `formats.with_acquisition_section`).
 
 Neither exists in the old `test_v1` (built 2026-07-30), which is why the cohort is rebuilt rather
 than reused.
@@ -687,6 +703,7 @@ slurm/final_eval/run_A_cxr_bert_cls.sh
 slurm/final_eval/run_B_cxr_bert_tokens.sh
 slurm/final_eval/run_C_radbert_tokens.sh
 slurm/final_eval/run_D_report2ct_style.sh
+slurm/final_eval/run_E_report2ct_style_meta.sh
 ```
 
 Each submits **two** jobs — `13_predict_r2v.sbatch` then `05_evaluate.sbatch`, chained with
@@ -835,7 +852,7 @@ contrastive-pretraining/
     text.py            the replaceable text-encoder seam: RadBERT, a test mock, one registry,
                        plus encode_reports (the one dispatch seam) and rebuild_embedder
     textenc/           the encoder zoo + report formats + fusion            (README.md)
-                       conditioning.py = the four named configurations (textenc/README.md Part 4)
+                       conditioning.py = the named configurations (textenc/README.md Part 4)
     textbench/         encoder x format selection benchmark; never imported by the trainer
                        (README.md; results and rationale in docs/TEXT_ENCODERS.md)
     conditioning.py    modality ids, NVIDIA's own modality dropout, report dropout, CFG

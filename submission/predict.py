@@ -406,6 +406,7 @@ def main() -> int:
 
     from mrrate_r2v.cli.generate_r2v import conditioning_text_for
     from mrrate_r2v.sampling import save_volume
+    from mrrate_r2v.textenc.formats import with_acquisition_section
 
     for index, (stem, report) in enumerate(prompts, start=1):
         filename = f"{stem}.nii.gz"
@@ -420,7 +421,11 @@ def main() -> int:
         # is part of what they learned; text without it is out of distribution and silently
         # so. D records no format and gets the text unchanged.
         text, prefix = conditioning_text_for(report, payload, modality, plane, spacing)
-        sections = split_sections(report) if needs_sections else None
+        # E carries the same metadata as its own conditioning token instead of as a text prefix, so
+        # the assigned modality/plane/spacing have to reach the sections too. Additive: D declares
+        # no `acquisition` section and encodes findings/impression exactly as before.
+        sections = (with_acquisition_section(split_sections(report), modality, plane, spacing)
+                    if needs_sections else None)
 
         case_started = time.time()
         volume = sampler.generate(

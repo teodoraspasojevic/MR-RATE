@@ -1,0 +1,22 @@
+{
+  "os":  "Linux-5.14.0-687.26.1.el9_8.x86_64-x86_64-with-glibc2.34",
+  "python":  "CPython 3.12.3",
+  "startedAt":  "2026-08-14T14:16:58.411667Z",
+  "args":  [
+    "tests/",
+    "--no-cov",
+    "-q",
+    "-p",
+    "no:randomly"
+  ],
+  "program":  "-m pytest.__main__",
+  "git":  {
+    "remote":  "https://github.com/teodoraspasojevic/MR-RATE.git",
+    "commit":  "5b22e97f5f32afbf4ddadc796bb8e8e61530e34e"
+  },
+  "email":  "teodora.spasojevic@fau.de",
+  "root":  "/home/hpc/y100dc/y100dc19/VLM3D-MRI-R2V-MICCAI-26/MR-RATE/contrastive-pretraining",
+  "host":  "helma1",
+  "executable":  "/apps/python/3.12-conda/envs/pytorch2.5.1/bin/python3",
+  "writerId":  "r5ws7qjkjd4uj9oorkp7da94e903gbkc"
+}

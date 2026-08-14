@@ -11,6 +11,7 @@ sampler and `ReportConditionedUNetMaisi` need no branch on which configuration i
 | A `cxr_bert` CLS | `PooledEmbedder` | 1 | 768 |
 | B `radbert` masked mean | `PooledEmbedder` | 1 | 768 |
 | C Report2CT-style fusion | `SectionedFusionEmbedder` | 2 | 2560 |
+| E Report2CT-style + acquisition | `SectionedFusionEmbedder` | 3 | 2560 |
 | A-tokens `cxr_bert` unpooled | `TokenSequenceEmbedder` | dynamic | 768 |
 | B-tokens `radbert` unpooled | `TokenSequenceEmbedder` | dynamic | 768 |
 
@@ -65,7 +66,7 @@ from torch import nn
 
 from ..text import TextConditioning, masked_mean
 from .encoders import POOLING_MODES, build_encoder
-from .formats import ORDER_AGNOSTIC_META_SPEC
+from .formats import ACQUISITION_SECTION, ORDER_AGNOSTIC_META_SPEC
 from .fusion import ProjectedConcatFusion
 
 log = logging.getLogger("mrrate_r2v.textenc.conditioning")
@@ -73,6 +74,17 @@ log = logging.getLogger("mrrate_r2v.textenc.conditioning")
 #: Section order is explicit and part of the contract: index 0 is findings, index 1 impression.
 #: Report2CT's own order (`torch.cat((context_f, context_i), dim=1)`).
 REPORT2CT_SECTIONS = ("findings", "impression")
+
+#: The same two sections plus a third token holding the acquisition metadata as text
+#: (`[MODALITY] .. [PLANE] .. [SPACING] ..`), encoded by the same three encoders.
+#:
+#: **The gap it closes.** A/B/C put that prefix at the head of their joined string, so modality,
+#: plane and spacing reach the text encoder as well as reaching the UNet numerically
+#: (`class_labels`, `spacing_tensor`). A sectioned-fusion configuration never composes a joined
+#: string, so under `REPORT2CT_SECTIONS` those three values are the one thing the report branch
+#: cannot see. Appended, not inserted: findings and impression keep sequence indices 0 and 1, which
+#: is what makes an E checkpoint's first two tokens the same quantity as a D checkpoint's.
+REPORT2CT_META_SECTIONS = REPORT2CT_SECTIONS + (ACQUISITION_SECTION,)
 
 #: Report2CT's verified encoder order, with `bio_clinicalbert` substituted for
 #: `medicalai/ClinicalBERT` (see the module docstring). 1024 + 768 + 768 = 2560.
@@ -430,6 +442,19 @@ CONDITIONING_CONFIGS: dict[str, dict] = {
                 "2560, one token per section, findings first. bio_clinicalbert substitutes for "
                 "Report2CT's medicalai/ClinicalBERT -- same width, different checkpoint.",
     },
+    "report2ct_style_meta": {
+        "kind": "sectioned_fusion",
+        "encoders": REPORT2CT_STYLE_ENCODERS,
+        "pooling": "mean",
+        "sections": REPORT2CT_META_SECTIONS,
+        "report_format": None,               # sections are encoded separately, never joined
+        "sequence_length": 3,
+        "output_dim": 2560,
+        "note": "Configuration E. Configuration D plus a third token holding "
+                "[MODALITY]/[PLANE]/[SPACING] as text, so the acquisition metadata A/B/C get from "
+                "their format prefix reaches the report branch here too. Identical encoders, "
+                "pooling and feature-axis order to D; findings and impression keep indices 0 and 1.",
+    },
 }
 
 DEFAULT_CONDITIONING = "radbert_mean"
@@ -515,6 +540,7 @@ __all__ = [
     "CONDITIONING_CONFIGS",
     "DEFAULT_CONDITIONING",
     "PooledEmbedder",
+    "REPORT2CT_META_SECTIONS",
     "REPORT2CT_SECTIONS",
     "REPORT2CT_STYLE_ENCODERS",
     "SectionedFusionEmbedder",

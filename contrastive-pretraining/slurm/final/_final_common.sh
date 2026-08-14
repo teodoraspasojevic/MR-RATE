@@ -1,8 +1,12 @@
-# Every hyperparameter of the four final runs, in one file.
+# Every hyperparameter of the final runs, in one file.
 #
-# The four run_*.sh scripts set R2V_CONFIG and nothing else, so "the only difference between the
-# four jobs is the conditioning mechanism" is enforced by construction rather than by four copies
-# staying in sync. Change a number here and all four change together; that is the point.
+# Each run_*.sh script sets R2V_CONFIG and nothing else, so "the only difference between the jobs
+# is the conditioning mechanism" is enforced by construction rather than by copies staying in sync.
+# Change a number here and every arm changes together; that is the point.
+#
+# E was added after A-D had run. It uses the identical settings below, so it is comparable to them
+# by the same construction -- but its numbers come from a later job, so if anything on the cluster
+# changed in between (node pool, container image), that is a difference the letters do not record.
 #
 # Usage (from contrastive-pretraining/):
 #   R2V_LR=3e-4 slurm/final/run_A_cxr_bert_cls.sh
@@ -129,10 +133,10 @@ VALREF_JSON="$WORKSPACE/cache/r2v/validation_reference_n256_seed0.json"
 # one fixed order teaches the model that order, and nothing at submission time would detect that the
 # challenge's reports use the other.
 #
-# Configuration D ignores this and must: it encodes findings and impression with three separate
-# tokenizers and never joins them into one string, so there is no section order to be robust to --
-# and, unavoidably, nowhere to put the metadata prefix. That is the one respect in which the four
-# jobs are not identical apart from the conditioning, and it is structural, not a choice.
+# Configurations D and E ignore this and must: they encode findings and impression with three
+# separate tokenizers and never join them into one string, so there is no section order to be
+# robust to. For D that also means nowhere to put the metadata prefix -- E is exactly the arm that
+# fixes that, by making the prefix its own conditioning token instead of a string prefix.
 REPORT_FORMAT="findings_impression_meta,impression_findings_meta"
 
 SEED=0
@@ -155,12 +159,12 @@ submit_final_run() {
     # listing it here splits it into `R2V_REPORT_FORMAT=findings_impression_meta` plus a junk entry
     # -- which trains on one fixed section order while looking like it did the right thing. Exported
     # into the environment instead and carried by the `ALL` above.
-    # D's own config file sets R2V_REPORT_FORMAT empty; overriding it would break it.
-    if [[ "$config" != "D" ]]; then
-        export R2V_REPORT_FORMAT="$REPORT_FORMAT"
-    else
-        unset R2V_REPORT_FORMAT
-    fi
+    # D and E set R2V_REPORT_FORMAT empty in their own config files (both encode sections
+    # separately and never compose a joined string); overriding it would break them.
+    case "$config" in
+        D|E) unset R2V_REPORT_FORMAT ;;
+        *)   export R2V_REPORT_FORMAT="$REPORT_FORMAT" ;;
+    esac
 
     local walltime="$WALLTIME"
     if [[ "$SMOKE" == "1" ]]; then

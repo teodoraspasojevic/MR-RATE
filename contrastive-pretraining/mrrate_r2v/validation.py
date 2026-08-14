@@ -64,6 +64,8 @@ from typing import Optional, Protocol, Sequence
 import numpy as np
 import torch
 
+from .textenc.formats import ACQUISITION_SECTION
+
 log = logging.getLogger("mrrate_r2v.validation")
 
 METRIC_NAMES = ("fvd", "fid_2p5d", "ssim")
@@ -716,8 +718,19 @@ class ValidationRunner:
                     correct = generate(case)
                     # Same case -- same seed, modality, spacing, shape -- with only the report
                     # replaced. Any difference in the output is attributable to the text alone.
+                    #
+                    # The `acquisition` section is the exception and stays this case's own: it holds
+                    # [MODALITY]/[PLANE]/[SPACING], i.e. the same facts as the class label and the
+                    # spacing tensor the swapped generation still runs at. Taking the donor's would
+                    # make the model disagree with itself about the geometry and credit the
+                    # resulting movement to the report (configuration E only; no other
+                    # configuration has the section).
+                    swapped_sections = dict(other.report_sections or {})
+                    own_sections = case.report_sections or {}
+                    if ACQUISITION_SECTION in own_sections:
+                        swapped_sections[ACQUISITION_SECTION] = own_sections[ACQUISITION_SECTION]
                     swapped_case = replace(case, report_text=other.report_text,
-                                           report_sections=other.report_sections)
+                                           report_sections=swapped_sections)
                     shuffled = generate(swapped_case)
 
                     scale = float(np.abs(correct).mean()) or 1.0

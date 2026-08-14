@@ -11,6 +11,7 @@ here for the same reason `data/{storage,manifest,reports,geometry}.py` avoid tor
 or stdlib-only interpreter must still be able to build report strings.
 """
 from .formats import (  # noqa: F401
+    ACQUISITION_SECTION,
     DEFAULT_REPORT_FORMAT,
     METADATA_DEPENDENT_FORMATS,
     ORDER_AGNOSTIC_META_SPEC,
@@ -19,9 +20,11 @@ from .formats import (  # noqa: F401
     format_report,
     meta_prefix_for,
     parse_format_spec,
+    with_acquisition_section,
 )
 
 __all__ = [
+    "ACQUISITION_SECTION",
     "CONDITIONING_CONFIGS",
     "DEFAULT_CONDITIONING",
     "DEFAULT_REPORT_FORMAT",
@@ -32,6 +35,7 @@ __all__ = [
     "choose_format",
     "meta_prefix_for",
     "parse_format_spec",
+    "with_acquisition_section",
     "MultiEncoderEmbedder",
     "PooledEmbedder",
     "ProjectedConcatFusion",

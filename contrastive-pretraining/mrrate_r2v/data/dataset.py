@@ -106,7 +106,14 @@ class R2VDatasetConfig:
     # one cross-attention token per section). Purely additive: `report_text` is unaffected, which
     # is why this is deliberately NOT in `geometry_fingerprint` -- it changes no existing field and
     # would otherwise invalidate every cohort built before it existed.
-    conditioning_sections: tuple = ("findings", "impression")
+    #
+    # `"acquisition"` is the one entry that is not a released report field: it holds
+    # `[MODALITY] .. [PLANE] .. [SPACING] ..` built from the manifest row and the resolved geometry,
+    # the same string the `*_meta` formats prefix their joined text with. It is in the default
+    # because it costs one f-string and an embedder encodes only the sections it was *built* with --
+    # so configuration D is byte-identical with it present, and configuration E has it available
+    # without a flag.
+    conditioning_sections: tuple = ("findings", "impression", "acquisition")
     geometry_mode: str = "per_modality_plane"
     # geometry_mode="fixed" only. **Both are (D, H, W)-ordered**, like every other internal
     # geometry parameter -- NOT the (X, Y, Z) order the Dataset *returns*. If your value came from
@@ -147,9 +154,19 @@ class R2VDatasetConfig:
         if self.archive_access_mode not in ARCHIVE_ACCESS_MODES:
             raise ValueError(f"Unknown archive_access_mode '{self.archive_access_mode}'. "
                              f"Choose from: {ARCHIVE_ACCESS_MODES}")
-        for name in tuple(self.report_sections) + tuple(self.conditioning_sections):
+        from ..textenc.formats import ACQUISITION_SECTION
+
+        for name in tuple(self.report_sections):
             if name not in REPORT_SECTION_NAMES:
                 raise ValueError(f"Unknown report section '{name}'. Choose from: {REPORT_SECTION_NAMES}")
+        # `conditioning_sections` additionally accepts the acquisition pseudo-section, which is
+        # composed from metadata rather than read off the `ReportRecord`. `report_sections` does not:
+        # it selects what goes into the joined `report_text`, and the `*_meta` formats already put
+        # the same values there.
+        for name in tuple(self.conditioning_sections):
+            if name not in REPORT_SECTION_NAMES + (ACQUISITION_SECTION,):
+                raise ValueError(f"Unknown conditioning section '{name}'. Choose from: "
+                                 f"{REPORT_SECTION_NAMES + (ACQUISITION_SECTION,)}")
         if self.report_format is not None:
             from ..textenc.formats import parse_format_spec
 
@@ -429,8 +446,17 @@ class MRReportToVolumeDataset(Dataset):
         # read plus strip -- no parsing, no sampling), so training, validation and sampling see
         # byte-identical text for a given study. An absent section is "" and is masked out by
         # `SectionedFusionEmbedder`, never emitted as a real attention key.
+        #
+        # `acquisition` is the one entry that is not a report field: `meta_prefix_for` over this
+        # row's modality/plane and the resolved target spacing -- the identical string the `*_meta`
+        # formats prefix `report_text` with, and (X, Y, Z) like `target_spacing_mm` below, so the
+        # text and the numeric `spacing_tensor` cannot disagree. Never empty, so it is never masked.
+        from ..textenc.formats import ACQUISITION_SECTION, meta_prefix_for
+
         report_sections_text = {
-            name: (getattr(report, name, None) or "").strip()
+            name: (meta_prefix_for(row.modality, row.plane, target_spacing_xyz)
+                   if name == ACQUISITION_SECTION
+                   else (getattr(report, name, None) or "").strip())
             for name in self.config.conditioning_sections
         }
 

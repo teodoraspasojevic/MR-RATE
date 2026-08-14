@@ -394,10 +394,21 @@ def main(argv=None) -> int:
             # The *case's* modality, not `--modality`: a cohort spans four sequences, and
             # conditioning an SWI case on T1w is a wrong class label that still generates fine.
             # `--modality` remains the flag for the free-form path, where there is no case to ask.
+            # `with_acquisition_section` is additive: configuration D ignores the extra key, and
+            # configuration E needs it because a cohort's stored sections are report text only --
+            # the acquisition token is composed from the case's own modality/plane/spacing, exactly
+            # as the Dataset composed it during training.
+            sections = None
+            if needs_sections:
+                from ..textenc.formats import with_acquisition_section
+
+                sections = with_acquisition_section(
+                    cohort.load_report_sections(case.case_id),
+                    case.sequence, case.acquisition_plane, case.spacing_mm,
+                )
             volume = sampler.generate(
                 report_text, tuple(case.shape), tuple(case.spacing_mm),
-                seed=args.seed, modality=case.sequence,
-                report_sections=cohort.load_report_sections(case.case_id) if needs_sections else None,
+                seed=args.seed, modality=case.sequence, report_sections=sections,
             )
             from ..sampling import save_volume
 
@@ -416,14 +427,24 @@ def main(argv=None) -> int:
     if prefix:
         log.info("adapter trained on a metadata format; prepending %r", prefix)
     log.info("report: %d characters", len(report_text))
+    # A free-form report has no section boundaries to recover, so a sectioned configuration gets the
+    # whole string as its findings token -- the same routing `SectionedFusionEmbedder.encode` falls
+    # back to, done explicitly so the acquisition token can be filled in alongside it. Without it,
+    # configuration E would generate from a masked-out metadata token it never trained with one.
+    sections = None
+    if getattr(embedder, "needs_sections", False):
+        from ..textenc.formats import with_acquisition_section
+
+        sections = with_acquisition_section({"findings": report_text}, args.modality, args.plane,
+                                            args.spacing)
     if args.latent_only:
         latent = sampler.sample_latent(report_text, args.modality, tuple(args.dim), tuple(args.spacing),
-                                        seed=args.seed)
+                                        seed=args.seed, report_sections=sections)
         log.info("latent %s finite=%s", tuple(latent.shape), bool(torch.isfinite(latent).all()))
         return 0
 
     volume = sampler.generate(report_text, tuple(args.dim), tuple(args.spacing), seed=args.seed,
-                              modality=args.modality)
+                              modality=args.modality, report_sections=sections)
     from ..sampling import save_volume
 
     save_volume(volume, args.spacing, args.out)

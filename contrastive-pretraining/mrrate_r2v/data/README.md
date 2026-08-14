@@ -27,7 +27,10 @@ sample["image"]              # torch.Tensor [1, X, Y, Z] -- preprocessed, model-
                              # dtype = config.dtype (default torch.bfloat16)
 sample["report_text"]        # str -- the conditioning text, composed by R2VDatasetConfig.report_format
 sample["report_sections_text"]  # dict -- unjoined sections; used only by a sectioned-fusion
-                             # conditioning (report2ct_style), which encodes each separately
+                             # conditioning (report2ct_style{,_meta}), which encodes each
+                             # separately. Includes "acquisition": the
+                             # "[MODALITY] .. [PLANE] .. [SPACING] .." string, composed from this
+                             # row and its resolved geometry rather than from the report
 sample["modality"]           # "T1w" | "T2w" | "FLAIR" | "SWI" | "unknown"
                              # ("MRA" only if you override --excluded-modalities)
 sample["acquisition_plane"]  # "AXIAL" | "SAGITTAL" | "CORONAL" | "OBLIQUE" | "unknown"

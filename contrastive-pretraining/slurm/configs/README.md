@@ -1,4 +1,4 @@
-# The four supported conditioning configurations
+# The supported conditioning configurations
 
 One file per configuration. Each is a shell fragment sourced by
 [`11_train_conditioning.sbatch`](../11_train_conditioning.sbatch), so the flags live in exactly one
@@ -10,6 +10,7 @@ place and a run cannot silently disagree with what is documented.
 | [`B_cxr_bert_tokens.sh`](B_cxr_bert_tokens.sh) | `cxr_bert_tokens` | `microsoft/BiomedVLP-CXR-BERT-specialized` | `(B, n, 768)` + `(B, n)` mask | order-agnostic + meta |
 | [`C_radbert_tokens.sh`](C_radbert_tokens.sh) | `radbert_tokens` | `zzxslp/RadBERT-RoBERTa-4m` | `(B, n, 768)` + `(B, n)` mask | order-agnostic + meta |
 | [`D_report2ct_style.sh`](D_report2ct_style.sh) | `report2ct_style` | MedEmbed-large + Bio_ClinicalBERT + CXR-BERT | `(B, 2, 2560)` | none — sections encoded separately |
+| [`E_report2ct_style_meta.sh`](E_report2ct_style_meta.sh) | `report2ct_style_meta` | MedEmbed-large + Bio_ClinicalBERT + CXR-BERT | `(B, 3, 2560)` | none — sections encoded separately |
 
 **`n` is variable, not fixed.** The tokenizer pads each batch to *its own* longest report, capped at
 `--max-report-tokens` (512), so `n` differs from batch to batch — measured 133–512 for CXR-BERT and
@@ -41,6 +42,18 @@ sbatch --export=ALL,R2V_CONFIG=D,R2V_MAX_STEPS=0 --time=24:00:00 \
 `R2V_MAX_STEPS=0` means "no step cap" (run `--epochs` to completion). `#SBATCH --export=NONE` in
 the job script means a plain `VAR=x sbatch ...` does **not** reach the job — always pass overrides
 through `--export=ALL,...` as above.
+
+**E is D plus one token, and that is the whole difference.** D encodes each section with its own
+tokenizer and never joins them into a string, so it is the one arm with nowhere to put the
+`[MODALITY]/[PLANE]/[SPACING]` prefix A, B and C carry — modality and plane reach it only as
+`class_labels`/`spacing_tensor`. E appends that prefix as a third conditioning token, encoded by
+the same three encoders through the same masked-mean pooling, leaving findings at sequence index 0
+and impression at 1. So D vs E measures exactly one thing: whether the acquisition metadata is
+worth a cross-attention key of its own. The information is not new to the model (modality is
+already a class label, spacing already a tensor), only its entry point is, so a null result is a
+possible honest outcome. The text itself is composed by the Dataset from the manifest row and the
+resolved target spacing, never parsed from the report, and is byte-identical to what
+`meta_prefix_for` gives A/B/C.
 
 **Configuration D is a Report2CT-*style* fusion, not a reproduction.** Report2CT's third encoder is
 `medicalai/ClinicalBERT` (a 6-layer DistilBERT); this substitutes the staged

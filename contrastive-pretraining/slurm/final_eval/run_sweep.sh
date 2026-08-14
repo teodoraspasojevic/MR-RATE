@@ -1,14 +1,14 @@
 #!/bin/bash -l
 # The three-stage study: which conditioning, at which guidance scale, how robust to report format.
 #
-#   slurm/final_eval/run_sweep.sh cfg       # stage 1: best guidance scale per arm      (20 jobs)
+#   slurm/final_eval/run_sweep.sh cfg       # stage 1: best guidance scale per arm      (25 jobs)
 #   slurm/final_eval/run_sweep.sh format    # stage 2: report-format robustness         (12 jobs)
-#   slurm/final_eval/run_sweep.sh headline  # stage 3: the four-way result               (4 jobs)
+#   slurm/final_eval/run_sweep.sh headline  # stage 3: the arm-vs-arm result             (5 jobs)
 #
-# **This is deliberately NOT the full 4 x 5 x 4 = 80-run grid.** Guidance scale and report format
-# are close to independent, so the grid spends 16 runs re-measuring each format at a guidance scale
-# already known to be wrong for that arm. Factorising into three stages answers the same three
-# questions in 36 jobs:
+# **This is deliberately NOT the full 5 x 5 x 4 = 100-run grid.** Guidance scale and report format
+# are close to independent, so the grid spends most of its runs re-measuring each format at a
+# guidance scale already known to be wrong for that arm. Factorising into three stages answers the
+# same three questions in 42 jobs:
 #
 #     which guidance scale is best for each arm?   stage 1, all arms x all scales
 #     how much does the report format cost?        stage 2, each arm at ITS best scale
@@ -25,8 +25,8 @@
 # text is composed, never which samples exist.
 #
 # Cost at that N, from the two completed baselines (5:04 and 6:31 for 2,000 cases):
-#     stage 1  20 jobs  ~120 GPU-h        stage 2  12 jobs  ~72 GPU-h
-#     stage 3   4 jobs   ~24 GPU-h        total    36 jobs  ~216 GPU-h
+#     stage 1  25 jobs  ~150 GPU-h        stage 2  12 jobs  ~72 GPU-h
+#     stage 3   5 jobs   ~30 GPU-h        total    42 jobs  ~252 GPU-h
 # CFG_VALUES="1.0 4.0 7.0" samples the guidance curve more coarsely for ~168 GPU-h total; it trims
 # the axis rather than the population, which is the only trim that keeps the runs comparable.
 
@@ -69,24 +69,28 @@ CFG_VALUES="${CFG_VALUES:-1.0 2.0 3.0 4.0 7.0}"
 FORMATS_IN_DIST="${FORMATS_IN_DIST:-findings_impression_meta impression_findings_meta}"
 FORMATS_OOD="${FORMATS_OOD:-findings_impression impression_findings}"
 
-# **Configuration D is excluded from the format axis, on purpose.** `report2ct_style` is sectioned
-# fusion: it encodes findings and impression as separate cross-attention tokens read from
-# `report_sections_text`, and never sees the joined string `--report-format` composes. Running it
+# **Configurations D and E are excluded from the format axis, on purpose.** Both are sectioned
+# fusion: they encode findings and impression as separate cross-attention tokens read from
+# `report_sections_text`, and never see the joined string `--report-format` composes. Running them
 # across four formats would produce four identical results and read as evidence of robustness.
+# E does condition on the metadata -- through its own `acquisition` token, which is composed from
+# the case's modality/plane/spacing and is therefore unaffected by `--report-format` too.
 FORMAT_ARMS="${FORMAT_ARMS:-A B C}"
-ALL_ARMS="${ALL_ARMS:-A B C D}"
+ALL_ARMS="${ALL_ARMS:-A B C D E}"
 
 arm_tag() {
     case "$1" in
         A) echo "A_cxr_bert_cls" ;;   B) echo "B_cxr_bert_tokens" ;;
         C) echo "C_radbert_tokens" ;; D) echo "D_report2ct_style" ;;
+        E) echo "E_report2ct_style_meta" ;;
     esac
 }
 
 # Filled in from stage 1's `metrics_summary.csv`. Until then every arm uses the incumbent, and the
 # script says so rather than pretending a sweep already happened.
 declare -A BEST_CFG=( [A]="${BEST_CFG_A:-4.0}" [B]="${BEST_CFG_B:-4.0}"
-                      [C]="${BEST_CFG_C:-4.0}" [D]="${BEST_CFG_D:-4.0}" )
+                      [C]="${BEST_CFG_C:-4.0}" [D]="${BEST_CFG_D:-4.0}"
+                      [E]="${BEST_CFG_E:-4.0}" )
 
 submit() {   # submit <arm> <tag suffix> <n_per_bucket> <cfg> <format> <walltime> [allow_mismatch]
     local arm="$1" suffix="$2" n="$3" cfg="$4" fmt="$5" walltime="$6" allow="${7:-0}"
@@ -132,14 +136,14 @@ TRAINED_FORMAT="${TRAINED_FORMAT:-findings_impression_meta}"
 
 case "$STAGE" in
 cfg)
-    # 4 arms x 5 scales at N_PER_BUCKET (2,000 cases, ~6 h each) = 20 jobs, ~120 GPU-h.
+    # 5 arms x 5 scales at N_PER_BUCKET (2,000 cases, ~6 h each) = 25 jobs, ~150 GPU-h.
     #
     # **This stage used to run at 50/bucket and could not work.** Per-bucket FID compares two
     # 512-d MedicalNet covariances; 50 samples estimates one of rank <= 49, `frechet_distance`
     # rejects the resulting matrix square root as untrustworthy, and on 2026-08-12 that took out
     # all 20 jobs -- 18 to walltime grinding through failing bootstrap resamples, 2 to an uncaught
     # raise that discarded 85 minutes of finished sampling. The cheap-N discount was never real.
-    echo "=== stage 1: guidance-scale sweep (${CFG_VALUES}) at ${N_PER_BUCKET}/bucket"
+    echo "=== stage 1: guidance-scale sweep (${CFG_VALUES}) at ${N_PER_BUCKET}/bucket over ${ALL_ARMS}"
     for arm in $ALL_ARMS; do
         for cfg in $CFG_VALUES; do
             submit "$arm" "cfg${cfg}" "$N_PER_BUCKET" "$cfg" "$TRAINED_FORMAT" "$WALLTIME"
@@ -148,12 +152,12 @@ cfg)
     echo
     echo "When these land, pick the best scale per arm from metrics_summary.csv (overall_pooled"
     echo "and batched_fixed_n on FVD/FID, plus report_consistency), then:"
-    echo "    BEST_CFG_A=... BEST_CFG_B=... BEST_CFG_C=... BEST_CFG_D=... run_sweep.sh format"
+    echo "    BEST_CFG_A=... BEST_CFG_B=... BEST_CFG_C=... BEST_CFG_D=... BEST_CFG_E=... run_sweep.sh format"
     ;;
 format)
-    # 3 arms x 4 formats at 200/bucket = 12 jobs, ~50 GPU-h. D is excluded (format-invariant).
+    # 3 arms x 4 formats at 200/bucket = 12 jobs, ~50 GPU-h. D and E are excluded (format-invariant).
     echo "=== stage 2: report-format robustness at ${N_PER_BUCKET}/bucket"
-    echo "    arms: $FORMAT_ARMS   (D excluded: sectioned fusion never reads the joined string)"
+    echo "    arms: $FORMAT_ARMS   (D, E excluded: sectioned fusion never reads the joined string)"
     for arm in $FORMAT_ARMS; do
         for fmt in $FORMATS_IN_DIST; do
             submit "$arm" "fmt_${fmt}" "$N_PER_BUCKET" "${BEST_CFG[$arm]}" "$fmt" "$WALLTIME" 0
@@ -164,8 +168,9 @@ format)
     done
     ;;
 headline)
-    # The result table: 4 arms, each at its own best scale, one fixed format.
-    echo "=== stage 3: headline four-way at ${N_PER_BUCKET}/bucket"
+    # The result table: every arm at its own best scale, one fixed format. D vs E is the pair to
+    # read for whether the acquisition token earned its place; they are identical otherwise.
+    echo "=== stage 3: headline (${ALL_ARMS}) at ${N_PER_BUCKET}/bucket"
     for arm in $ALL_ARMS; do
         submit "$arm" "headline" "$N_PER_BUCKET" \
             "${BEST_CFG[$arm]}" "$TRAINED_FORMAT" "$WALLTIME"
@@ -175,7 +180,7 @@ all)
     # **Removed, not fixed.** It submitted all three stages at once and its own header claimed
     # they were chained with --dependency=afterany. They were not, and could not be: stages 2 and
     # 3 read BEST_CFG, which does not exist until a human has read stage 1's metrics_summary.csv.
-    # `all` therefore silently pinned 16 of the 36 jobs to the incumbent 4.0 and answered a
+    # `all` therefore silently pinned 17 of the 42 jobs to the incumbent 4.0 and answered a
     # question nobody asked. A dependency cannot substitute for the judgement in between.
     echo "'all' is gone: stages 2 and 3 need BEST_CFG_* from stage 1, which is a human decision." >&2
     echo "Run:  run_sweep.sh cfg   ->  read metrics_summary.csv  ->  BEST_CFG_A=... run_sweep.sh format" >&2

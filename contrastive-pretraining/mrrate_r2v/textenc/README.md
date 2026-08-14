@@ -262,7 +262,7 @@ memory, and a wider conditioning tensor. Only worth it if it measurably helps â€
 
 ---
 
-## Part 4: the four named configurations
+## Part 4: the named configurations
 
 A *configuration* bundles an encoder set, a pooling decision and a report format under one name.
 `--conditioning <name>` selects it; nothing else needs setting.
@@ -273,6 +273,18 @@ A *configuration* bundles an encoder set, a pooling decision and a report format
 | **B** | `cxr_bert_tokens` | CXR-BERT | `(B, n, 768)` + `(B, n)` mask |
 | **C** | `radbert_tokens` | RadBERT | `(B, n, 768)` + `(B, n)` mask |
 | **D** | `report2ct_style` | MedEmbed-large + Bio_ClinicalBERT + CXR-BERT | `(B, 2, 2560)` |
+| **E** | `report2ct_style_meta` | MedEmbed-large + Bio_ClinicalBERT + CXR-BERT | `(B, 3, 2560)` |
+
+**E is D plus one token.** A, B and C put `[MODALITY]/[PLANE]/[SPACING]` at the head of their
+joined string (the `*_meta` formats), so the acquisition metadata reaches their text encoder as
+well as reaching the UNet as `class_labels`/`spacing_tensor`. D encodes each section on its own
+tokenizer and never joins them, so it has nowhere to put that prefix. E gives it a conditioning
+token of its own â€” appended, so findings and impression keep sequence indices 0 and 1 and a D
+result and an E result differ in exactly one token. The section text is composed by the Dataset
+(`data/dataset.py`) from the manifest row and the resolved target spacing, never parsed from the
+report, and is byte-identical to `meta_prefix_for`'s output; inference paths rebuild it with
+`formats.with_acquisition_section`. Unlike impression (absent for 8.9% of studies) it is never
+empty, so its mask entry is always True.
 
 `superseded_radbert_mean` (pooled RadBERT, `(B, 1, 768)`) is out of the lineup but still runnable,
 so adapters trained under it keep loading.

@@ -292,6 +292,7 @@ step. Start here; widening it is an experiment, not a fix.
 | `cxr_bert_tokens` | `(B, n, 768)` + `(B, n)` mask | `R2V_CONFIG=B` |
 | `radbert_tokens` | `(B, n, 768)` + `(B, n)` mask | `R2V_CONFIG=C` |
 | `report2ct_style` | `(B, 2, 2560)` | `R2V_CONFIG=D` |
+| `report2ct_style_meta` | `(B, 3, 2560)` — D + an acquisition-metadata token | `R2V_CONFIG=E` |
 
 `n` is the longest report **in that batch** after tokenisation, capped at `--max-report-tokens`;
 padding is masked out of the attention, so a sample's conditioning never depends on its batchmates.
