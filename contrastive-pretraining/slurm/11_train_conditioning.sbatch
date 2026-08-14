@@ -107,7 +107,19 @@ ARGS=(
 [[ -n "${R2V_REPORT_FORMAT:-}" ]] && ARGS+=(--report-format "$R2V_REPORT_FORMAT")
 [[ "$MAX_STEPS" != "0" ]] && ARGS+=(--max-steps "$MAX_STEPS")
 [[ -n "${R2V_SAVE_EVERY:-}" ]] && ARGS+=(--save-every-steps "$R2V_SAVE_EVERY")
+[[ -n "${R2V_SAVE_EVERY_EPOCHS:-}" ]] && ARGS+=(--save-every-epochs "$R2V_SAVE_EVERY_EPOCHS")
 [[ -n "${R2V_TEXT_POOLING:-}" ]] && ARGS+=(--text-pooling "$R2V_TEXT_POOLING")
+
+# Resume. `R2V_EPOCHS` is how many epochs THIS job runs, not the total -- the trainer continues the
+# absolute epoch numbering from the checkpoint. `R2V_RESUME_LR_SCHEDULE=restart` is what you want
+# when extending a run that finished: its PolynomialLR is at exactly 0 and continuing it trains
+# nothing. The trainer refuses that case rather than running it, so this cannot fail quietly.
+if [[ -n "${R2V_RESUME:-}" ]]; then
+    [[ -f "$R2V_RESUME" ]] || { echo "R2V_RESUME does not exist: $R2V_RESUME" >&2; exit 1; }
+    ARGS+=(--resume "$R2V_RESUME"
+           --resume-lr-schedule "${R2V_RESUME_LR_SCHEDULE:-continue}")
+    echo "=== resuming from $R2V_RESUME (lr schedule: ${R2V_RESUME_LR_SCHEDULE:-continue}) ==="
+fi
 
 # Validation is off by default so a smoke run stays minutes, not hours: each validation step runs a
 # full diffusion sampler over --val-quick-samples cases.
@@ -133,6 +145,7 @@ if [[ -n "${R2V_VALIDATE_EVERY:-}" ]]; then
         --validation-reference "$R2V_VALIDATION_REFERENCE")
     [[ -n "${R2V_VALIDATE_FULL_EVERY:-}" ]] && ARGS+=(--validate-full-every-steps "$R2V_VALIDATE_FULL_EVERY")
     [[ -n "${R2V_VAL_FULL:-}" ]] && ARGS+=(--val-full-samples "$R2V_VAL_FULL")
+    [[ -n "${R2V_VALIDATE_FULL_AT_END:-}" ]] && ARGS+=(--validate-full-at-end)
 else
     ARGS+=(--no-validate-at-end)
 fi

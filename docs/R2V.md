@@ -591,6 +591,49 @@ Caveats that bound all of it: report-volume *semantic* fidelity is still unmeasu
 docstring in `validation.py`), so `ssim_advantage` is a structural stand-in; one seed per arm; and
 FVD/FID at N=512 are still rank-deficient against 512- and 2048-d features.
 
+### Training more epochs onto a finished run
+
+`slurm/final/run_D_continue.sh` is the worked example: two more epochs of configuration D, resumed
+from its `adapter_last.pt`, writing into a **new** run directory (`..._cont`) so `--keep-last-n`
+cannot prune the baseline's checkpoints or overwrite its `train_summary.json`.
+
+**`--resume-lr-schedule restart` is mandatory when the source run finished, and the reason is a
+silent one.** `PolynomialLR` reaches exactly 0 at `total_iters` and stays there. A completed run's
+checkpoint therefore stores a dead schedule *and* an optimizer whose learning rate is already 0 --
+`r2v_final_D_report2ct_style/adapter_last.pt` holds
+`{total_iters: 4493, last_epoch: 4493, _last_lr: [0.0]}`. Plain `--resume` restores both, so the
+continuation trains at LR 0 for its entire walltime: the loss curve looks like a converged model and
+the checkpoint it writes is bit-for-bit its input. `fit` now refuses an exhausted schedule outright
+rather than running it (`test_extending_a_finished_run_refuses_its_dead_lr_schedule`), and `restart`
+discards it and builds a fresh one from `--lr` over the new run's horizon. Adam's moments are kept
+either way -- they describe the loss surface, not the schedule.
+
+Two settings that a resume makes different from a fresh run, both deliberate:
+
+* **`--epochs` and `--max-steps` count what *this* job does**, not the model's history. The epoch
+  *numbering* is still absolute, so a continuation logs and checkpoints epochs 3 and 4
+  (`adapter_epoch003.pt`, `adapter_epoch004.pt`) and never replays epoch 0's shuffle seed.
+* **Save intervals are anchored at the resumed step.** Anchored at 0, `4493 // 600 > 0 // 600` fires
+  a validation, a full validation and a checkpoint on the *first* optimizer step after every resume.
+
+Pick the restart LR against what the adapter is now, not against the sweep. The sweep's 1e-3 is the
+right peak for a run starting from a zero-init projection; a converged adapter re-entered at full
+peak spends its first epoch undoing its last. D's continuation uses **3e-4** (power 2 over 4,493
+steps → mean ~1e-4).
+
+Use `--save-every-epochs 1`. An epoch boundary is not a multiple of `--save-every-steps` in general
+(2 epochs of D is 4,493 optimizer steps, so the boundary sits at 2246.5), and `adapter_epoch*.pt` is
+outside `--keep-last-n`'s glob, so retention cannot delete the checkpoint the next decision rests on.
+
+**Budget from the measured number, not the estimate in `_final_common.sh`'s header.** The four
+completed arms took **22.17 h** for 2 epochs, of which only 0.47 h was validation → **10.85 h of
+training per epoch**. Three epochs does not fit `h200`'s hard 24 h cap at all; two fit with ~1.8 h of
+margin. Past that there is only `preempt` (48 h), which is survivable now that resume works but
+still loses everything since the last checkpoint.
+
+Smoke it first — `SMOKE=1 NODES=1 slurm/final/run_D_continue.sh` carries the resume flags (they sit
+outside the SMOKE branch on purpose), so it exercises the exact code path the long job takes.
+
 ### How often to validate, and on how many cases
 
 Every validation case costs a full diffusion sampling run, so this is a real budget. Measured at

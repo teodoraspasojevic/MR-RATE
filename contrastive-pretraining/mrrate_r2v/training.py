@@ -227,6 +227,11 @@ class TrainingConfig:
     # All three count **optimizer** steps, not micro-steps, so their meaning does not change with
     # grad_accumulation_steps. `self.step` remains the micro-step counter for resume compatibility.
     save_every_steps: Optional[int] = None
+    #: Epochs between end-of-epoch checkpoints (`adapter_epoch<N>.pt`, absolute epoch number so a
+    #: resumed run continues the numbering). Counted in epochs, not steps, because an epoch boundary
+    #: does not land on a multiple of `save_every_steps` in general -- 2 epochs of configuration D
+    #: is 4493 optimizer steps, so the boundary sits at 2246.5. Never pruned by `keep_last_n`.
+    save_every_epochs: Optional[int] = None
     validate_every_steps: Optional[int] = None
     validate_full_every_steps: Optional[int] = None
     validate_at_end: bool = True
@@ -313,6 +318,10 @@ class MRRateAdapterTrainer:
         self.step = 0            # micro-steps (one per forward/backward)
         self.optimizer_step = 0  # optimizer steps -- what every interval and every log is keyed on
         self.epoch = 0
+        #: First epoch index `fit` will run. Advanced past the resumed epoch by `load_for_resume` so
+        #: a continuation does not replay the original run's epoch-0 shuffle (and, under
+        #: `series_selection="one_per_study_random"`, its epoch-0 series draw) as its first epoch.
+        self.start_epoch = 0
         # Lower-is-better and higher-is-better tracked separately, both persisted, so a resumed run
         # does not overwrite a better checkpoint with a worse one on its first validation.
         self.best_metrics: dict = {"fvd": None, "fid_2p5d": None, "ssim": None}
@@ -576,6 +585,12 @@ class MRRateAdapterTrainer:
         here so the trainer keeps no dependency on the sampler or the feature extractor.
         """
         micro_per_epoch = max(len(train_loader), 1)
+        # Both budgets count what THIS invocation does, not the model's whole history: `n_epochs` is
+        # epochs to run and `max_steps` is micro-steps to run. Measuring `max_steps` against the
+        # cumulative `self.step` instead made it meaningless after a resume -- the D checkpoint is at
+        # micro-step 17972, so any smoke-sized cap was already exceeded before the first batch and
+        # the job stopped one micro-step in while reporting that it had honoured the cap.
+        start_step = self.step
         total_micro = self.config.max_steps or int(self.config.n_epochs * micro_per_epoch)
         # `PolynomialLR` is stepped once per *optimizer* step, so its horizon must be counted in
         # optimizer steps -- but both `max_steps` and `len(train_loader)` are micro-step counts.
@@ -586,13 +601,35 @@ class MRRateAdapterTrainer:
         total_steps = max(1, total_micro // self.config.grad_accumulation_steps)
         if self.lr_scheduler is None:
             self.lr_scheduler = build_scheduler(self.optimizer, total_steps)
+        # A `PolynomialLR` restored from a run that finished is at `last_epoch == total_iters`, where
+        # it returns exactly 0 and never rises again. Training on would be a silent no-op for the
+        # whole job, so it is refused here rather than discovered in the loss curve afterwards.
+        exhausted = getattr(self.lr_scheduler, "total_iters", None)
+        if exhausted is not None and self.lr_scheduler.last_epoch >= exhausted:
+            raise RuntimeError(
+                f"the resumed LR schedule is exhausted (last_epoch="
+                f"{self.lr_scheduler.last_epoch} >= total_iters={exhausted}), so it would hold the "
+                f"learning rate at {self.lr_scheduler.get_last_lr()} for all {total_steps} optimizer "
+                "steps of this run and train nothing. This is what extending a completed run looks "
+                "like: pass --resume-lr-schedule restart (with --lr set to the peak you want the "
+                "new schedule to start from) instead of continuing the old one."
+            )
         history, validations = [], []
         start = time.time()
         # Intervals fire on the optimizer step *transition*, so an interval is never missed and
         # never fires twice for one optimizer step (which `step % N` on micro-steps would do
         # whenever grad_accumulation_steps > 1).
-        last_validated = last_saved = last_full = 0
-        for epoch in range(self.config.n_epochs):
+        # Anchored at the *current* optimizer step, not at 0. A resumed run starts at step 4493, and
+        # `4493 // 600 > 0 // 600` is true, so anchoring at 0 fired a validation, a full validation
+        # and a checkpoint save all on the first optimizer step after every resume.
+        last_validated = last_saved = last_full = self.optimizer_step
+        # `n_epochs` is how many epochs *this* invocation runs; `start_epoch` is where they sit in
+        # the model's whole training history (0 for a fresh run, past the resumed epoch otherwise).
+        # Every epoch number that leaves this loop -- the log line, the W&B curve, the checkpoint
+        # filename, `train_summary.json` -- is the absolute one, so a continuation reads as epochs
+        # 3-4 rather than as a second run of epochs 1-2.
+        for offset in range(self.config.n_epochs):
+            epoch = self.start_epoch + offset
             self.epoch = epoch
             set_loader_epoch(train_loader, epoch)
             for batch in train_loader:
@@ -647,9 +684,18 @@ class MRRateAdapterTrainer:
                                   loss=metrics["loss"])
                         self._prune_checkpoints()
 
-                if self.config.max_steps and self.step >= self.config.max_steps:
+                if self.config.max_steps and self.step - start_step >= self.config.max_steps:
                     break
-            if self.config.max_steps and self.step >= self.config.max_steps:
+            stopped_early = bool(self.config.max_steps
+                                 and self.step - start_step >= self.config.max_steps)
+            # Only for an epoch that actually ran to its end: a `max_steps` break leaves a partial
+            # epoch, and a file named for it would claim a pass over the data that did not happen.
+            if (self.config.save_every_epochs and self.local_rank == 0 and not stopped_early
+                    and (offset + 1) % self.config.save_every_epochs == 0):
+                self.save(self.output_dir / f"adapter_epoch{epoch + 1:03d}.pt",
+                          loss=history[-1]["loss"] if history else None,
+                          validation=validations[-1] if validations else None)
+            if stopped_early:
                 break
 
         if self.config.validate_at_end and validate is not None:
@@ -664,7 +710,11 @@ class MRRateAdapterTrainer:
             # Belongs in the summary, not only in the log: a run whose numbers look fine but which
             # skipped a third of its steps trained on a different dataset than it claims to have.
             "skipped_steps": self.skipped_steps,
+            # Cumulative across resumes, not this job's `n_epochs`: with `start_epoch` beside it the
+            # two are always separable, and the cumulative count is the one that describes the
+            # weights the run produced.
             "epochs": self.epoch + 1,
+            "start_epoch": self.start_epoch,
             "seconds": time.time() - start,
             "final_loss": history[-1]["loss"] if history else None,
             "mean_loss": sum(h["loss"] for h in history) / len(history) if history else None,
@@ -734,7 +784,28 @@ class MRRateAdapterTrainer:
             written = written or full_path
         return written
 
-    def load_for_resume(self, path) -> dict:
+    def load_for_resume(self, path, lr_schedule: str = "continue") -> dict:
+        """Restore weights, optimizer, RNG and counters from an adapter checkpoint.
+
+        `lr_schedule` decides what happens to the learning rate, and it is the one thing a resume
+        cannot get right on its own:
+
+        * ``continue`` -- restore the stored `PolynomialLR` and carry on down it. Correct when the
+          original run was cut short (preemption, walltime) and the remaining horizon is the one the
+          schedule was built for.
+        * ``restart`` -- discard the stored schedule and LR, and build a fresh `PolynomialLR` from
+          ``config.lr`` over *this* run's horizon. Required when extending a run that already ran to
+          completion, because `PolynomialLR` reaches exactly 0 at `total_iters` and stays there:
+          `r2v_final_D_report2ct_style/adapter_last.pt` stores
+          ``{total_iters: 4493, last_epoch: 4493, _last_lr: [0.0]}`` and an optimizer whose
+          ``param_groups[0]["lr"]`` is ``0.0``. Continuing that schedule trains at LR 0 -- a silent
+          no-op that burns the whole walltime and writes a checkpoint identical to its input.
+
+        `fit` refuses to run a restored schedule that is already exhausted, so the failure above is
+        an error rather than a wasted job.
+        """
+        if lr_schedule not in ("continue", "restart"):
+            raise ValueError(f"lr_schedule must be continue|restart, got {lr_schedule!r}")
         from .models.adapter import load_adapter_checkpoint
 
         payload = load_adapter_checkpoint(
@@ -747,7 +818,19 @@ class MRRateAdapterTrainer:
         )
         if payload.get("optimizer_state_dict"):
             self.optimizer.load_state_dict(payload["optimizer_state_dict"])
-        if payload.get("lr_scheduler_state_dict"):
+        if lr_schedule == "restart":
+            # Adam's moments are kept -- they are a property of the loss surface, not of the
+            # schedule -- but `lr` and `initial_lr` come back from the checkpoint too, and
+            # `initial_lr` is what a newly built LRScheduler adopts as its `base_lrs`. Left alone,
+            # a fresh schedule would restart from the *old* peak, or from 0.
+            for group in self.optimizer.param_groups:
+                group["lr"] = self.config.lr
+                group["initial_lr"] = self.config.lr
+            # `fit` builds the new schedule, because only it knows the new horizon.
+            self.lr_scheduler = None
+            log.info("resume: LR schedule restarted at %.3e over this run's horizon "
+                     "(stored schedule discarded)", self.config.lr)
+        elif payload.get("lr_scheduler_state_dict"):
             if self.lr_scheduler is None:
                 self.lr_scheduler = build_scheduler(self.optimizer, 1)
             self.lr_scheduler.load_state_dict(payload["lr_scheduler_state_dict"])
@@ -766,6 +849,11 @@ class MRRateAdapterTrainer:
         self.step = int(payload.get("step", 0))
         self.optimizer_step = int(payload.get("optimizer_step", self.step))
         self.epoch = int(payload.get("epoch", 0))
+        # The stored `epoch` is the index of the epoch in progress when the checkpoint was written,
+        # so the next one to run is the one after it. A mid-epoch checkpoint therefore loses the
+        # remainder of its epoch rather than replaying its first half -- the honest trade at an
+        # epoch granularity this coarse (10.85 h), and it keeps every epoch's shuffle seed distinct.
+        self.start_epoch = self.epoch + 1
         stored_best = payload.get("best_metrics") or {}
         # Carried forward so the first validation after a resume cannot overwrite a better
         # checkpoint with a worse one just because this process has not seen a score yet.

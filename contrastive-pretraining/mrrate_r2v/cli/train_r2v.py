@@ -181,7 +181,9 @@ def parse_args(argv=None):
     train = p.add_argument_group("optimisation")
     train.add_argument("--out", type=Path, required=True, help="output directory for checkpoints")
     train.add_argument("--epochs", type=int, default=1)
-    train.add_argument("--max-steps", type=int, default=None)
+    train.add_argument("--max-steps", type=int, default=None,
+                       help="micro-steps to run in THIS invocation (like --epochs, not cumulative "
+                            "across a --resume)")
     train.add_argument("--batch-size", type=int, default=1)
     train.add_argument("--lr", type=float, default=1e-5, help="NVIDIA's own diffusion_unet_train.lr")
     train.add_argument("--grad-accumulation-steps", type=int, default=1)
@@ -202,12 +204,25 @@ def parse_args(argv=None):
     train.add_argument("--log-every", type=int, default=10)
     train.add_argument("--save-every-steps", type=int, default=None,
                        help="optimizer steps between periodic checkpoints")
+    train.add_argument("--save-every-epochs", type=int, default=None,
+                       help="epochs between end-of-epoch checkpoints (adapter_epoch<N>.pt, "
+                            "absolute epoch number, never pruned by --keep-last-n). An epoch "
+                            "boundary is not a multiple of --save-every-steps in general, so this "
+                            "is the only way to get a checkpoint that is exactly one epoch")
     train.add_argument("--validate-every-steps", type=int, default=None,
                        help="optimizer steps between validation passes (not micro-steps)")
     train.add_argument("--keep-last-n", type=int, default=3,
                        help="periodic checkpoints to retain; 'last' and 'best_*' are never pruned")
     train.add_argument("--save-format", default="adapter", choices=["adapter", "full", "both"])
     train.add_argument("--resume", type=Path, default=None, help="adapter checkpoint to resume from")
+    train.add_argument("--resume-lr-schedule", default="continue", choices=["continue", "restart"],
+                       help="'continue' (default): carry on down the checkpoint's PolynomialLR -- "
+                            "for a run cut short by preemption or walltime. 'restart': discard it "
+                            "and build a fresh one from --lr over this run's horizon -- required "
+                            "when extending a run that COMPLETED, because PolynomialLR reaches "
+                            "exactly 0 at its horizon and stays there, so continuing would train "
+                            "at LR 0. The trainer refuses an exhausted schedule rather than "
+                            "running it")
     train.add_argument("--scale-factor", default="auto",
                        help="'auto' = from the base checkpoint (matches official inference), "
                             "'recompute' = 1/std(z) of the first batch (official training), or a literal")
@@ -783,7 +798,8 @@ def main(argv=None) -> int:
         lr=args.lr, n_epochs=args.epochs, max_steps=args.max_steps, batch_size=args.batch_size,
         grad_accumulation_steps=args.grad_accumulation_steps, grad_clip_norm=args.grad_clip_norm,
         amp=args.amp, amp_dtype=args.amp_dtype, seed=args.seed, log_every=args.log_every,
-        save_every_steps=args.save_every_steps, validate_every_steps=args.validate_every_steps,
+        save_every_steps=args.save_every_steps, save_every_epochs=args.save_every_epochs,
+        validate_every_steps=args.validate_every_steps,
         validate_full_every_steps=args.validate_full_every_steps,
         validate_at_end=args.validate_at_end, validate_full_at_end=args.validate_full_at_end,
         keep_last_n=args.keep_last_n, save_format=args.save_format,
@@ -803,7 +819,7 @@ def main(argv=None) -> int:
         local_rank=rank, wandb_run=wandb_run,
     )
     if args.resume:
-        trainer.load_for_resume(args.resume)
+        trainer.load_for_resume(args.resume, lr_schedule=args.resume_lr_schedule)
 
     validate = None
     if validation_dataset is not None:

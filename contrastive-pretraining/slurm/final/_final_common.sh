@@ -90,9 +90,14 @@ EPOCHS=2
 # days. Lower this to ~16 h if the jobs sit pending.
 #
 # Past 24 h there is only the `preempt` partition (48 h, and the account has the QOS), where a job
-# can be killed at any moment by higher-priority work. That is survivable only with checkpoint
-# resume, and `--resume` is NOT plumbed into 11_train_conditioning.sbatch today -- so treat 24 h as
-# the real limit until it is.
+# can be killed at any moment by higher-priority work. That is survivable with checkpoint resume,
+# which `R2V_RESUME` / `R2V_RESUME_LR_SCHEDULE` now plumb into 11_train_conditioning.sbatch (see
+# run_D_continue.sh) -- but a preempted job still loses everything since its last checkpoint, so
+# pair it with `SAVE_EVERY_EPOCHS=1` or a tight `VALIDATE_EVERY`.
+#
+# **Measured, and 2x the estimate above**: the four completed arms took 22.17 h for 2 epochs
+# (r2v_final_D_report2ct_style/train_summary.json), of which only 0.47 h was validation. So an epoch
+# is ~10.85 h of training, three epochs do not fit on h200 at all, and two fit with ~1.8 h of margin.
 WALLTIME=24:00:00
 
 # ---------------------------------------------------------------- validation
@@ -191,6 +196,23 @@ submit_final_run() {
             echo "W&B online needs WANDB_API_KEY exported, or 'wandb login' run once." >&2
             exit 1
         fi
+    fi
+
+    # ------------------------------------------------------------ continuation knobs
+    #
+    # Outside the SMOKE/real branch on purpose: a smoke that skipped the resume flags would validate
+    # a code path the real job does not take, which is the one thing a smoke must never do. All of
+    # these are unset for the original A-E runs, so those still submit exactly as they did;
+    # run_D_continue.sh is the only caller that sets them.
+    [[ -n "${SAVE_EVERY_EPOCHS:-}" ]] && exports+=",R2V_SAVE_EVERY_EPOCHS=${SAVE_EVERY_EPOCHS}"
+    [[ -n "${VALIDATE_FULL_AT_END:-}" && "$SMOKE" != "1" ]] && exports+=",R2V_VALIDATE_FULL_AT_END=1"
+    if [[ -n "${RESUME_FROM:-}" ]]; then
+        [[ -f "$RESUME_FROM" ]] || { echo "RESUME_FROM does not exist: $RESUME_FROM" >&2; exit 1; }
+        exports+=",R2V_RESUME=${RESUME_FROM}"
+        # `restart` is the default here rather than the trainer's `continue`, because the only reason
+        # to resume from this launcher is to extend a run that finished -- and `continue` on a
+        # finished run is the LR-0 no-op the trainer refuses.
+        exports+=",R2V_RESUME_LR_SCHEDULE=${RESUME_LR_SCHEDULE:-restart}"
     fi
     exports+=",R2V_TAG=${tag}"
 
