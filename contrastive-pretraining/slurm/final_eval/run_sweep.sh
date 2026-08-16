@@ -36,7 +36,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/_final_eval_common.sh"
 # Not `${1:?...}` with braces in the message: bash ends the expansion at the FIRST `}`, so the
 # stray one lands in the value and every stage name arrives as e.g. "cfg}".
 STAGE="${1:-}"
-[[ -n "$STAGE" ]] || { echo "usage: run_sweep.sh <cfg|format|headline|all>" >&2; exit 1; }
+[[ -n "$STAGE" ]] || { echo "usage: run_sweep.sh <cfg|format|headline|representative|unbalanced|all>" >&2; exit 1; }
 
 # ---------------------------------------------------------------- the axes
 #
@@ -109,7 +109,17 @@ submit() {   # submit <arm> <tag suffix> <n_per_bucket> <cfg> <format> <walltime
     exports+=",R2V_WANDB=${WANDB_MODE},R2V_WANDB_PROJECT=${WANDB_PROJECT}"
     exports+=",R2V_WANDB_GROUP=sweep_${STAGE},R2V_WANDB_NAME=${tag}"
     exports+=",R2V_WANDB_PANELS=${WANDB_PANELS},R2V_WANDB_REPORTS=${WANDB_REPORTS}"
-    exports+=",R2V_N_PER_BUCKET=${n}"
+    # CASE_TOTAL replaces per-bucket balancing with one draw over the whole split. The two are
+    # mutually exclusive and the CLI refuses both, so this is an if/else rather than two appends.
+    if [[ -n "${CASE_TOTAL:-}" ]]; then
+        exports+=",R2V_N_TOTAL=${CASE_TOTAL}"
+    else
+        exports+=",R2V_N_PER_BUCKET=${n}"
+    fi
+    # Random case selection instead of the first-N prefix. Only the `representative` and
+    # `unbalanced` stages set this; every other stage leaves it empty so its runs stay
+    # prefix-nested with the 20 cfg jobs.
+    [[ -n "${CASE_SELECTION_SEED:-}" ]] && exports+=",R2V_CASE_SELECTION_SEED=${CASE_SELECTION_SEED}"
     # No `--frechet-batch-size` override any more. It existed because the old 50/bucket stage could
     # not fill a 512-case batch; every stage now runs at N_PER_BUCKET so the default 512 applies
     # everywhere, which is what keeps `overall_batched_n512` comparable across every job.
@@ -176,6 +186,94 @@ headline)
             "${BEST_CFG[$arm]}" "$TRAINED_FORMAT" "$WALLTIME"
     done
     ;;
+representative)
+    # **Why this stage exists.** Every other stage takes the FIRST N per bucket of the
+    # (study_uid, series_id) order. That is a convenience sample, and on the MR-RATE test split it
+    # is measurably skewed against the 27,027 cases it leaves out (measured 2026-08-14, one row per
+    # study per bucket, joined to splits_merged_majority):
+    #
+    #     PP_Cerebrovascular       prefix 14.43%  rest 11.41%   two-proportion z = +4.06
+    #     BP_Hemorrhagic_lesions   prefix 10.92%  rest  8.38%                   z = +3.91
+    #     PP_Spinal                prefix  0.75%  rest  1.79%                   z = -3.45
+    #
+    # all three surviving Bonferroni over 14 labels. Summed absolute deviation from population
+    # prevalence is 0.146 for the prefix; **all 20 seeds tested (0-19) score lower**, median 0.070.
+    # So the skew is a property of the prefix, not an unlucky draw: a prefix run answers "how does
+    # the model do on these 2,000 cases", and only a seeded draw answers "on this split".
+    #
+    # This bites `report_consistency` hardest: PP_Cerebrovascular is configuration D's single best
+    # label (AUROC 0.563 at cfg 4.0) and the prefix over-represents it by 26% relative.
+    #
+    # Seed 42 is the repo's standard, chosen a priori rather than by taking the most favourable
+    # draw -- it scores 0.092 (0.63x the prefix), mid-pack rather than best.
+    #
+    # The tag carries `_rand<seed>`, and `run_id`/`cases_sha256` differ, so these can neither
+    # overwrite nor be confused with the prefix runs. **They are NOT case-by-case comparable with
+    # the 20 cfg jobs** -- different case list, so no paired per-case test across the two sets.
+    # They ARE comparable to each other: one case list shared across the cfg values.
+    CASE_SELECTION_SEED="${CASE_SELECTION_SEED:-42}"
+    REPRESENTATIVE_ARMS="${REPRESENTATIVE_ARMS:-D}"
+    REPRESENTATIVE_CFG="${REPRESENTATIVE_CFG:-3.0 4.0}"
+    echo "=== representative: RANDOM ${N_PER_BUCKET}/bucket, case-selection seed ${CASE_SELECTION_SEED}"
+    echo "    arms: $REPRESENTATIVE_ARMS   cfg: $REPRESENTATIVE_CFG"
+    for arm in $REPRESENTATIVE_ARMS; do
+        for cfg in $REPRESENTATIVE_CFG; do
+            submit "$arm" "cfg${cfg}_rand${CASE_SELECTION_SEED}" "$N_PER_BUCKET" \
+                "$cfg" "$TRAINED_FORMAT" "$WALLTIME"
+        done
+    done
+    ;;
+unbalanced)
+    # **The `representative` stage fixed WHICH cases; this one fixes the MIXTURE.**
+    #
+    # Every other stage forces all ten (modality, plane) buckets to the same size, so `overall_*`
+    # describes a 10%-each population that does not exist in the data. Measured shares, one row per
+    # study per bucket over the 29,027-case test split -- and the all-series shares training
+    # actually saw, which track them within ~2pp:
+    #
+    #     bucket           training %   eligible %   balanced n   unbalanced n
+    #     T2w AXIAL            15.86        16.27          200            ~325
+    #     T1w AXIAL            15.87        13.81          200            ~276
+    #     FLAIR SAGITTAL       10.81        12.04          200            ~241
+    #     SWI AXIAL            11.46        11.63          200            ~233
+    #     FLAIR AXIAL           9.97        11.53          200            ~231
+    #     T1w SAGITTAL         12.60        10.46          200            ~209
+    #     T2w CORONAL           6.87         7.96          200            ~159
+    #     T1w CORONAL           7.12         6.07          200            ~121
+    #     FLAIR CORONAL         5.13         5.77          200            ~115
+    #     T2w SAGITTAL          4.31         4.47          200             ~89
+    #
+    # Balancing more than doubles the rarest bucket's weight and nearly halves T1w AXIAL's. Training
+    # used `series_selection="all"` with every series seen once per epoch, i.e. no balancing at all,
+    # so this draw is the closer match to training statistics -- and to the challenge, which scores
+    # one distance over its whole hidden set.
+    #
+    # **Simple random, not proportional-stratified**, by choice: bucket counts land where the draw
+    # puts them (multinomial, so the ~89 above is +/-9), which carries the same sampling variance a
+    # real submission would and assumes nothing about the allocation.
+    #
+    # The cost, stated rather than discovered later: unequal bucket counts make `overall_macro`
+    # meaningless -- read `overall_pooled` and `overall_weighted` -- and thin the small buckets'
+    # per-bucket FID/FVD. Those are *already* rank-deficient at 200/bucket (200 < 512 feature dims,
+    # all ten flagged in every completed run), so this worsens a known limitation rather than
+    # introducing one. 89 still clears the n<50 `unstable_small_sample` threshold, and a Frechet
+    # that cannot be computed now returns null with a reason instead of killing the job.
+    #
+    # Tag carries `_all<total>_rand<seed>`. Third distinct population, so NO case-level comparison
+    # with either the prefix runs or the `representative` ones.
+    CASE_SELECTION_SEED="${CASE_SELECTION_SEED:-42}"
+    CASE_TOTAL="${CASE_TOTAL:-2000}"
+    UNBALANCED_ARMS="${UNBALANCED_ARMS:-D}"
+    UNBALANCED_CFG="${UNBALANCED_CFG:-3.0 4.0}"
+    echo "=== unbalanced: RANDOM ${CASE_TOTAL} over the whole split, seed ${CASE_SELECTION_SEED}"
+    echo "    arms: $UNBALANCED_ARMS   cfg: $UNBALANCED_CFG   (buckets at population frequency)"
+    for arm in $UNBALANCED_ARMS; do
+        for cfg in $UNBALANCED_CFG; do
+            submit "$arm" "cfg${cfg}_all${CASE_TOTAL}_rand${CASE_SELECTION_SEED}" \
+                "$N_PER_BUCKET" "$cfg" "$TRAINED_FORMAT" "$WALLTIME"
+        done
+    done
+    ;;
 all)
     # **Removed, not fixed.** It submitted all three stages at once and its own header claimed
     # they were chained with --dependency=afterany. They were not, and could not be: stages 2 and
@@ -187,5 +285,5 @@ all)
     exit 1
     ;;
 *)
-    echo "unknown stage '$STAGE' (cfg | format | headline | all)" >&2; exit 1 ;;
+    echo "unknown stage '$STAGE' (cfg | format | headline | representative | unbalanced | all)" >&2; exit 1 ;;
 esac

@@ -119,8 +119,10 @@ class LiveCase:
         return hashlib.sha256(str(self.study_key).encode()).hexdigest()[:16]
 
 
-def select_eval_cases(dataset, n_per_bucket: int | None = None) -> list:
-    """Dataset indices to evaluate, in a deterministic bucket-interleaved order. **No RNG.**
+def select_eval_cases(dataset, n_per_bucket: int | None = None,
+                      selection_seed: int | None = None,
+                      n_total: int | None = None) -> list:
+    """Dataset indices to evaluate, in a deterministic bucket-interleaved order. **No RNG by default.**
 
     Two properties, both load-bearing:
 
@@ -135,7 +137,56 @@ def select_eval_cases(dataset, n_per_bucket: int | None = None) -> list:
     `n_per_bucket=None` (the default) evaluates **every** case in the split -- which is what CTFlow
     does on CT-RATE's validation set, and what removes "which subset?" from the list of things a
     reader has to trust.
+
+    **`selection_seed` trades prefix-stability for representativeness, and is opt-in.** The prefix
+    is a *convenience* sample, not a random one: it is the `n_per_bucket` lexicographically smallest
+    `study_uid`s in each bucket, and on the MR-RATE test split those differ measurably from the rest
+    of the population -- `PP_Cerebrovascular` 14.4% vs 11.4% and `BP_Hemorrhagic_lesions` 10.9% vs
+    8.4% over the remaining 27,027 eligible cases (two-proportion z = 4.06 and 3.91, both surviving
+    Bonferroni over 14 labels). Measured 2026-08-14. So a prefix run answers "how does the model do
+    on these 2,000 cases", and only a seeded draw answers "how does it do on this split".
+
+    With a seed, a bucket that has more candidates than `n_per_bucket` is sampled without
+    replacement instead of truncated. Two details make it reproducible rather than merely random,
+    matching `cohort.select_cohort_buckets`:
+
+    - candidates are sorted **before** sampling, so the draw depends on the data rather than on
+      manifest row order;
+    - a fresh `RandomState` per bucket, so which buckets you ask for can never shift another
+      bucket's draw.
+
+    Prefix-stability is *deliberately* not preserved here: a seeded 200/bucket run is not a subset
+    of a seeded 400/bucket run, and the two are not nested populations. `cases_sha256` and `run_id`
+    both change, so a seeded run can never be mistaken for a prefix run in the results.
+
+    **`n_total` drops per-bucket balancing entirely** and draws that many cases from the whole split
+    at once, so each bucket appears at its *population* frequency instead of at 1/n_buckets. It is
+    mutually exclusive with `n_per_bucket` and requires `selection_seed`.
+
+    Why it exists: training saw every series exactly once per epoch with no balancing
+    (`cli/train_r2v.py` uses `series_selection="all"`), and the natural bucket mix ranges from 4.5%
+    (T2w SAGITTAL) to 16.3% (T2w AXIAL). A 200-per-bucket cohort forces all ten to 10%, which more
+    than doubles the rarest bucket's weight and nearly halves T1w AXIAL's. So `overall_pooled`
+    FID/FVD from a balanced cohort is a distance over a mixture that does not exist in the data;
+    with `n_total` it estimates the population value, which is also what the challenge computes
+    (one distance over the whole hidden set, no per-bucket balancing).
+
+    The cost, and it is real: bucket counts become unequal and the small ones get thin (~89 for
+    T2w SAGITTAL at `n_total=2000`), so **per-bucket** distribution metrics get noisier and
+    `overall_macro` stops being meaningful -- read `overall_pooled` and `overall_weighted`. Note
+    per-bucket FID/FVD is *already* rank-deficient at 200/bucket (200 < 512 feature dims), so this
+    worsens a known limitation rather than introducing one.
     """
+    if n_total is not None:
+        if n_per_bucket is not None:
+            raise ValueError("n_total and n_per_bucket are mutually exclusive: the first draws "
+                             "across the whole split at population frequencies, the second forces "
+                             "every bucket to the same size. Pick one.")
+        if selection_seed is None:
+            raise ValueError("n_total requires selection_seed -- an unseeded 'random' subset would "
+                             "be unreproducible, and taking a deterministic prefix of the flat list "
+                             "is exactly the biased selection n_total exists to avoid.")
+
     by_bucket: dict = {}
     for index, sample in enumerate(dataset.samples):
         key = (sample.modality or "unknown", sample.plane or "unknown")
@@ -146,7 +197,33 @@ def select_eval_cases(dataset, n_per_bucket: int | None = None) -> list:
             key=lambda i: (str(dataset.samples[i].study_uid), str(dataset.samples[i].series_id))
         )
         if n_per_bucket is not None and len(by_bucket[key]) > n_per_bucket:
-            by_bucket[key] = by_bucket[key][:n_per_bucket]
+            if selection_seed is None:
+                by_bucket[key] = by_bucket[key][:n_per_bucket]
+            else:
+                import numpy as np
+
+                rng = np.random.RandomState(selection_seed)
+                picked = sorted(rng.choice(len(by_bucket[key]), size=n_per_bucket,
+                                           replace=False).tolist())
+                by_bucket[key] = [by_bucket[key][p] for p in picked]
+
+    if n_total is not None:
+        import numpy as np
+
+        # One draw over the concatenation of the per-bucket sorted lists, in sorted bucket order --
+        # so the candidate pool is a function of the data, not of dict iteration order. Buckets are
+        # NOT sampled separately: that would re-impose an allocation, which is the thing being
+        # removed. The result is regrouped and interleaved below, so the ordering guarantees the
+        # streaming evaluator relies on (every bucket represented early) still hold.
+        flat = [index for key in sorted(by_bucket) for index in by_bucket[key]]
+        if n_total > len(flat):
+            raise ValueError(f"n_total={n_total} exceeds the {len(flat)} cases in this split")
+        rng = np.random.RandomState(selection_seed)
+        kept = set(rng.choice(len(flat), size=n_total, replace=False).tolist())
+        keep_indices = {flat[p] for p in kept}
+        by_bucket = {key: [i for i in members if i in keep_indices]
+                     for key, members in by_bucket.items()}
+        by_bucket = {key: members for key, members in by_bucket.items() if members}
 
     ordered: list = []
     columns = [by_bucket[key] for key in sorted(by_bucket)]
@@ -278,7 +355,8 @@ class LiveCohortView:
 
 
 def run_fingerprint(*, split: str, cases, geometry: dict, task: str, n_per_bucket, seed: int,
-                    model_identity: dict) -> str:
+                    model_identity: dict, case_selection_seed: int | None = None,
+                    n_total: int | None = None) -> str:
     """The comparability hash: same value, same experiment.
 
     Covers the ordered case list (by `(study_key, series_key)`, so it identifies *which* cases
@@ -286,6 +364,11 @@ def run_fingerprint(*, split: str, cases, geometry: dict, task: str, n_per_bucke
     voxel, the task, the sample cap and the model checkpoint. This is `cohort_id` recomputed from
     the run instead of read from a directory -- and unlike `cohort_id` it cannot go stale, because
     there is no artifact to go stale relative to.
+
+    `case_selection_seed` and `n_total` enter the payload **only when set**, so every
+    prefix-selected run keeps the hash it was recorded with. A seeded or unbalanced draw already
+    changes `cases` and therefore the hash; carrying the parameters as well makes the reason legible
+    rather than merely implied.
     """
     payload = {
         "live_evaluation_version": LIVE_EVALUATION_VERSION,
@@ -297,6 +380,10 @@ def run_fingerprint(*, split: str, cases, geometry: dict, task: str, n_per_bucke
         "model": model_identity,
         "cases": [[c.study_key, c.series_key] for c in cases],
     }
+    if case_selection_seed is not None:
+        payload["case_selection_seed"] = case_selection_seed
+    if n_total is not None:
+        payload["n_total"] = n_total
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode()
     ).hexdigest()[:16]

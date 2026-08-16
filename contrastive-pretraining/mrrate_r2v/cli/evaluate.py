@@ -92,13 +92,34 @@ def parse_args(argv=None):
                       choices=["percentile", "zscore", "minmax"])
     data.add_argument("--num-workers", type=int, default=4)
 
-    sel = p.add_argument_group("case selection (deterministic, no RNG)")
+    sel = p.add_argument_group("case selection (deterministic, no RNG unless --case-selection-seed)")
     sel.add_argument("--n-per-bucket", type=int, default=None,
                      help="cases per (modality, plane). Default: the ENTIRE split. The cap keeps "
                           "the first N of the same deterministic order, so it is a prefix of the "
                           "full run, never a different sample")
     sel.add_argument("--seed", type=int, default=42,
-                     help="seeds sampler noise only -- case selection uses no RNG at all")
+                     help="seeds sampler noise only -- case selection uses no RNG unless "
+                          "--case-selection-seed is given")
+    sel.add_argument("--n-total", type=int, default=None,
+                     # Percent signs doubled: argparse %%-formats help strings.
+                     help="draw this many cases from the WHOLE split instead of N per bucket, so "
+                          "every (modality, plane) appears at its population frequency (4.5%% to "
+                          "16.3%%) rather than forced to 1/10th each. Mutually exclusive with "
+                          "--n-per-bucket; requires --case-selection-seed. This is the mixture "
+                          "training saw (series_selection='all', no balancing) and the one the "
+                          "challenge scores. Cost: unequal bucket counts, the smallest ~89 at "
+                          "--n-total 2000, so per-bucket distribution metrics get noisier and "
+                          "overall_macro stops being meaningful -- read overall_pooled instead")
+    sel.add_argument("--case-selection-seed", type=int, default=None,
+                     # Literal percent signs must be doubled: argparse %%-formats help strings, and
+                     # a bare '14.4% vs' raises ValueError when --help is built.
+                     help="draw --n-per-bucket cases per bucket at RANDOM with this seed instead "
+                          "of taking the first N. The prefix is a convenience sample: on the "
+                          "MR-RATE test split it over-represents PP_Cerebrovascular (14.4%% vs "
+                          "11.4%%) and BP_Hemorrhagic_lesions (10.9%% vs 8.4%%) against the "
+                          "remaining population. Use this for a representative estimate; it gives "
+                          "up prefix-nesting with other runs, and changes run_id/cases_sha256 so "
+                          "the two kinds of run can never be confused")
 
     model = p.add_argument_group("model")
     model.add_argument("--checkpoint", type=Path, default=None,
@@ -606,7 +627,9 @@ def main(argv=None) -> int:
         log.info("--task %s has no paired metrics, so distribution metrics stay on", task.name)
 
     dataset, dataset_config = build_dataset(args)
-    indices = select_eval_cases(dataset, args.n_per_bucket)
+    indices = select_eval_cases(dataset, args.n_per_bucket,
+                                selection_seed=args.case_selection_seed,
+                                n_total=args.n_total)
     cases = build_cases(dataset, indices)
     if not cases:
         raise SystemExit(f"no cases in split {args.split!r} -- check --manifest and --split")
@@ -616,14 +639,25 @@ def main(argv=None) -> int:
     run_id = run_fingerprint(
         split=args.split, cases=cases, geometry=dataset_config.geometry_fingerprint(),
         task=task.name, n_per_bucket=args.n_per_bucket, seed=args.seed, model_identity=identity,
+        case_selection_seed=args.case_selection_seed, n_total=args.n_total,
     )
     cohort_view = LiveCohortView(
         cases=cases, split=args.split, geometry=dataset_config.geometry_fingerprint(),
         population_bucket_counts=population_bucket_counts(dataset), run_id=run_id,
     )
+    if args.n_total is not None:
+        scale = (f" (RANDOM {args.n_total} over the WHOLE split, UNBALANCED across buckets, "
+                 f"case-selection seed {args.case_selection_seed} -- buckets appear at population "
+                 f"frequency; read overall_pooled, not overall_macro)")
+    elif args.n_per_bucket is None:
+        scale = " (FULL SPLIT)"
+    elif args.case_selection_seed is None:
+        scale = f" (first {args.n_per_bucket}/bucket)"
+    else:
+        scale = (f" (RANDOM {args.n_per_bucket}/bucket, case-selection seed "
+                 f"{args.case_selection_seed} -- not a prefix of any other run)")
     log.info("run_id=%s over %d cases, %d buckets%s", run_id, len(cases),
-             len(cohort_view.buckets),
-             " (FULL SPLIT)" if args.n_per_bucket is None else f" (first {args.n_per_bucket}/bucket)")
+             len(cohort_view.buckets), scale)
     for bucket in cohort_view.buckets:
         geom = cohort_view.bucket_geometry(bucket)
         log.info("   %-16s n=%-6d shape=%s spacing=%s", bucket, geom["n"],
@@ -645,7 +679,19 @@ def main(argv=None) -> int:
         report_classifier=args.report_classifier, report_labels_csv=args.report_labels_csv,
         wandb_panels=(args.wandb_panels if args.wandb_mode != "disabled" else 0),
         wandb_log_reports=args.wandb_log_reports,
-        extra_run_metadata={"model": identity, "dataset_config": dataset_config.geometry_fingerprint()},
+        extra_run_metadata={"model": identity,
+                            "dataset_config": dataset_config.geometry_fingerprint(),
+                            # None for every prefix run, so the two selection regimes are
+                            # distinguishable in the results without reading the log.
+                            "case_selection_seed": args.case_selection_seed,
+                            "case_selection": ("prefix" if args.case_selection_seed is None
+                                               else "random_without_replacement"),
+                            # Which of the three populations this run used, so the results are
+                            # self-describing without cross-referencing the launcher.
+                            "case_allocation": ("simple_random_whole_split"
+                                                if args.n_total is not None
+                                                else "balanced_per_bucket"),
+                            "n_total": args.n_total},
     )
     evaluator = LiveEvaluator(dataset, cases, config, cohort_view)
     summary = evaluator.run(generate)

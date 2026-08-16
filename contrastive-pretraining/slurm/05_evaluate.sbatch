@@ -98,6 +98,15 @@ ARGS=(
 )
 [[ "$TASK" == "generation" ]] && ARGS+=(--base-checkpoint "$UNET_CHECKPOINT")
 [[ -n "${R2V_N_PER_BUCKET:-}" ]] && ARGS+=(--n-per-bucket "$R2V_N_PER_BUCKET")
+# R2V_CASE_SELECTION_SEED draws the N per bucket at random instead of taking the first N. The
+# prefix is a convenience sample and measurably skewed (see the flag's help); this is how you get a
+# representative estimate. It changes run_id, so a seeded run cannot be mistaken for a prefix run.
+[[ -n "${R2V_CASE_SELECTION_SEED:-}" ]] && ARGS+=(--case-selection-seed "$R2V_CASE_SELECTION_SEED")
+# R2V_N_TOTAL drops per-bucket balancing: draw this many cases from the whole split, so each bucket
+# appears at its population frequency (4.5%-16.3%) instead of 1/10th. That is the mixture training
+# saw and the one the challenge scores. Mutually exclusive with R2V_N_PER_BUCKET -- the CLI refuses
+# both -- so a caller setting this must not also set that.
+[[ -n "${R2V_N_TOTAL:-}" ]] && ARGS+=(--n-total "$R2V_N_TOTAL")
 [[ -n "${R2V_FRECHET_BATCH:-}" ]] && ARGS+=(--frechet-batch-size "$R2V_FRECHET_BATCH")
 # Keep the generated volumes so a later metric does not need a second 4-hour sampling run.
 # R2V_SAVE_VOLUMES=1 puts them next to the results; give a path to put them elsewhere.
@@ -164,6 +173,8 @@ fi
 
 echo "=== evaluating: task=$TASK tag=$TAG split=${R2V_SPLIT:-test} ==="
 echo "    n-per-bucket: ${R2V_N_PER_BUCKET:-<entire split>}"
+echo "    n-total     : ${R2V_N_TOTAL:-<per-bucket balanced>}"
+echo "    selection   : ${R2V_CASE_SELECTION_SEED:+random, seed $R2V_CASE_SELECTION_SEED}${R2V_CASE_SELECTION_SEED:-first-N prefix}"
 echo "    results     : $OUT"
 
 # run_py_text, not run_py: report2volume needs the text-encoder stack, and using one image for all
