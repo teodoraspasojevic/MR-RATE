@@ -3,3 +3,12 @@ CLAUDE.md
 /logs
 .coverage
 /contrastive-pretraining/tests
+.vscode
+*.zip
+/contrastive-pretraining/run_evaluate_debug_generation.py
+/contrastive-pretraining/run_evaluate_debug_reconstruction.py
+/contrastive-pretraining/run_evaluate_debug.py
+/contrastive-pretraining/run_predict_debug.py
+/contrastive-pretraining/run_train_debug.py
+/contrastive-pretraining/run_train_debug_fusion.py
+/contrastive-pretraining/run_train_debug_resume.py
