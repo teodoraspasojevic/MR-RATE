@@ -4,6 +4,7 @@
 #   slurm/final_eval/run_sweep.sh cfg       # stage 1: best guidance scale per arm      (25 jobs)
 #   slurm/final_eval/run_sweep.sh format    # stage 2: report-format robustness         (12 jobs)
 #   slurm/final_eval/run_sweep.sh headline  # stage 3: the arm-vs-arm result             (5 jobs)
+#   slurm/final_eval/run_sweep.sh epochs    # D at 3 and 4 epochs, cfg 3.0 and 4.0       (4 jobs)
 #
 # **This is deliberately NOT the full 5 x 5 x 4 = 100-run grid.** Guidance scale and report format
 # are close to independent, so the grid spends most of its runs re-measuring each format at a
@@ -36,7 +37,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/_final_eval_common.sh"
 # Not `${1:?...}` with braces in the message: bash ends the expansion at the FIRST `}`, so the
 # stray one lands in the value and every stage name arrives as e.g. "cfg}".
 STAGE="${1:-}"
-[[ -n "$STAGE" ]] || { echo "usage: run_sweep.sh <cfg|format|headline|representative|unbalanced|all>" >&2; exit 1; }
+[[ -n "$STAGE" ]] || { echo "usage: run_sweep.sh <cfg|format|headline|epochs|representative|unbalanced|all>" >&2; exit 1; }
 
 # ---------------------------------------------------------------- the axes
 #
@@ -83,6 +84,7 @@ arm_tag() {
         A) echo "A_cxr_bert_cls" ;;   B) echo "B_cxr_bert_tokens" ;;
         C) echo "C_radbert_tokens" ;; D) echo "D_report2ct_style" ;;
         E) echo "E_report2ct_style_meta" ;;
+        D_cont) echo "D_report2ct_style_cont" ;;
     esac
 }
 
@@ -175,6 +177,64 @@ headline)
         submit "$arm" "headline" "$N_PER_BUCKET" \
             "${BEST_CFG[$arm]}" "$TRAINED_FORMAT" "$WALLTIME"
     done
+    ;;
+epochs)
+    # **Does more training help, and does the answer depend on the guidance scale?**
+    #
+    # Configuration D was resumed from its own `adapter_last.pt` for two more epochs
+    # (slurm/final/run_D_continue.sh, job 737063, COMPLETED 2026-08-17 in 22:28 with
+    # skipped_steps=0). This stage scores the two per-epoch checkpoints that job wrote, at the two
+    # guidance scales D's cfg sweep left in contention: 2 x 2 = 4 jobs, ~24 GPU-h.
+    #
+    # **Read it as a 3-point curve, not as 4 numbers.** `report2volume_D_report2ct_style_cfg3.0`
+    # and `_cfg4.0` are already on disk from the cfg sweep, and they ARE the 2-epoch point of this
+    # same curve: same arm, same format, same seed, same prefix case list (cases_sha256
+    # e9ffa637...), only fewer optimizer steps. So when these land there are three epochs per
+    # scale:
+    #
+    #     epochs  checkpoint                       optimizer steps  where the number comes from
+    #     2       D/adapter_last.pt                          4,493  cfg sweep, already scored
+    #     3       D_cont/adapter_epoch003.pt                 6,739  this stage
+    #     4       D_cont/adapter_epoch004.pt                 8,986  this stage
+    #
+    # **The training curve says to expect no gain**, which is the point of measuring it offline:
+    # the continuation's own validations went FVD 16.05 -> 16.13 -> 16.21 and FID-2.5D 25.69 ->
+    # 26.61 -> 26.78 across epochs 3 and 4, i.e. flat to slightly worse after the first full
+    # validation of epoch 3. If that holds at 2,000 cases, the 2-epoch checkpoint is the one to
+    # submit and this stage is what licenses saying so. If it does not hold, the 4-epoch checkpoint
+    # is free.
+    #
+    # Prefix selection, not seeded -- deliberately, because comparability with the existing 2-epoch
+    # runs is the whole value here and those are prefix runs. The prefix's known skew
+    # (see the `representative` stage) applies equally to all three epoch points, so it cannot
+    # create or hide an epoch effect.
+    #
+    # Volumes are not kept (SAVE_VOLUMES=1 to override): this stage picks a checkpoint, and the
+    # picked one gets its volumes from a `headline` run.
+    EPOCH_ARMS="${EPOCH_ARMS:-D_cont}"
+    EPOCH_CHECKPOINTS="${EPOCH_CHECKPOINTS:-epoch003 epoch004}"
+    EPOCH_CFG="${EPOCH_CFG:-3.0 4.0}"
+    echo "=== epochs: ${EPOCH_ARMS} x {${EPOCH_CHECKPOINTS}} x cfg {${EPOCH_CFG}} at ${N_PER_BUCKET}/bucket"
+    for arm in $EPOCH_ARMS; do
+        for checkpoint in $EPOCH_CHECKPOINTS; do
+            # `submit` resolves the checkpoint through the global CHECKPOINT_KIND, so this is set
+            # per iteration rather than passed -- and the resolved basename is printed on every
+            # line below, which is what makes a wrong one visible instead of silent.
+            CHECKPOINT_KIND="$checkpoint"
+            for cfg in $EPOCH_CFG; do
+                submit "$arm" "${checkpoint}_cfg${cfg}" "$N_PER_BUCKET" \
+                    "$cfg" "$TRAINED_FORMAT" "$WALLTIME"
+            done
+        done
+    done
+    echo
+    echo "Compare against the 2-epoch point already on disk:"
+    echo "    \$WS/cache/r2v/results/report2volume_D_report2ct_style_cfg{3.0,4.0}/metrics_summary.csv"
+    # `model.training.epoch` in run_manifest.json is the checkpoint's OWN epoch counter and it is
+    # 0-INDEXED, while the filename is 1-based (`training.py` writes `adapter_epoch{epoch+1:03d}`).
+    # So `adapter_epoch003.pt` reports epoch 2 there: add one to read it as epochs completed. The
+    # tag in the results dir name is the unambiguous label, which is why it carries the checkpoint.
+    echo "'model.training.epoch' in each run_manifest.json is 0-indexed: epoch003 -> 2."
     ;;
 representative)
     # **Why this stage exists.** Every other stage takes the FIRST N per bucket of the
@@ -276,5 +336,6 @@ all)
     exit 1
     ;;
 *)
-    echo "unknown stage '$STAGE' (cfg | format | headline | representative | unbalanced | all)" >&2; exit 1 ;;
+    echo "unknown stage '$STAGE' (cfg | format | headline | epochs | representative | unbalanced | all)" >&2
+    exit 1 ;;
 esac

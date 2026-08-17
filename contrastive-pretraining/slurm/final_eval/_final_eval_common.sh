@@ -100,6 +100,20 @@ resolve_checkpoint() {
         best_ssim) echo "$run_dir/adapter_best_ssim.pt" ;;
         best_fvd) echo "$run_dir/adapter_best_fvd.pt" ;;
         best_fid) echo "$run_dir/adapter_best_fid_2p5d.pt" ;;
+        # A per-epoch checkpoint: `epoch003` -> `adapter_epoch003.pt`. Only continuation runs write
+        # these (`SAVE_EVERY_EPOCHS=1` in slurm/final/run_D_continue.sh), and the numbering is
+        # ABSOLUTE across the resume, so `epoch003` is the third epoch of training regardless of
+        # which job produced it. Verified on the D continuation 2026-08-17 by hashing
+        # `adapter_state_dict` (74 tensors each):
+        #
+        #     adapter_epoch003.pt  step 6739  3 epochs  sha dfcb542129d154fc
+        #     adapter_epoch004.pt  step 8986  4 epochs  sha cddd36addd3de6fc
+        #     adapter_last.pt      step 8986  4 epochs  sha cddd36addd3de6fc  <- same weights
+        #
+        # So `epoch004` and `last` are the same evaluation for this run; `epoch004` is the one to
+        # ask for anyway, because it says which epoch it is in the tag and the results dir.
+        # `adapter_best_fid_2p5d.pt` is NOT either of them -- it is step 4800, mid-epoch 3.
+        epoch[0-9][0-9][0-9]) echo "$run_dir/adapter_${CHECKPOINT_KIND}.pt" ;;
         *) echo "unknown CHECKPOINT_KIND=$CHECKPOINT_KIND" >&2; exit 1 ;;
     esac
 }
@@ -158,7 +172,13 @@ run_dir_for() {
         C) echo "$RUNS/r2v_final_C_radbert_tokens" ;;
         D) echo "$RUNS/r2v_final_D_report2ct_style" ;;
         E) echo "$RUNS/r2v_final_E_report2ct_style_meta" ;;
-        *) echo "unknown config '$1' (expected A, B, C, D or E)" >&2; exit 1 ;;
+        # D's continuation: the SAME configuration and the same optimizer state, resumed from D's
+        # `adapter_last.pt` for two more epochs (slurm/final/run_D_continue.sh, job 737063). A
+        # separate key rather than a CHECKPOINT_KIND on D, because it is a different run directory
+        # with its own train_summary.json -- and because `D` must keep meaning "2 epochs", which is
+        # what every completed cfg-sweep number was produced at.
+        D_cont) echo "$RUNS/r2v_final_D_report2ct_style_cont" ;;
+        *) echo "unknown config '$1' (expected A, B, C, D, E or D_cont)" >&2; exit 1 ;;
     esac
 }
 
