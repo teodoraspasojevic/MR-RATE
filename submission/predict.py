@@ -12,7 +12,6 @@ is worse than crashing loudly.
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
@@ -262,7 +261,7 @@ def resolve_weight(name_env: str, default_name: str) -> Path:
     raise SystemExit(f"{name_env}={name!r} not found. Looked in: {[str(c) for c in candidates]}")
 
 
-def build(seed: int, device: str):
+def build(device: str):
     """`(sampler, embedder, payload)` via the package's own loader -- see the module docstring.
 
     `device` is explicit (not read from `R2V_DEVICE` here) so a DDP rank can pass its own
@@ -284,18 +283,17 @@ def build(seed: int, device: str):
         modality_guidance_scale=env_float("R2V_MODALITY_GUIDANCE_SCALE", 10.0),
         batched_guidance=env_flag("R2V_BATCHED_GUIDANCE", True),
         num_inference_steps=env_int("R2V_NUM_INFERENCE_STEPS", 30),
-        seed=seed,
+        # `SamplerConfig.random_seed` is stored but never read again anywhere in
+        # `mrrate_r2v.sampling` -- every actual draw is unseeded (see `main()`) to match the
+        # platform's own reference baseline (`mrgen_example_docker/inference.py`), which never
+        # seeds either. This field is inert; any value here is equivalent.
+        seed=None,
         device=device,
         latent_only=False,
         allow_base_mismatch=False,
     )
     print(f"adapter={args.adapter} base={args.base_checkpoint} vae={args.vae_checkpoint} device={device}")
     return build_sampler(args)
-
-
-def stable_seed(base_seed: int, case_id: str) -> int:
-    """Per-case sampler seed, so a resume regenerates the same volume."""
-    return int(hashlib.sha256(f"{base_seed}:{case_id}".encode()).hexdigest()[:8], 16)
 
 
 def geometry_for(modality: str, plane: str) -> tuple[tuple[int, int, int], tuple[float, float, float]]:
@@ -305,6 +303,17 @@ def geometry_for(modality: str, plane: str) -> tuple[tuple[int, int, int], tuple
     spec = GeometryPolicy(mode="per_modality_plane").resolve(modality, plane)
     dim = tuple(int(v) for v in dhw_to_xyz(spec.target_shape))
     spacing = tuple(float(v) for v in dhw_to_xyz(spec.target_spacing))
+    return dim, spacing
+
+
+def baseline_geometry(divisor: int) -> tuple[tuple[int, int, int], tuple[float, float, float]]:
+    """The platform's own reference baseline (`mrgen_example_docker/inference.py`) ignores
+    modality/plane and always samples a 64^3 latent at spacing (1.5, 1.9, 1.9)mm. `divisor`
+    (`sampler.divisor`, 4 for the mr-brain model) converts that latent size to the matching
+    output voxel shape -- reusing our own model's divisor rather than guessing theirs.
+    """
+    dim = (64 * divisor,) * 3
+    spacing = (1.5, 1.9, 1.9)
     return dim, spacing
 
 
@@ -323,14 +332,20 @@ def main() -> int:
     if done:
         print(f"[rank {rank}] resuming: {len(done)} case(s) already done")
 
-    seed = env_int("R2V_SEED", 1234)
     device = f"cuda:{local_rank}" if is_ddp else env_str("R2V_DEVICE", "cuda")
-    sampler, embedder, payload = build(seed, device)
+    sampler, embedder, payload = build(device)
     needs_sections = bool(getattr(embedder, "needs_sections", False))
     print(f"[rank {rank}] conditioning={(payload.get('config') or {}).get('conditioning_name')} "
           f"needs_sections={needs_sections}")
 
     dtype = np.dtype(env_str("R2V_OUTPUT_DTYPE", "float32"))
+    # "policy" (default): per-modality/plane geometry from GeometryPolicy, as trained. "baseline":
+    # the platform's own reference container's fixed 64^3-latent grid, to A/B against in a future
+    # submission -- see `baseline_geometry`.
+    geometry_mode = env_str("R2V_GEOMETRY_MODE", "policy")
+    if geometry_mode not in ("policy", "baseline"):
+        raise SystemExit(f"R2V_GEOMETRY_MODE={geometry_mode!r} must be 'policy' or 'baseline'")
+    print(f"[rank {rank}] geometry_mode={geometry_mode}")
 
     from mrrate_r2v.cli.generate_r2v import conditioning_text_for
     from mrrate_r2v.sampling import save_volume
@@ -345,7 +360,8 @@ def main() -> int:
             continue
 
         modality, plane = modality_plane_for(case_id)
-        dim, spacing = geometry_for(modality, plane)
+        dim, spacing = (baseline_geometry(sampler.divisor) if geometry_mode == "baseline"
+                        else geometry_for(modality, plane))
         # A/B/C were trained on a metadata format, so the [MODALITY]/[PLANE]/[SPACING] prefix
         # is part of what they learned; text without it is out of distribution and silently
         # so. D records no format and gets the text unchanged.
@@ -359,7 +375,10 @@ def main() -> int:
         case_started = time.time()
         volume = sampler.generate(
             text, dim, spacing,
-            seed=stable_seed(seed, case_id),
+            # No seed: matches the platform's own reference baseline, which draws unseeded
+            # noise every run. A prior version derived a per-case seed for resume-reproducibility;
+            # since a stopped run is now restarted from scratch rather than resumed in place,
+            # that reproducibility isn't needed and there is no other benefit to fixing a seed.
             modality=modality,
             report_sections=sections,
             postprocess=True,  # int16 [0, 1000], NVIDIA's own MR output range

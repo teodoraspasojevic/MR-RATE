@@ -148,8 +148,13 @@ flag typed locally never reaches the platform.
 | `R2V_NUM_INFERENCE_STEPS` | `30` | NVIDIA's own default |
 | `R2V_REPORT_GUIDANCE_SCALE` | `3` | `0` disables the report term; predict.py's own fallback (unset) is `4.0` |
 | `R2V_MODALITY_GUIDANCE_SCALE` | `10.0` | NVIDIA's `cfg_guidance_scale` for mr-brain |
-| `R2V_SEED` | `1234` | per-case seed is `sha256(seed:case_id)`, matching `eval.live.stable_seed` |
+| `R2V_GEOMETRY_MODE` | `policy` | `policy` = per-modality/plane `GeometryPolicy` (as trained); `baseline` = the platform's own reference container's fixed 64^3-latent grid at (1.5, 1.9, 1.9)mm, for A/B testing |
 | `R2V_OUTPUT_DTYPE` | `float32` | values stay NVIDIA's MR `[0, 1000]` range either way |
+
+Sampling is intentionally unseeded (no `R2V_SEED` knob): the platform's own reference baseline
+(`mrgen_example_docker/inference.py`) draws unseeded noise every run too, and a CT-track sibling
+submission's own seed sweep found no seed reliably beats another — between-seed score spread was
+indistinguishable from within-seed-repeat spread.
 
 `predict.py` backs up each finished volume to `/checkpoint/outputs` and its filename to
 `/checkpoint/done.json` (rank-scoped under multi-GPU) as it goes, so a restart resumes instead of
