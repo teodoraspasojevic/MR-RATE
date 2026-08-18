@@ -231,32 +231,22 @@ standard BERT weights are loaded into a stock `BertModel` and the unused heads a
 
 ---
 
-## Part 3: fusion — using two encoders at once
+## Part 3: fusion — using several encoders at once
 
-The 2025 VLM3D CT-track winner concatenated three text encoders rather than picking one. You can
-do the same:
+The 2025 VLM3D CT-track winner concatenated three text encoders rather than picking one. This
+package's version of that is `conditioning.SectionedFusionEmbedder` (Part 4, configurations D/E):
+each encoder pools its own report section independently, and the pooled vectors are concatenated
+into one wider token per section. `ProjectedConcatFusion` is its optional learned variant — a
+per-encoder Linear to a shared width before concatenation, so a 1024-wide and a 384-wide encoder
+contribute comparable magnitudes:
 
 ```python
-from mrrate_r2v.textenc import MultiEncoderEmbedder, ProjectedConcatFusion, build_encoder
+from mrrate_r2v.textenc import ProjectedConcatFusion
 
-pair = [build_encoder("bioclinical_mbert"), build_encoder("medembed_small")]
-
-fused = MultiEncoderEmbedder(pair, mode="token")    # (B, L1+L2, 768) -- keeps every token
-fused = MultiEncoderEmbedder(pair, mode="feature")  # (B, 1, 1152)   -- one vector per report
-fused = MultiEncoderEmbedder(pair, mode="token",
-        fusion=ProjectedConcatFusion([768, 384], projection_dim=256))   # learned projection first
+fusion = ProjectedConcatFusion(input_dims=[1024, 768, 768], projection_dim=256)
 ```
 
-| mode | what it does | when |
-|---|---|---|
-| `"token"` | glues the two token sequences end to end; narrower model's features are zero-padded | default — cross-attention exists to use token detail |
-| `"feature"` | pools each model to one vector, concatenates those | reproduces the CT-winner recipe, as a comparable baseline |
-
-`MultiEncoderEmbedder` is itself an encoder as far as the rest of the code is concerned, so it
-drops into the trainer with no other change. `ProjectedConcatFusion` takes a plain list of input
-widths, so it is not tied to any particular pair of models.
-
-Fusion costs what it says: two models means two forward passes, roughly double the time and
+Fusion costs what it says: three models means three forward passes, roughly triple the time and
 memory, and a wider conditioning tensor. Only worth it if it measurably helps — which is what
 `textbench` is for.
 

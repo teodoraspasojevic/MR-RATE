@@ -1,12 +1,14 @@
 """Conditioning bookkeeping shared by the trainer and the sampler: MR-RATE's modality strings ->
 NVIDIA's class ids, report dropout, and classifier-free guidance.
 
-Every number here is NVIDIA's, read from their files:
+Every number here is NVIDIA's, read from their files (bundled at `models/nvidia_configs/`, see
+`models/nvidia.py`'s module docstring for why this package carries its own copies rather than a
+checkout of NV-Generate-CTMR):
 
-- the class ids come from `NV-Generate-CTMR/configs/modality_mapping.json`, not from a second copy;
-- modality dropout is `scripts/diff_model_train.py:augment_modality_label` imported unchanged, so
-  its three-way augmentation (coarsen CT subtype -> 1, coarsen MR subtype -> 8, drop to class 0 with
-  probability `prob`) is preserved exactly;
+- the class ids come from `models/nvidia_configs/modality_mapping.json`, not from a second copy;
+- modality dropout is `models.nvidia.augment_modality_label`, copied verbatim from NVIDIA's
+  `scripts/diff_model_train.py`, so its three-way augmentation (coarsen CT subtype -> 1, coarsen MR
+  subtype -> 8, drop to class 0 with probability `prob`) is preserved exactly;
 - guidance reduces to `scripts/diff_model_infer.py:206-207`'s formula when the report term is off,
   which `tests/test_r2v_guidance.py` asserts numerically.
 
@@ -70,13 +72,10 @@ class ModalityEncoder:
 
 
 def augment_modality_label(modality_tensor: torch.Tensor, prob: float = 0.1) -> torch.Tensor:
-    """NVIDIA's own modality conditioning-dropout, imported from the vendored trainer.
-
-    Kept as a thin re-export rather than a copy so it cannot drift: see
-    `NV-Generate-CTMR/scripts/diff_model_train.py:34-66`.
+    """NVIDIA's own modality conditioning-dropout. Re-exported from `models.nvidia`, which carries
+    the verbatim copy (see its module docstring), so there is exactly one copy in this package.
     """
-    from .models import nvidia as _nvidia  # noqa: F401  -- puts the vendored root on sys.path
-    from scripts.diff_model_train import augment_modality_label as official
+    from .models.nvidia import augment_modality_label as official
 
     return official(modality_tensor, prob=prob)
 
@@ -97,7 +96,6 @@ class ConditioningConfig:
     report_dropout_probability: float = 0.1
     report_guidance_scale: float = 4.0
     modality_guidance_scale: float = 10.0  # NVIDIA's `cfg_guidance_scale` for mr-brain
-    independent_dropout: bool = True
 
     def __post_init__(self) -> None:
         for name in ("modality_dropout_probability", "report_dropout_probability"):
@@ -155,26 +153,6 @@ def combine_guidance(
     return guided
 
 
-@dataclass
-class GuidanceBranches:
-    """Which forward passes a given guidance setting needs, in a fixed order so the batched call and
-    the explicit calls cannot disagree."""
-
-    use_null_null: bool
-    use_modality_report: bool
-
-    @property
-    def n_branches(self) -> int:
-        return 1 + int(self.use_null_null) + int(self.use_modality_report)
-
-    @staticmethod
-    def resolve(modality_guidance_scale: float, report_guidance_scale: float) -> "GuidanceBranches":
-        return GuidanceBranches(
-            use_null_null=modality_guidance_scale != 0.0,
-            use_modality_report=report_guidance_scale != 0.0,
-        )
-
-
 def guided_model_output(
     unet,
     x: torch.Tensor,
@@ -195,16 +173,17 @@ def guided_model_output(
     Branch order is always: (modality, null_report), then (null_modality, null_report) if modality
     guidance is on, then (modality, report) if report guidance is on.
     """
-    branches = GuidanceBranches.resolve(config.modality_guidance_scale, config.report_guidance_scale)
+    use_null_null = config.modality_guidance_scale != 0.0
+    use_modality_report = config.report_guidance_scale != 0.0
     batch = x.shape[0]
     extra = dict(extra_unet_inputs or {})
 
     labels = [class_labels]
     drops = [torch.ones(batch, dtype=torch.bool, device=x.device)]
-    if branches.use_null_null:
+    if use_null_null:
         labels.append(torch.full_like(class_labels, modality_null_id))
         drops.append(torch.ones(batch, dtype=torch.bool, device=x.device))
-    if branches.use_modality_report:
+    if use_modality_report:
         labels.append(class_labels)
         drops.append(torch.zeros(batch, dtype=torch.bool, device=x.device))
 
@@ -235,10 +214,10 @@ def guided_model_output(
     prediction_modality_null = predictions[0]
     index = 1
     prediction_null_null = None
-    if branches.use_null_null:
+    if use_null_null:
         prediction_null_null = predictions[index]
         index += 1
-    prediction_modality_report = predictions[index] if branches.use_modality_report else None
+    prediction_modality_report = predictions[index] if use_modality_report else None
     return combine_guidance(
         prediction_null_null, prediction_modality_null, prediction_modality_report,
         config.modality_guidance_scale, config.report_guidance_scale,
@@ -247,7 +226,6 @@ def guided_model_output(
 
 __all__ = [
     "ConditioningConfig",
-    "GuidanceBranches",
     "MRRATE_MODALITY_TO_NVIDIA_KEY",
     "ModalityEncoder",
     "UNCONDITIONAL_MODALITY_KEY",
