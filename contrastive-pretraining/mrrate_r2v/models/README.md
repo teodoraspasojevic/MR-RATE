@@ -13,7 +13,7 @@ into the denoiser.
 
 | file | what it is |
 |---|---|
-| [`nvidia.py`](nvidia.py) | the **only** place vendored NVIDIA code is imported. Loads their autoencoder and diffusion UNet, exposes their config paths. |
+| [`nvidia.py`](nvidia.py) | the **only** place NVIDIA-authored code is used. Loads their autoencoder and diffusion UNet, exposes their config paths. |
 | [`report_conditioned_unet.py`](report_conditioned_unet.py) | that same diffusion UNet, structurally unchanged, **plus** report cross-attention adapters — and a strict pretrained-weight loader. |
 | [`adapter.py`](adapter.py) | what is trainable (asserted, not assumed) and the adapter checkpoint format. |
 
@@ -47,9 +47,14 @@ trainable   8,080,000 params in N tensors (4.28% of 188,580,868); frozen 180,500
 
 ## 1. `nvidia.py` — the seam
 
-This module puts the repo's own vendored `NV-Generate-CTMR/` on `sys.path` and re-exports what is
-needed. It never imports NVIDIA code from anywhere else (not from a sibling clone, not from
-site-packages), so if the vendored layout ever changes, exactly one file needs editing.
+Loads the pretrained autoencoder and diffusion UNet, and exposes the JSON configs
+([`nvidia_configs/`](nvidia_configs/)) that describe their exact architecture, so nothing
+downstream has to restate those numbers. The network classes themselves are `monai` classes; this
+module adds the loading glue on top — config parsing, instantiating a network from that config, and
+the unconditional sampling loop the report-blind evaluation baseline uses.
+
+A few small functions here (and the config JSON) are copied, not reimplemented, from NVIDIA's
+NV-Generate-CTMR release — see the banner comment near the top of `nvidia.py` for exactly which.
 
 ```python
 from mrrate_r2v.models.nvidia import (
@@ -63,8 +68,8 @@ from mrrate_r2v.models.nvidia import (
 ### The architecture is read, never restated
 
 `nvidia_unet_kwargs()` in [`report_conditioned_unet.py`](report_conditioned_unet.py) parses
-`configs/config_network_rflow.json` and hands the result to the constructor. For NV-Generate-MR-Brain
-that is:
+`nvidia_configs/config_network_rflow.json` and hands the result to the constructor. For
+NV-Generate-MR-Brain that is:
 
 ```
 num_channels      [64, 128, 256, 512]     4 levels
@@ -90,7 +95,7 @@ is valid, and it is wrong. Each call site names which one it means.
 NVIDIA's env config stores `model_dir="./models"` relative to the *current working directory*.
 `load_autoencoder_and_unet` therefore requires absolute overrides and rewrites
 `model_dir`/`model_filename`/`existing_ckpt_filepath` consistently. Passing a relative path fails
-with a bare `FileNotFoundError` from inside their code.
+with a bare, uninformative `FileNotFoundError`.
 
 ---
 
