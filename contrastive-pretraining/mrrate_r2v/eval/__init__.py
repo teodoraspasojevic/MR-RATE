@@ -1,27 +1,19 @@
-"""Evaluation: frozen ground-truth cohort + predictions + task -> metrics.
+"""Evaluation: generate a volume, score it against the official VLM3D challenge metrics.
 
-See `mrrate_r2v/eval/README.md` for what each metric means and how to read a result directory.
+See `mrrate_r2v/eval/README.md` for what each metric means. `cli.evaluate` (final scoring) and
+`validation.py` (the periodic during-training curve) are the two callers.
 
-    tasks.py              which metrics are valid for which task (the registry)
-    runner.py             the single pipeline -- everything goes through run_evaluation()
-    geometry_contract.py  may these two volumes be compared voxelwise?
-    paired.py             voxelwise + detail metrics on one pair
-    distribution.py       FID / Inception Score / precision-recall-density-coverage
-    features.py           fingerprint-gated feature cache
-    aggregate.py          per-sequence and overall means
-    pairing.py            identifier matching, for importing an external checkpoint's files
-    wandb_logging.py      optional W&B wrapper, degrades to a no-op
+    challenge/             vendored port of the official evaluation container -- MSE/PSNR/SSIM,
+                           2.5D FID, modality scope. The source of truth for what a metric means.
+    challenge_metrics.py   ChallengeAccumulator: the one place that runs challenge/ and reduces
+                           it to the metrics dict both callers log
+    live.py                the streaming per-case harness cli.evaluate uses
+    padding.py             VAE divisor padding (pad_to_divisible / crop_using_record)
+    figures.py             the ground-truth-vs-generated example panel renderer
+    wandb_evaluation.py    the shim `figures.py` needs to render a panel from a `LiveCase`
+    wandb_logging.py       optional W&B wrapper, degrades to a no-op
 
-**This package deliberately re-exports nothing.** Import the module you need directly, so a
-heavy dependency in one module never blocks another -- `geometry_contract` needs only numpy and
-nibabel, `distribution` needs torch, and neither should make the other unimportable:
+**This package deliberately re-exports nothing.** Import the module you need directly:
 
-    from mrrate_r2v.eval import paired as M
-    from mrrate_r2v.eval.runner import run_evaluation, EvaluationInputs
-    from mrrate_r2v.eval.tasks import get_task
-
-Every module works on plain numpy arrays, so you can use one metric without loading a cohort,
-a model, or the runner:
-
-    M.psnr(gt_array, pred_array)
+    from mrrate_r2v.eval.challenge_metrics import ChallengeAccumulator
 """
