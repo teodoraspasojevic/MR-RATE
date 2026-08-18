@@ -16,7 +16,7 @@
 #   sbatch slurm/submission_smoke.sbatch <ws>/runs/<tag>/adapter_step0004200.pt
 #
 # This does NOT build or run the Docker image (Helma has no Docker, only Apptainer). What it does
-# validate is everything inside the image that can fail: the prompt parser, the routing table, the
+# validate is everything inside the image that can fail: the prompt parser, the case_id parser, the
 # per-bucket geometry, the metadata prefix, the section splitter, checkpoint/resume, and the actual
 # sampler and decoder call. A Docker build that fails after this passes fails on packaging, which is
 # the cheap half to debug.
@@ -24,8 +24,6 @@
 # It exercises the container's own environment contract -- FORITHMUS_INPUT/OUTPUT/CHECKPOINT and the
 # R2V_* knobs -- rather than a CLI flag path, so the thing under test is the thing that ships.
 #
-#   R2V_ROUTING=report|fixed|marginal      routing strategy (default marginal)
-#   R2V_FIXED_BUCKET=T1w:AXIAL             with R2V_ROUTING=fixed
 #   R2V_STEPS=10                           fewer diffusion steps for a faster check
 #   R2V_SMOKE_RESUME=1                     second pass, to prove /checkpoint resume skips the done
 #
@@ -44,8 +42,11 @@ SUBMISSION_DIR="$REPO_ROOT/submission"
 OUT_DIR="${R2V_SMOKE_OUT:-$WORKSPACE/cache/r2v/submission_smoke/out}"
 CKPT_DIR="${R2V_SMOKE_CKPT:-$WORKSPACE/cache/r2v/submission_smoke/checkpoint}"
 
+# `routing.py` was folded into predict.py by the declutter -- the modality/plane for a case now
+# comes from parsing its case_id, not from a distribution-matching router, so there is no second
+# module to check for. Leaving it here aborted every smoke in pre-flight.
 preflight "$ADAPTER" "$VAE_CHECKPOINT" "$UNET_CHECKPOINT" \
-          "$SUBMISSION_DIR/predict.py" "$SUBMISSION_DIR/routing.py" \
+          "$SUBMISSION_DIR/predict.py" \
           "$SUBMISSION_DIR/mock_input/prompts.json"
 
 # A resume run must find the previous run's /checkpoint; a fresh run must not, or it would report
@@ -70,8 +71,6 @@ apptainer exec "${APPTAINER_ARGS[@]}" \
     --env "R2V_ADAPTER=$ADAPTER" \
     --env "R2V_BASE_CHECKPOINT=$UNET_CHECKPOINT" \
     --env "R2V_VAE_CHECKPOINT=$VAE_CHECKPOINT" \
-    --env "R2V_ROUTING=${R2V_ROUTING:-marginal}" \
-    --env "R2V_FIXED_BUCKET=${R2V_FIXED_BUCKET:-}" \
     --env "R2V_NUM_INFERENCE_STEPS=${R2V_STEPS:-30}" \
     --env "R2V_CHECKPOINT_EVERY=1" \
     "$SIF_IMAGE_TEXT" python3 "$SUBMISSION_DIR/predict.py"
@@ -96,5 +95,10 @@ print("all volumes finite and non-constant")
 PY
 
 echo
-echo "=== run manifest ==="
-cat "$CKPT_DIR/run_manifest.json"
+echo "=== resume state ==="
+# `run_manifest.json` is gone with the old predict.py. The resume contract is now `done.json` (the
+# filenames already generated) plus `outputs/` (their bytes), which is what `load_done` reads back
+# on a restart -- so that pair is what a smoke has to show.
+cat "$CKPT_DIR/done.json"
+echo
+echo "backed-up volumes: $(ls "$CKPT_DIR/outputs" | wc -l)"

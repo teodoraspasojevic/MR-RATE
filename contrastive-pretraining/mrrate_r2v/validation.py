@@ -221,8 +221,16 @@ class ValidationRunner:
 
         result = combine(gather_objects([accumulator.state()]))
         metrics = {f"val/{key}": value for key, value in result["metrics"].items()}
+        # **`gather_objects` is a COLLECTIVE and must be entered by every rank.** Calling it inside
+        # `if rank() == 0` leaves the other ranks never reaching `all_gather_object`, so rank 0
+        # waits on a payload-size exchange that never completes and then resizes its input tensor to
+        # whatever uninitialised bytes it read -- surfacing as `OutOfMemoryError: tried to allocate
+        # more than 1EB`, not as a hang or a clear collective error. Gather on all ranks; only the
+        # *logging* below is rank 0's job. Sorted so the panel order does not depend on which rank
+        # happened to answer first.
+        gathered_panels = sorted(gather_objects(panels), key=lambda r: r["case_id"])
         if rank() == 0:
-            metrics["val/n_panels"] = self._log_panels(gather_objects(panels), step)
+            metrics["val/n_panels"] = self._log_panels(gathered_panels, step)
         metrics["val/n_cases"] = result["metrics"]["n_scored_files"]
         metrics["val/seconds"] = time.time() - started
         metrics["val/validation_index"] = self._validation_index

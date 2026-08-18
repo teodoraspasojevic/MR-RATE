@@ -24,7 +24,6 @@
 #   R2V_REPORT_GUIDANCE=1        the plain report-conditioned prediction
 #   R2V_MODALITY_GUIDANCE=0      report guidance only, modality left conditioned
 #   R2V_LATENT_ONLY=1            skip the VAE decode (cheap check of the diffusion loop)
-#   R2V_COHORT=<cohort dir>      one .nii.gz per cohort case from its paired MR-RATE report
 #
 # **This script does NOT produce anything cli.evaluate can score.** It writes .nii.gz files plus a
 # generation_manifest.json -- volumes you can open in a viewer, in NVIDIA's int16 [0, 1000] output
@@ -74,13 +73,13 @@ GEOMETRY=()
 [[ -n "${R2V_DIM_X:-}" ]] && GEOMETRY+=(--dim "$R2V_DIM_X" "${R2V_DIM_Y:?set all three}" "${R2V_DIM_Z:?set all three}")
 [[ -n "${R2V_SPACING_X:-}" ]] && GEOMETRY+=(--spacing "$R2V_SPACING_X" "${R2V_SPACING_Y:?set all three}" "${R2V_SPACING_Z:?set all three}")
 
-if [[ -n "${R2V_COHORT:-}" ]]; then
-    run_py_text mrrate_r2v.cli.generate_r2v "${COMMON[@]}" --cohort "$R2V_COHORT" --out-dir "$OUT_DIR"
-else
-    run_py_text mrrate_r2v.cli.generate_r2v "${COMMON[@]}" ${GEOMETRY+"${GEOMETRY[@]}"} \
-        --report "$REPORT" \
-        --out "$OUT_DIR/sample.nii.gz"
-fi
+# One report, one volume. The `R2V_COHORT` branch that used to live here passed `--cohort/--out-dir`,
+# flags removed with the cohort layer -- it could only have failed at argument parsing. Scoring a
+# whole split is `cli.evaluate`'s job now (slurm/evaluate.sbatch), which generates and scores in one
+# pass rather than writing a prediction set for a second job to pick up.
+run_py_text mrrate_r2v.cli.generate_r2v "${COMMON[@]}" ${GEOMETRY+"${GEOMETRY[@]}"} \
+    --report "$REPORT" \
+    --out "$OUT_DIR/sample.nii.gz"
 
 echo "=== output ==="
 ls -la "$OUT_DIR"

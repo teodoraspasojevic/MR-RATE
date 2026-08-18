@@ -155,7 +155,28 @@ submit_final_run() {
     esac
 
     local walltime="$WALLTIME"
-    if [[ "$SMOKE" == "1" ]]; then
+    if [[ "${VERIFY:-0}" == "1" ]]; then
+        # **The post-refactor wiring check.** SMOKE deliberately turns validation and W&B OFF, so
+        # after a refactor it proves only that a forward/backward step still runs -- it cannot see a
+        # broken validation pass, a metric key that no longer reaches W&B, or a checkpoint that
+        # fails to write. VERIFY is the same short run with exactly those three switched on:
+        # 12 optimizer steps, validating twice at N=8 with 8 inference steps, checkpointing twice.
+        #
+        # The numbers here are wiring numbers, never results. N=8 is far below what FID can
+        # estimate and 8 inference steps is a quarter of NVIDIA's 30, so the val/* values this
+        # produces mean nothing except "the code path ran and returned finite numbers".
+        tag="verify_${tag}"
+        walltime=${VERIFY_WALLTIME:-01:30:00}
+        exports+=",R2V_MAX_STEPS=$(( 12 * GRAD_ACCUM )),R2V_EPOCHS=1,R2V_LR=1e-4"
+        exports+=",R2V_VALIDATE_EVERY=6,R2V_VAL_QUICK=${VERIFY_VAL_N:-8}"
+        exports+=",R2V_VAL_VISUALIZE=${VERIFY_VAL_VIS:-2},R2V_VAL_STEPS=${VERIFY_VAL_STEPS:-8}"
+        exports+=",R2V_WANDB=${WANDB_MODE},R2V_WANDB_PROJECT=${WANDB_PROJECT}"
+        exports+=",R2V_SAVE_EVERY=6,R2V_KEEP_LAST_N=2"
+        if [[ "$WANDB_MODE" == "online" && -z "${WANDB_API_KEY:-}" && ! -f "$HOME/.netrc" ]]; then
+            echo "W&B online needs WANDB_API_KEY exported, or 'wandb login' run once." >&2
+            exit 1
+        fi
+    elif [[ "$SMOKE" == "1" ]]; then
         # Eight optimizer steps, no validation, no W&B: this exists to answer "does batch 8 fit and
         # how fast is a step", and nothing else. Peak memory is in the job's GPU utilisation block.
         tag="smoke_${tag}"

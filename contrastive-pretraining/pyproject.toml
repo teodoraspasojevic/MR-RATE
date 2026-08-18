@@ -4,7 +4,9 @@
 # `routing`/`predict` modules are plain scripts that the container runs with no arguments, so their
 # invariants are only checkable from a test.
 pythonpath = [".", "mr_rate", "vision_encoder", "scripts", "../submission"]
-testpaths = ["tests"]
+# "../submission" too: the refactor moved the container's tests next to `predict.py`, and with
+# only "tests" here a plain `pytest` run collected none of them.
+testpaths = ["tests", "../submission"]
 addopts = "--cov=mrrate_r2v --cov=mr_rate --cov=vision_encoder --cov-report=term-missing"
 
 [tool.coverage.run]
