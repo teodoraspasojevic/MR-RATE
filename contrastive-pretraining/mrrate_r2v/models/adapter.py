@@ -1,24 +1,12 @@
-"""What is trainable, and what a trained artefact contains.
-
-Two jobs, both about the same invariant -- *only the report adapter is learned*:
-
-- `freeze_to_adapter_only` + `assert_only_adapter_trainable`: turn `requires_grad` off everywhere
-  else and then *prove* it, at startup, before an optimizer exists. A silent leak here means
-  fine-tuning NVIDIA's 180M-parameter denoiser at lr 1e-5 on 88k studies instead of training a
-  5M-parameter adapter.
-- `save_adapter_checkpoint` / `load_adapter_checkpoint`: the adapter is ~8M of a 188M model, so the
-  base weights are not duplicated. The checkpoint instead *identifies* the base checkpoint it was
-  trained against (path + sha256) and refuses to load onto a different one unless told to.
-
-Membership is decided by module identity, not by name matching: `adapter_parameter_names` walks the
-actual `context_proj` / `{down,mid,up}_cross_attn` submodules and the `null_context` Parameter. The
-name-prefix tuple `CONDITIONING_PREFIXES` is then cross-checked against that set, so if the two ever
-disagree the mismatch is an error rather than a quietly frozen adapter.
+"""What is trainable, and what a trained artefact contains. See `models/README.md` §3 for the
+full rationale -- in short: only the report adapter (~8M of a 188M model) is ever trained, this
+module both enforces that (`freeze_to_adapter_only` + `assert_only_adapter_trainable`) and proves
+adapter membership two independent ways (`adapter_parameter_names`), and its checkpoint format
+stores the adapter alone, identifying the frozen base it was trained against by path + sha256.
 """
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -45,10 +33,9 @@ def adapter_modules(model) -> dict:
 
 
 def adapter_parameter_names(model) -> set:
-    """State-dict names of every adapter parameter, including the report-CFG null embedding.
-
-    `null_context` is a bare Parameter on the UNet rather than a submodule, and it is part of the
-    adapter: it *is* the null-report representation that report classifier-free guidance needs.
+    """State-dict names of every adapter parameter, including `null_context` -- a bare Parameter
+    rather than a submodule, but part of the adapter: it is the learned null-report representation
+    that report classifier-free guidance needs.
     """
     owned = {id(p) for module in adapter_modules(model).values() for p in module.parameters()}
     owned.add(id(model.null_context))
@@ -89,9 +76,9 @@ def freeze_to_adapter_only(model, text_embedder=None) -> FreezeReport:
     """Make exactly the report adapter trainable. Everything else -- NVIDIA's denoiser, its
     modality/spacing/timestep embeddings, and the text encoder -- gets `requires_grad=False`.
 
-    Note what this does *not* do: it does not run any part of the forward pass under `no_grad`.
-    Autograd still traverses the frozen convolutions, because that is the only route by which a
-    gradient can reach an adapter sitting in the middle of the network.
+    This does not run the forward pass under `no_grad`: autograd still has to traverse the frozen
+    convolutions, since that's the only route by which a gradient reaches an adapter sitting in
+    the middle of the network.
     """
     names = adapter_parameter_names(model)
     for name, parameter in model.named_parameters():
@@ -176,98 +163,6 @@ def sha256_file(path, chunk: int = 1 << 20) -> str:
         for block in iter(lambda: handle.read(chunk), b""):
             digest.update(block)
     return digest.hexdigest()
-
-
-def training_provenance(payload: dict, checkpoint_path=None, world_size: int | None = None) -> dict:
-    """How much training produced this adapter, as plain JSON.
-
-    Read once by `cli.evaluate` and written into `run_manifest.json`, so a results directory can
-    report "trained on N samples" without opening a checkpoint. That matters: the evaluator reads
-    only `.npy` and `.json` by design (`eval/README.md`), and loading a torch checkpoint there would
-    put the model stack back into a path whose whole point is not having one.
-
-    `samples_seen` is the honest quantity -- `optimizer_step x effective_batch_size`, i.e. how many
-    volumes the optimizer actually consumed. It is **not** the dataset size: at 2 epochs it is
-    roughly twice it. Both are reported, with `samples_per_epoch` derived only when `epochs` is
-    known, because dividing by a guessed epoch count would invent a dataset size.
-
-    `world_size` is not in the checkpoint (it is a launch property, not a model property), so
-    `effective_batch_size` needs `train_summary.json`, which `cli.train_r2v` writes next to the
-    checkpoint. Absent that, per-rank numbers are reported and the derived ones are None rather
-    than silently computed at world_size=1 -- which would understate samples seen 8-fold for these
-    runs.
-    """
-    config = payload.get("config") or {}
-    training = config.get("training") or {}
-    optimizer_step = payload.get("optimizer_step") or payload.get("step")
-    # `epoch` is 0-indexed in the checkpoint, so the count of epochs completed is epoch + 1.
-    epoch_index = payload.get("epoch")
-
-    out = {
-        "optimizer_step": int(optimizer_step) if optimizer_step is not None else None,
-        "micro_step": int(payload["step"]) if payload.get("step") is not None else None,
-        "epochs_completed": (int(epoch_index) + 1) if epoch_index is not None else None,
-        "batch_size_per_rank": training.get("batch_size"),
-        "grad_accumulation_steps": training.get("grad_accumulation_steps"),
-        "learning_rate": training.get("lr"),
-        "conditioning": config.get("conditioning_name") or config.get("conditioning"),
-        "report_format": config.get("report_format"),
-        "world_size": None,
-        "world_size_source": None,
-        "effective_batch_size": None,
-        "samples_seen": None,
-        "samples_per_epoch": None,
-        "train_summary": None,
-    }
-
-    summary_path = None
-    if checkpoint_path is not None:
-        candidate = Path(checkpoint_path).parent / "train_summary.json"
-        if candidate.is_file():
-            summary_path = candidate
-    if summary_path is not None:
-        try:
-            summary = json.loads(summary_path.read_text())
-        except Exception as e:  # noqa: BLE001 -- provenance is never worth failing a run over
-            log.warning("could not read %s (%s); reporting per-rank training numbers only",
-                        summary_path, e)
-        else:
-            out["train_summary"] = str(summary_path)
-            out["world_size"] = summary.get("world_size")
-            out["world_size_source"] = "train_summary" if summary.get("world_size") else None
-            out["effective_batch_size"] = summary.get("effective_batch_size")
-            if summary.get("optimizer_steps") is not None:
-                out["optimizer_step"] = int(summary["optimizer_steps"])
-            if summary.get("epochs") is not None:
-                out["epochs_completed"] = int(summary["epochs"])
-            out["skipped_steps"] = summary.get("skipped_steps")
-            out["mean_loss"] = summary.get("mean_loss")
-            out["trainable_parameters"] = summary.get("trainable_parameters")
-            # The preprocessing a scoring cohort must match. Absent from summaries written before
-            # 2026-08-10, which is why `assert_preprocessing_matches_training` treats missing keys
-            # as "cannot verify" rather than "verified".
-            for key in ("posterior_shift_mm", "normalizer", "geometry_mode"):
-                if summary.get(key) is not None:
-                    out[key] = summary[key]
-
-    # An explicit world size fills the gap when the run died before writing its summary -- which is
-    # exactly configuration C (job 714499, host-RAM OOM in its final validation). The launch
-    # geometry is a recorded fact of that run (`slurm/final/_final_common.sh`: 2 nodes x 4 GPUs), so
-    # supplying it is provenance, not inference; `world_size_source` says which it was. It never
-    # overrides a value the summary already provided.
-    if world_size and not out["world_size"]:
-        out["world_size"] = int(world_size)
-        out["world_size_source"] = "explicit"
-        if out["batch_size_per_rank"] and out["grad_accumulation_steps"]:
-            out["effective_batch_size"] = (int(out["batch_size_per_rank"])
-                                           * int(out["grad_accumulation_steps"])
-                                           * int(world_size))
-
-    if out["optimizer_step"] and out["effective_batch_size"]:
-        out["samples_seen"] = int(out["optimizer_step"]) * int(out["effective_batch_size"])
-        if out["epochs_completed"]:
-            out["samples_per_epoch"] = out["samples_seen"] // int(out["epochs_completed"])
-    return out
 
 
 def save_adapter_checkpoint(
@@ -454,5 +349,4 @@ __all__ = [
     "save_adapter_checkpoint",
     "save_full_unet_checkpoint",
     "sha256_file",
-    "training_provenance",
 ]

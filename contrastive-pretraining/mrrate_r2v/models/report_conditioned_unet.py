@@ -1,36 +1,21 @@
-"""Report-conditioned NV-Generate-MR-Brain diffusion UNet.
+"""Report-conditioned NV-Generate-MR-Brain diffusion UNet. See `models/README.md` §2 for the full
+rationale -- in short:
 
-`DiffusionModelUNetMaisi` already has a conditioning path (`with_conditioning=True`), but it
-*replaces* each attention level's `SpatialAttentionBlock` with a `SpatialTransformer`: a different
-module tree, so NVIDIA's pretrained weights no longer load and the frozen part is no longer the
-architecture that was trained. This module keeps the pretrained tree byte-identical and *adds*
-cross-attention as new top-level modules:
+`DiffusionModelUNetMaisi`'s own `with_conditioning=True` *replaces* each attention level's
+`SpatialAttentionBlock` with a `SpatialTransformer`, a different module tree that NVIDIA's
+pretrained weights no longer load onto. This module instead keeps the pretrained tree
+byte-identical and *adds* cross-attention as new top-level modules:
 
-    context_proj                small MLP, any report embedding -> `cross_attention_dim`, so the
-                                choice of text encoder is not baked into the architecture
+    context_proj                small MLP, any report embedding -> `cross_attention_dim`
     {down,mid,up}_cross_attn    one zero-initialised `ReportCrossAttentionAdapter` per conditioned
-                                level, applied to the tensor *entering* that block
+                                 level, applied to the tensor *entering* that block (so the skip
+                                 connections leaving that level carry the report too)
 
-Properties that are the point of doing it this way:
-
-- Pretrained state dicts load with `unexpected == []` and `missing` exactly the conditioning path
-  (`load_pretrained_maisi_weights` enforces this, and the base geometry comes from NVIDIA's own
-  `config_network_rflow.json` via `nvidia_unet_kwargs`, not from a second copy of the numbers).
-- The adapter's `proj_out` is zero-initialised (`zero_module`, the same convention MAISI uses for its
-  own output conv), so at init the conditioned UNet is numerically *identical* to the pretrained one
-  -- fine-tuning starts *at* NVIDIA's model, not near it.
-- Conditioning enters at each block's *input*, so the skip connections leaving that level carry it
-  too; conditioning the block output would leave the decoder's skips report-blind.
-- `context=None`, or a per-sample `context_drop_mask`, selects a learned null embedding -- what
-  report dropout during training and the classifier-free-guidance branch of NVIDIA's inference loop
-  both need.
-- `context_mask` is honoured, so a padded batch of variable-length reports conditions on the real
-  tokens only. This is why the adapter is not monai's `SpatialTransformer`: that block's
-  `CrossAttentionBlock.forward` (monai/networks/blocks/crossattention.py:144) takes no mask, so
-  padding would silently join the attention softmax and the conditioning of a sample would depend
-  on the longest report that happened to share its batch. Dropping that block also drops its
-  spatial self-attention and GEGLU feed-forward, which duplicate what the pretrained
-  `SpatialAttentionBlock`s at those same levels already do, at O(voxels^2) attention cost.
+Each adapter's `proj_out` is zero-initialised, so at init the conditioned UNet is numerically
+identical to the pretrained one. `context=None` (or a per-sample `context_drop_mask`) selects a
+learned null embedding, for report dropout and classifier-free guidance; `context_mask` lets a
+padded batch of variable-length reports condition on real tokens only -- monai's own
+`SpatialTransformer`/`CrossAttentionBlock` takes no such mask.
 """
 
 from __future__ import annotations
@@ -59,23 +44,11 @@ _MAISI_PARAMS = inspect.signature(DiffusionModelUNetMaisi.__init__).parameters
 
 # -- SDPA backend guard ------------------------------------------------------------------------
 #
-# `F.scaled_dot_product_attention` is one *interface* over four interchangeable CUDA kernels; torch
-# picks one per call from the shapes, dtype and mask. Two places here reach it: the base model's
-# `SpatialAttentionBlock`s (MONAI's `use_flash_attention=True` means "call SDPA", not "use
-# FlashAttention"), and `MaskedCrossAttention` below, which calls it unconditionally.
-#
-# The cuDNN backend returns **non-finite gradients from a finite forward** at latent 48^3 -- the
-# (T2w, CORONAL) bucket -- in bfloat16 and float16. Measured: 8/8 seeds, batch 1-8, with random
-# Gaussian latents and no data, model or adapter involved; born on the query branch of
-# `up_blocks.1.attentions.*` and reaching every adapter tensor. This is the same class as PyTorch
-# issue #166211 (NaN in grad_q under CUDNN_ATTENTION, finite output), and cuDNN's own release notes
-# document a backward defect at certain static sequence lengths plus problems at key/value length 1
-# -- which is exactly what a pooled report embedding gives the adapter.
-#
-# Every other backend is correct here, so the fix is to take cuDNN out of the running rather than
-# to abandon SDPA. MATH stays in the list purely as a last resort: `MaskedCrossAttention` passes an
-# `attn_mask` that the fused kernels can refuse, and an empty candidate set is a hard
-# "No available kernel" error, not a fallback.
+# `F.scaled_dot_product_attention` picks one of several CUDA kernels per call. cuDNN's returns
+# non-finite gradients from a finite forward at latent 48^3 (the T2w/CORONAL bucket) in bf16/fp16
+# -- measured with random data, no model or adapter involved; the same class of bug as PyTorch
+# issue #166211. Every other backend is correct here, so the fix is to exclude cuDNN rather than
+# abandon SDPA. See `models/README.md` for the full writeup.
 def safe_sdpa_backends() -> list:
     """The SDPA backends this model is allowed to use: every one except cuDNN's."""
     from torch.nn.attention import SDPBackend
@@ -86,12 +59,11 @@ def safe_sdpa_backends() -> list:
 def sdpa_backend_guard(on_cuda: bool = True):
     """Context manager restricting SDPA to `safe_sdpa_backends()`. A no-op off CUDA.
 
-    Applied around the *forward* pass only, in `ReportConditionedUNetMaisi.forward`, which is
-    enough: the backend is chosen during forward and the matching backward kernel is bound into
-    the autograd node then, so backward inherits the choice (verified -- the 48^3 gradient is
-    finite with the guard on forward alone). Activation checkpointing would break that assumption
-    by re-running attention during backward under whatever context is live then; this model does
-    not use it, and a future change that adds it must wrap the backward too.
+    Applied around the forward pass only, in `ReportConditionedUNetMaisi.forward` -- the backend
+    chosen there is bound into the autograd node, so backward inherits it (verified: the 48^3
+    gradient is finite with the guard on forward alone). Activation checkpointing would break that
+    assumption by re-running attention during backward under whatever context is live then; this
+    model does not use it.
     """
     if not on_cuda:
         return contextlib.nullcontext()

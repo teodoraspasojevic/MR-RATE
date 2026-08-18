@@ -1,11 +1,6 @@
-"""The ONLY module in this package that touches NVIDIA's model-loading code -- and it imports
-exclusively from this repository's OWN vendored copy (`NV-Generate-CTMR/` at the repo root, added
-by commit `cf5cf1f`, Apache-2.0 licensed, `LICENSE`/`LICENSE.weights` intact). No other file in
-`evaluation/` imports `scripts.diff_model_infer` or anything else from that directory directly --
-this is the single seam, so a future change to the vendored copy's layout only requires touching
-this one file. This module never imports from any OTHER repository (in particular, never from
-`~/NV-Generate-CTMR`, the sibling fork used only as reference material for this package's design
--- see docs/design/archive/09_older_evaluation_implementation_audit.md).
+"""The only module in this package that imports NVIDIA's model-loading code -- and only from this
+repo's own vendored copy (`NV-Generate-CTMR/` at the repo root). See `models/README.md` for why
+this is kept as a single seam.
 """
 
 from __future__ import annotations
@@ -18,11 +13,7 @@ VENDORED_NVIDIA_ROOT = REPO_ROOT / "NV-Generate-CTMR"
 DEFAULT_CONFIGS_DIR = VENDORED_NVIDIA_ROOT / "configs"
 
 if not VENDORED_NVIDIA_ROOT.is_dir():
-    raise FileNotFoundError(
-        f"Vendored NVIDIA code not found at {VENDORED_NVIDIA_ROOT}. This repository is expected to "
-        "carry its own copy (added by commit cf5cf1f, 'feat: add NVIDIA-MRI-Brain official code') -- "
-        "this package never imports NVIDIA's model-loading code from any other repository."
-    )
+    raise FileNotFoundError(f"Vendored NVIDIA code not found at {VENDORED_NVIDIA_ROOT}.")
 if str(VENDORED_NVIDIA_ROOT) not in sys.path:
     sys.path.insert(0, str(VENDORED_NVIDIA_ROOT))
 
@@ -37,11 +28,10 @@ DEFAULT_NETWORK_CONFIG = DEFAULT_CONFIGS_DIR / "config_network_rflow.json"
 
 
 def required_spatial_divisor(autoencoder, cfg_args) -> int:
-    """The encoder's raw 2^n_downsample compression factor is NOT a sufficient padding target --
-    `MaisiConvolution`'s memory-saving conv-splitting also requires divisibility by `num_splits`
-    at the bottleneck resolution (ported rationale, verified in the older implementation's own
-    empirical test, docs/design/archive/09_older_evaluation_implementation_audit.md §15 -- this function's logic is unchanged from there,
-    only its call site differs).
+    """The padding target for a volume before VAE encoding: the encoder's 2^n_downsample
+    compression factor, times `num_splits` (`MaisiConvolution`'s memory-saving conv-splitting also
+    requires divisibility by that, at the bottleneck resolution). See `models/README.md` for how
+    this differs from the sampling-time divisor.
     """
     n_downsamples = sum(1 for m in autoencoder.encoder.modules() if isinstance(m, MaisiDownsample))
     compression = 2**n_downsamples
@@ -50,8 +40,8 @@ def required_spatial_divisor(autoencoder, cfg_args) -> int:
 
 
 def load_autoencoder(checkpoint_path, env_config=DEFAULT_ENV_CONFIG, model_config=DEFAULT_MODEL_CONFIG, network_config=DEFAULT_NETWORK_CONFIG, device: str = "cuda"):
-    """Loads ONLY the autoencoder (VAE) -- for VAE-reconstruction evaluation, which never needs
-    the diffusion UNet. Returns (autoencoder, cfg_args, required_divisor).
+    """Loads only the autoencoder (VAE), for callers that never need the diffusion UNet.
+    Returns (autoencoder, cfg_args, required_divisor).
     """
     import torch
 
@@ -73,12 +63,10 @@ def load_autoencoder_and_unet(env_config=DEFAULT_ENV_CONFIG, model_config=DEFAUL
     """For generation (needs both nets). Returns (autoencoder, unet, scale_factor, cfg_args) via
     NVIDIA's own `load_models`, unmodified.
 
-    **Both checkpoint paths must be overridden with absolute paths.** NVIDIA's shipped env config
-    stores them relative -- `model_dir="./models"`, `trained_autoencoder_path="models/..."` -- and
-    `load_models` resolves them against the *current working directory*. Running from anywhere
-    other than a directory that happens to contain `models/` then fails with a bare
-    FileNotFoundError. `unet_checkpoint_override` is split into the `model_dir`/`model_filename`
-    pair `load_models` actually reads, and `existing_ckpt_filepath` is kept consistent with it.
+    Both checkpoint paths must be overridden with absolute paths: NVIDIA's shipped env config
+    stores them relative to the current working directory (`model_dir="./models"`), which
+    `load_models` resolves as-is. `unet_checkpoint_override` is split into the `model_dir`/
+    `model_filename` pair `load_models` reads, with `existing_ckpt_filepath` kept consistent.
     """
     import logging
     from pathlib import Path as _Path
