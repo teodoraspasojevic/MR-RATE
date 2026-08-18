@@ -167,11 +167,6 @@ under: Python 3.12, torch 2.5.1+cu121, monai 1.5.2, transformers 5.14.1, numpy 2
 nibabel 5.4.2. Floating any of them turns a leaderboard score into a number we cannot reproduce
 locally, which is the point of pinning rather than a style preference.
 
-The in-container tree mirrors the repository — `/opt/app/NV-Generate-CTMR` beside
-`/opt/app/contrastive-pretraining/mrrate_r2v` — because `mrrate_r2v/models/nvidia.py` locates the
-vendored NVIDIA code as `parents[3]/NV-Generate-CTMR`. Flattening `contrastive-pretraining/` away
-makes that resolve to `/NV-Generate-CTMR` and the import fails at container start.
-
 Text-encoder directories are resolved from `MRRATE_PRETRAINED_DIR=/opt/app/pretrained`, never from
 the absolute cluster paths recorded in the adapter checkpoint. That is what lets arm D's three
 encoders load with no per-arm wiring in `entrypoint.sh`, and it is why `predict.py` passes

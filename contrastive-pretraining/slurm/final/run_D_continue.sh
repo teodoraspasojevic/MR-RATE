@@ -64,22 +64,6 @@ EPOCHS=2
 # never touched by `--keep-last-n`, unlike the `adapter_step*.pt` files.
 SAVE_EVERY_EPOCHS=1
 
-# ---------------------------------------------------------------- validation
-#
-# **Full N=512 passes, more often than the original's 4000.** Best-checkpoint tracking carries the
-# source run's bests forward (fvd 16.04, fid_2p5d 26.13, ssim 0.3574) so a resume cannot overwrite a
-# better checkpoint with a worse one -- but all three of those came from the single N=512 pass, and
-# FVD at N=128 is ~20 for the same weights. Left at 4000, this run would take one full pass and its
-# `best_*` files would be decided almost by that one pass. At 1500 it takes three, so the comparison
-# against the carried-forward bests is like-for-like at the N they were measured at.
-#
-# Affordable because the measured cost is small: 654 s for the N=512 pass, 126-189 s at N=128, and
-# 1701 s of validation in total across the whole 22.17 h source run.
-VALIDATE_FULL_EVERY=1500
-# The last thing the job does before writing `adapter_last.pt`, so the final checkpoint has a
-# full-N number attached rather than an N=128 one.
-VALIDATE_FULL_AT_END=1
-
 echo "=== continuing configuration D ==="
 echo "    resume from : $RESUME_FROM"
 echo "    into        : $WORKSPACE/runs/$TAG"

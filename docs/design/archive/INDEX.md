@@ -45,6 +45,7 @@ These are **not** archived — they document external systems, not this code's s
 | `08_dataset_recommendation_manifest_and_axis_order.md` | the axis-order trace end-to-end: why R2V returns (X,Y,Z) and the contrastive loader (D,H,W), with file:line citations into both models | changing any axis convention |
 | `09_older_evaluation_implementation_audit.md` | component-by-component audit of a previous evaluation implementation, including the blind-resize bug this one replaces | reintroducing anything from that implementation |
 | `10_evaluation_geometry_contract_and_shape_mismatch_policy.md` | the full four-verdict geometry policy with citations into the implementation and tests | loosening `compare_geometry` or adding a "just resize it" path |
+| `11_success_criteria_pre_challenge_metrics_rewrite.md` | the pre-challenge-metrics success criteria (`slurm/SUCCESS_CRITERIA.md`/`check_run.py`, deleted from `slurm/` as unrunnable against the current `metrics.json` schema) and the findings behind its E5/E7 threshold revisions and known-acceptable outcomes | writing new success criteria against `challenge_metrics.ChallengeAccumulator`'s output, so earlier findings aren't rediscovered from scratch |
 | `mr_rate_dataset_and_dataloader_implementation.md` | the original dataset/dataloader analysis that preceded doc 06 | historical context only |
 | `report2volume_gap_analysis.md` | what was missing for R2V at the outset | historical context only |
 | `recommended_next_steps.md` | a planning snapshot | historical context only |
@@ -61,3 +62,9 @@ current guides and keeping them would mean two sources of truth:
 - `REPORT_TO_VOLUME.md` — a 690-line beginner guide, superseded by `docs/R2V.md` plus
   `mrrate_r2v/data/README.md`.
 - `evaluation/README.md` — superseded by `mrrate_r2v/eval/README.md`.
+- `slurm/SUCCESS_CRITERIA.md` and `slurm/check_run.py` (2026-08-18) — checked a metrics schema
+  (`metrics_per_bucket.csv`/`metrics_summary.csv`, `psnr_fg`/`ssim3d_whole`/`ncc_fg`/
+  `edge_preservation_fg`, per-bucket FID ordering, `report_consistency`) that the challenge-metrics
+  rewrite replaced with one `metrics.json` scored by `challenge_metrics.ChallengeAccumulator`;
+  `mrrate_r2v/README.md` had already flagged both as stale and unable to run. Content preserved in
+  `11_success_criteria_pre_challenge_metrics_rewrite.md`.

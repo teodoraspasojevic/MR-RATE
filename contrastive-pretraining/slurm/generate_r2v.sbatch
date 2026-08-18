@@ -12,12 +12,12 @@
 #
 # Report-to-volume inference with a trained adapter, through NVIDIA's own sampler and decoder.
 #
-#   sbatch slurm/07_generate_r2v.sbatch <ws>/runs/<tag>/adapter_last.pt
+#   sbatch slurm/generate_r2v.sbatch <ws>/runs/<tag>/adapter_last.pt
 #
 # The adapter path is positional because `#SBATCH --export=NONE` (FAU's recommended setting, kept
 # from the other scripts here) means a plain `VAR=x sbatch ...` does NOT reach the job. Everything
 # else below is an environment variable, so override those with
-# `sbatch --export=ALL,R2V_STEPS=10 slurm/07_generate_r2v.sbatch <adapter>`.
+# `sbatch --export=ALL,R2V_STEPS=10 slurm/generate_r2v.sbatch <adapter>`.
 #
 # Variants:
 #   R2V_REPORT_GUIDANCE=0        modality-only generation, i.e. NVIDIA's original behaviour
@@ -28,9 +28,9 @@
 #
 # **This script does NOT produce anything cli.evaluate can score.** It writes .nii.gz files plus a
 # generation_manifest.json -- volumes you can open in a viewer, in NVIDIA's int16 [0, 1000] output
-# range. A prediction set (predictions.json + per-bucket .npz, in the cohort's percentile-
-# normalised space) comes from `slurm/13_predict_r2v.sbatch`, which runs cli.predict_r2v. Use this
-# one to look at a sample; use 13 to get numbers.
+# range. For scored metrics, use `slurm/evaluate.sbatch --task report2volume` instead, which
+# generates and scores in one streaming pass. Use this script to look at a sample; use
+# evaluate.sbatch to get numbers.
 
 unset SLURM_EXPORT_ENV
 set -euo pipefail

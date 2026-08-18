@@ -105,21 +105,11 @@ submit() {   # submit <arm> <tag suffix> <n_per_bucket> <cfg> <format> <walltime
     exports+=",R2V_MODALITY_GUIDANCE=${MODALITY_GUIDANCE},R2V_SEED=${SEED}"
     exports+=",R2V_SPLIT=${SPLIT},R2V_POSTERIOR_SHIFT=${POSTERIOR_SHIFT}"
     exports+=",R2V_NORMALIZER=${NORMALIZER},R2V_REPORT_FORMAT=${fmt}"
-    exports+=",R2V_TRAIN_WORLD_SIZE=${TRAIN_WORLD_SIZE},R2V_ALLOW_FORMAT_MISMATCH=${allow}"
+    exports+=",R2V_ALLOW_FORMAT_MISMATCH=${allow}"
     exports+=",R2V_WANDB=${WANDB_MODE},R2V_WANDB_PROJECT=${WANDB_PROJECT}"
     exports+=",R2V_WANDB_GROUP=sweep_${STAGE},R2V_WANDB_NAME=${tag}"
     exports+=",R2V_WANDB_PANELS=${WANDB_PANELS},R2V_WANDB_REPORTS=${WANDB_REPORTS}"
-    # CASE_TOTAL replaces per-bucket balancing with one draw over the whole split. The two are
-    # mutually exclusive and the CLI refuses both, so this is an if/else rather than two appends.
-    if [[ -n "${CASE_TOTAL:-}" ]]; then
-        exports+=",R2V_N_TOTAL=${CASE_TOTAL}"
-    else
-        exports+=",R2V_N_PER_BUCKET=${n}"
-    fi
-    # Random case selection instead of the first-N prefix. Only the `representative` and
-    # `unbalanced` stages set this; every other stage leaves it empty so its runs stay
-    # prefix-nested with the 20 cfg jobs.
-    [[ -n "${CASE_SELECTION_SEED:-}" ]] && exports+=",R2V_CASE_SELECTION_SEED=${CASE_SELECTION_SEED}"
+    exports+=",R2V_N_PER_BUCKET=${n}"
     # No `--frechet-batch-size` override any more. It existed because the old 50/bucket stage could
     # not fill a 512-case batch; every stage now runs at N_PER_BUCKET so the default 512 applies
     # everywhere, which is what keeps `overall_batched_n512` comparable across every job.
@@ -134,7 +124,7 @@ submit() {   # submit <arm> <tag suffix> <n_per_bucket> <cfg> <format> <walltime
     local job
     job=$(sbatch --parsable --job-name="ev_${tag}" --time="$walltime" --export="$exports" \
         ${dependency+"${dependency[@]}"} \
-        "$REPO_ROOT/slurm/05_evaluate.sbatch" report2volume "$tag" "$adapter")
+        "$REPO_ROOT/slurm/evaluate.sbatch" report2volume "$tag" "$adapter")
     # The adapter is printed because it is SUBSTITUTED for configuration C: that run died before
     # writing adapter_last.pt, so it falls back to adapter_step0004200.pt. A silent substitution in
     # a 12-job sweep is exactly how a step-mismatched comparison gets read as a like-for-like one.
@@ -211,17 +201,17 @@ representative)
     # overwrite nor be confused with the prefix runs. **They are NOT case-by-case comparable with
     # the 20 cfg jobs** -- different case list, so no paired per-case test across the two sets.
     # They ARE comparable to each other: one case list shared across the cfg values.
-    CASE_SELECTION_SEED="${CASE_SELECTION_SEED:-42}"
-    REPRESENTATIVE_ARMS="${REPRESENTATIVE_ARMS:-D}"
-    REPRESENTATIVE_CFG="${REPRESENTATIVE_CFG:-3.0 4.0}"
-    echo "=== representative: RANDOM ${N_PER_BUCKET}/bucket, case-selection seed ${CASE_SELECTION_SEED}"
-    echo "    arms: $REPRESENTATIVE_ARMS   cfg: $REPRESENTATIVE_CFG"
-    for arm in $REPRESENTATIVE_ARMS; do
-        for cfg in $REPRESENTATIVE_CFG; do
-            submit "$arm" "cfg${cfg}_rand${CASE_SELECTION_SEED}" "$N_PER_BUCKET" \
-                "$cfg" "$TRAINED_FORMAT" "$WALLTIME"
-        done
-    done
+    #
+    # **Disabled, not fixed.** This stage needs `cli.evaluate` to support a seeded random draw
+    # (`--case-selection-seed` or equivalent); no such flag exists today, so `evaluate.sbatch`
+    # silently drops the `R2V_CASE_SELECTION_SEED` export this stage used to set and every job ran
+    # the ordinary first-N-per-bucket prefix instead -- the exact bias this stage exists to avoid,
+    # with no error to say so. Re-enable once that CLI support exists; the analysis above is why
+    # it's worth adding rather than a reason to just delete this stage.
+    echo "'representative' needs seeded random case selection in cli.evaluate, which doesn't exist yet." >&2
+    echo "It used to silently fall back to the ordinary first-N prefix -- the exact bias this stage" >&2
+    echo "exists to avoid. Disabled until cli.evaluate grows that flag." >&2
+    exit 1
     ;;
 unbalanced)
     # **The `representative` stage fixed WHICH cases; this one fixes the MIXTURE.**
@@ -261,18 +251,19 @@ unbalanced)
     #
     # Tag carries `_all<total>_rand<seed>`. Third distinct population, so NO case-level comparison
     # with either the prefix runs or the `representative` ones.
-    CASE_SELECTION_SEED="${CASE_SELECTION_SEED:-42}"
-    CASE_TOTAL="${CASE_TOTAL:-2000}"
-    UNBALANCED_ARMS="${UNBALANCED_ARMS:-D}"
-    UNBALANCED_CFG="${UNBALANCED_CFG:-3.0 4.0}"
-    echo "=== unbalanced: RANDOM ${CASE_TOTAL} over the whole split, seed ${CASE_SELECTION_SEED}"
-    echo "    arms: $UNBALANCED_ARMS   cfg: $UNBALANCED_CFG   (buckets at population frequency)"
-    for arm in $UNBALANCED_ARMS; do
-        for cfg in $UNBALANCED_CFG; do
-            submit "$arm" "cfg${cfg}_all${CASE_TOTAL}_rand${CASE_SELECTION_SEED}" \
-                "$N_PER_BUCKET" "$cfg" "$TRAINED_FORMAT" "$WALLTIME"
-        done
-    done
+    #
+    # **Disabled, not fixed.** Same root cause as `representative`: this stage needs `cli.evaluate`
+    # to support drawing a random total over the whole split (`--n-total`/`--case-selection-seed`
+    # or equivalent) instead of the per-bucket-balanced `--n-per-bucket`; neither exists today, so
+    # `evaluate.sbatch` silently dropped the `R2V_N_TOTAL`/`R2V_CASE_SELECTION_SEED` exports this
+    # stage used to set and fell through to `cli.evaluate`'s default of the entire ~29,027-case test
+    # split -- far past this stage's own `$WALLTIME`, so the job would run until killed. Re-enable
+    # once that CLI support exists; the analysis above is why it's worth adding, not a reason to
+    # delete the stage.
+    echo "'unbalanced' needs whole-split random sampling (--n-total) in cli.evaluate, which doesn't" >&2
+    echo "exist yet. It used to silently fall through to the full ~29,027-case test split instead --" >&2
+    echo "far past this stage's own walltime. Disabled until cli.evaluate grows that support." >&2
+    exit 1
     ;;
 all)
     # **Removed, not fixed.** It submitted all three stages at once and its own header claimed

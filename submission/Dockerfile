@@ -1,7 +1,6 @@
 # VLM3D `mr-volume-generation` submission — thin image, weights mounted at /weights.
 #
-# Build from the REPOSITORY ROOT (the context needs both NV-Generate-CTMR/ and
-# contrastive-pretraining/):
+# Build from the REPOSITORY ROOT (the context needs contrastive-pretraining/ and submission/):
 #
 #     docker buildx build --platform linux/amd64 -f submission/Dockerfile -t mr-r2v-vlm3d-challenge:latest .
 #
@@ -97,12 +96,11 @@ ENV TRANSFORMERS_OFFLINE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 
-# The in-container tree mirrors the repository, and that is load-bearing at exactly one place:
-# `mrrate_r2v/models/nvidia.py` finds the vendored NVIDIA code as `parents[3]/NV-Generate-CTMR`.
-# Flattening `contrastive-pretraining/` away would make that resolve to `/NV-Generate-CTMR`.
+# The in-container tree:
 #
-#   /opt/app/NV-Generate-CTMR/                     vendored NVIDIA model + configs (Apache-2.0)
-#   /opt/app/contrastive-pretraining/mrrate_r2v/   our package
+#   /opt/app/contrastive-pretraining/mrrate_r2v/   our package (NVIDIA's model-loading pieces it
+#                                                   needs are copied into models/nvidia.py itself,
+#                                                   Apache-2.0-attributed there -- no separate copy)
 #   /opt/app/{predict.py,entrypoint.sh}
 #   /opt/app/models/       -> symlinks into /weights          (made by entrypoint.sh)
 #   /opt/app/pretrained/   -> /weights/pretrained             (made by entrypoint.sh)
@@ -128,10 +126,6 @@ WORKDIR /opt/app
 RUN mkdir -p /opt/app/models /opt/app/pretrained /input /output /checkpoint \
     && chown -R appuser:appuser /opt/app /input /output /checkpoint
 
-COPY --chown=appuser:appuser NV-Generate-CTMR/scripts  /opt/app/NV-Generate-CTMR/scripts
-COPY --chown=appuser:appuser NV-Generate-CTMR/configs  /opt/app/NV-Generate-CTMR/configs
-COPY --chown=appuser:appuser NV-Generate-CTMR/LICENSE  /opt/app/NV-Generate-CTMR/LICENSE
-COPY --chown=appuser:appuser NV-Generate-CTMR/LICENSE.weights /opt/app/NV-Generate-CTMR/LICENSE.weights
 COPY --chown=appuser:appuser contrastive-pretraining/mrrate_r2v \
                              /opt/app/contrastive-pretraining/mrrate_r2v
 COPY --chown=appuser:appuser submission/predict.py    /opt/app/predict.py

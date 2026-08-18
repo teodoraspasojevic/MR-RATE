@@ -95,9 +95,6 @@ def parse_args(argv=None):
     model.add_argument("--model-name", default=None, help="recorded in metrics.json")
     model.add_argument("--allow-base-mismatch", action="store_true")
     model.add_argument("--allow-report-format-mismatch", action="store_true")
-    model.add_argument("--train-world-size", type=int, default=None,
-                       help="rank count the adapter was TRAINED on, for the training-sample count "
-                            "when the run wrote no train_summary.json")
 
     samp = p.add_argument_group("sampling")
     samp.add_argument("--num-inference-steps", type=int, default=30)
@@ -132,28 +129,22 @@ def parse_args(argv=None):
 # --------------------------------------------------------------------------- dataset
 
 def build_dataset(args):
-    """The dataset, built exactly as `cli.train_r2v.build_dataset` builds it.
+    """The dataset, built by the same `data.build_r2v_dataset` `cli.train_r2v` uses.
 
     `series_selection` is the one deliberate difference and it is not a preprocessing difference:
     training uses `"all"` so a study's report is paired with each of its series, while evaluation
     uses `"one_per_study_per_bucket"` so one study contributes one observation per bucket.
     """
-    import torch
+    from ..data import build_r2v_dataset
 
-    from ..data import MRReportToVolumeDataset, R2VDatasetConfig
-    from ..data.reports import ShardReportStore
-
-    config = R2VDatasetConfig(
-        split=args.split, report_sections=tuple(args.report_sections),
-        report_format=args.report_format, geometry_mode=args.geometry_mode,
-        series_selection="one_per_study_per_bucket", posterior_shift_mm=args.posterior_shift_mm,
-        normalizer=args.normalizer, dtype=torch.float32, seed=args.seed,
+    dataset = build_r2v_dataset(
+        args.manifest, args.report_index, split=args.split, report_format=args.report_format,
+        geometry_mode=args.geometry_mode, series_selection="one_per_study_per_bucket",
+        posterior_shift_mm=args.posterior_shift_mm, normalizer=args.normalizer, seed=args.seed,
+        report_sections=args.report_sections,
     )
-    dataset = MRReportToVolumeDataset(
-        str(args.manifest), ShardReportStore(str(args.report_index)), config=config
-    )
-    log.info("dataset: %d (report, volume) pairs in split '%s'", len(dataset), args.split)
-    return dataset, config
+    log.info("dataset: %d (report, volume) pairs in split %r", len(dataset), args.split)
+    return dataset, dataset.config
 
 
 # --------------------------------------------------------------------------- generators
@@ -166,7 +157,6 @@ def build_report2volume(args, dataset):
     """
     from types import SimpleNamespace
 
-    from ..models.adapter import training_provenance
     from .generate_r2v import assert_report_format_matches, build_sampler
 
     sampler, _embedder, payload = build_sampler(SimpleNamespace(
@@ -180,10 +170,10 @@ def build_report2volume(args, dataset):
         batched_guidance=True, allow_base_mismatch=args.allow_base_mismatch,
     ))
 
-    training = training_provenance(payload, args.checkpoint, world_size=args.train_world_size)
-    log.info("training provenance: %s optimizer steps, %s epochs, %s samples seen",
-             training.get("optimizer_step"), training.get("epochs_completed"),
-             training.get("samples_seen"))
+    training = {"optimizer_step": payload.get("optimizer_step") or payload.get("step"),
+                "epoch": payload.get("epoch"), "loss": payload.get("loss")}
+    log.info("training provenance: %s optimizer steps, epoch %s, loss %s",
+             training["optimizer_step"], training["epoch"], training["loss"])
     assert_report_format_matches(payload, _FormatView(args.report_format),
                                  allow_mismatch=args.allow_report_format_mismatch,
                                  embedder=sampler.text_embedder)
@@ -257,7 +247,7 @@ def reconstruct(autoencoder, volume, divisor: int, device: str):
 
 def build_reconstruction(args, dataset):
     """The frozen NVIDIA autoencoder: encode the real volume, decode it back, same grid."""
-    from ..cohort import sha256_file
+    from ..models.adapter import sha256_file
     from ..models.nvidia import (
         DEFAULT_ENV_CONFIG, DEFAULT_MODEL_CONFIG, DEFAULT_NETWORK_CONFIG, load_autoencoder,
     )
@@ -283,7 +273,7 @@ def build_generation(args, dataset):
     import numpy as np
     import torch
 
-    from ..cohort import sha256_file
+    from ..models.adapter import sha256_file
     from ..data.geometry import UNET_SPATIAL_MULTIPLE
     from ..models.nvidia import (
         DEFAULT_ENV_CONFIG, DEFAULT_MODEL_CONFIG, DEFAULT_NETWORK_CONFIG,

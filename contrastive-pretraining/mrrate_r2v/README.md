@@ -2,21 +2,18 @@
 
 Generate a 3D brain MRI volume from a radiology report, and measure how good it is.
 
-This is the package entry point: **what each piece is, how the pieces connect, and how to run
-training and inference.** For *why* the experiment is designed this way — sampling policy, FOV
-choices, what makes two runs comparable — read [`docs/R2V.md`](../../docs/R2V.md). The two files are
-deliberately split so they don't drift: that one is the experiment guide, this one is the code map.
+This file is the map: what each piece is, where it lives, and how to run training and
+inference. For *why* it's designed this way, see [`docs/R2V.md`](../../docs/R2V.md) (the
+experiment guide) and [`DEVELOPER_NOTES.md`](DEVELOPER_NOTES.md) (implementation-level detail,
+edge cases, and history — not needed to just use the pipeline).
 
-Layer guides: [`data/README.md`](data/README.md) · [`models/README.md`](models/README.md) ·
-[`cli/README.md`](cli/README.md) · [`eval/README.md`](eval/README.md)
-
-No installation needed — it is importable from `contrastive-pretraining/` as a plain package.
+No installation needed — it's importable from `contrastive-pretraining/` as a plain package.
 
 ---
 
-## 1. What the model actually is
+## 1. What it is
 
-One sentence: **NVIDIA's `NV-Generate-MR-Brain` diffusion model, frozen, with a small trainable
+**NVIDIA's `NV-Generate-MR-Brain` diffusion model, frozen, with a small trainable
 cross-attention adapter that lets a radiology report steer it.**
 
 ```
@@ -33,98 +30,42 @@ cross-attention adapter that lets a radiology report steer it.**
                                                        L1 loss vs (latent − noise)
 ```
 
-**Trainable: 8,080,000 of 188,580,868 parameters (4.28%).** The trainer asserts that before the
-first optimizer step and refuses to start otherwise.
-
-Why so little? Because the adapters are zero-initialised, the conditioned model is *numerically
-identical* to NVIDIA's at step 0. Training starts **at** a working brain-MRI generator and only ever
-adds the report on top — instead of trying to relearn brain anatomy from 88k studies.
-
----
+Only **4.28%** of parameters (~8M of ~189M) are trainable. The adapters start
+zero-initialized, so the conditioned model is numerically identical to NVIDIA's at step 0 —
+training starts from a working brain-MRI generator and just adds the report on top.
 
 ## 2. The pipeline, in three steps
 
 ```
 stage 0   build_manifest    →  manifest.csv (+ report_index.csv)     once per storage location
  train    train_r2v         →  adapter_last.pt                       --split train
- test     evaluate --task   →  RESULTS dir (CSV + summary + figures) --split test
+ test     evaluate --task   →  metrics.json                          --split test
 ```
 
-**Train and test are the same program up to the point where one trains and the other infers.**
-Both call `build_dataset`, both construct `R2VDatasetConfig` from the same flags, both resolve a
-case's grid through `dataset.geometry.resolve`. Where training calls `loss.backward()`, evaluation
-calls the sampler and then the metrics. Nothing is written to disk in between — no cohort, no
-prediction set, no `.npy`. A case is preprocessed, generated, scored and released, one at a time.
-
-That is the structural reason the package looks like this. The old design had three artifacts that
-could drift, and one did: training ran at `posterior_shift_mm=15` while every cohort was built at
-`0`, displacing 15.8% of test cases, and nothing could see it because the value existed on only one
-side. Removing the intermediate artifacts removes the class of bug.
-
-What makes two runs comparable is **`run_id`** ([`eval/live.py`](eval/live.py)): a hash over the
-ordered case list, every preprocessing setting, the task, the sample cap, the seed and the model
-checkpoint. Equal `run_id` means the same cases at the same geometry under the same preprocessing —
-the guarantee `cohort_id` used to carry, computed from the run instead of stored, so it cannot go
-stale. On top of it, `cli.evaluate` compares its own preprocessing flags against what the adapter
-recorded and refuses a mismatch before any GPU work.
-
-[`cohort.py`](cohort.py) and [`predictions.py`](predictions.py) remain as the library for reading
-results produced before 2026-08-10.
-- **[`predictions.py`](predictions.py)** — a prediction set records the `cohort_id` it was produced
-  against. `evaluate` hard-fails on a mismatch. **There is no `--force` and no "close enough"
-  comparison, by design** — that refusal is what makes two experiments comparable.
-
-Both use stdlib + numpy only, so an evaluation never needs the data stack or a model loaded.
-
----
+`train_r2v` and `evaluate` share one dataset-building path, so they can't preprocess
+differently. Evaluation streams generate→score one case at a time — nothing intermediate is
+written to disk (no cohort, no prediction set, no `.npy`).
 
 ## 3. Module map
 
-### Top level
-
 | module | what it is |
 |---|---|
-| [`cohort.py`](cohort.py) | the frozen ground-truth contract: `Cohort`, `CohortCase`, `cohort_id` |
-| [`predictions.py`](predictions.py) | its mirror: `PredictionSet`, `PredictionItem`, `PredictionReader.assert_matches_cohort` |
-| [`volumes.py`](volumes.py) | on-disk volume storage — one `.npz` archive per (modality, plane) bucket, random-access by `case_id` |
-| [`text.py`](text.py) | the replaceable text-encoder seam: `TextEmbedder` protocol, `RadBertEmbedder`, `MockTextEmbedder`, one registry |
-| [`conditioning.py`](conditioning.py) | modality class ids, NVIDIA's own modality dropout, report dropout, classifier-free guidance |
-| [`training.py`](training.py) | `MRRateAdapterTrainer` — mirrors `NV-Generate-CTMR/scripts/diff_model_train.py` |
-| [`sampling.py`](sampling.py) | `ReportToVolumeSampler` — mirrors `scripts/diff_model_infer.py` |
-
-### Subpackages
+| [`text.py`](text.py) | the text-encoder seam: `TextEmbedder` protocol, `RadBertEmbedder`, `MockTextEmbedder` |
+| [`conditioning.py`](conditioning.py) | modality class ids, modality/report dropout, classifier-free guidance |
+| [`training.py`](training.py) | `MRRateAdapterTrainer` — the training loop |
+| [`sampling.py`](sampling.py) | `ReportToVolumeSampler` — the inference loop |
 
 | package | guide | what it does |
 |---|---|---|
 | [`data/`](data/) | [README](data/README.md) | manifest → archive reads → preprocessing → `(volume, report)` pairs |
 | [`models/`](models/) | [README](models/README.md) | the frozen NVIDIA nets, the report adapter, what is trainable |
-| [`cli/`](cli/) | [README](cli/README.md) | the eight entry points and every flag |
+| [`cli/`](cli/) | [README](cli/README.md) | the entry points and their flags |
 | [`eval/`](eval/) | [README](eval/README.md) | one runner, three tasks, one result layout |
+| [`textenc/`](textenc/) | [README](textenc/README.md) | turning report text into conditioning tensors |
 
-### Two structural rules that look arbitrary but are not
+## 4. One sample, at a glance
 
-- **`eval/__init__.py` re-exports nothing**, and `data/{storage,manifest,reports,geometry}.py` import
-  no torch. A heavy dependency in one module must not make another unimportable — a pyarrow-only
-  interpreter has to be able to build a shards manifest.
-- **The evaluator reads `.npy` files and nothing else.** No manifest, no archive, no Dataset, no
-  model. That is what makes it *impossible* for the evaluator to preprocess differently than the
-  cohort did.
-
----
-
-## 4. Walkthrough: from a NIfTI on disk to a number
-
-### 4.1 One sample
-
-[`MRReportToVolumeDataset.__getitem__`](data/dataset.py), per index:
-
-1. resolve the (modality, plane) **bucket** and its target geometry;
-2. read the NIfTI bytes straight out of the `.zip`/tar archive (no extraction in `stream` mode);
-3. **RAS reorient → resample → crop/pad → normalize** (`percentile` 0–99.5 → [0,1], which is
-   NVIDIA's own MRI transform) — this is `scripts/data.py`'s code, imported unchanged, so the two
-   pipelines in this repo cannot drift on how a volume is prepared;
-4. permute `(D,H,W)` → `(X,Y,Z)` **exactly once**;
-5. fetch the report and concatenate the requested sections.
+[`MRReportToVolumeDataset.__getitem__`](data/dataset.py) turns one (study, series) pair into:
 
 ```python
 sample = {
@@ -132,188 +73,43 @@ sample = {
   "report_text":       "Findings: ...  Impression: ...",
   "modality":          "T1w",                 # becomes the class label
   "acquisition_plane": "AXIAL",
-  "target_spacing_mm": tensor([1., 1., 1.]),  # a real conditioning input, not just header metadata
+  "target_spacing_mm": tensor([1., 1., 1.]),  # a real conditioning input, not just metadata
   "target_shape":      tensor([256, 256, 256]),
   "study_key", "series_key":                  # identifiers — never log verbatim
 }
 ```
 
-**One sample = one report paired with one real volume.** A study with 6 series produces 6 samples
-during training (`series_selection="all"`), all conditioned on the same report.
+One sample = one report paired with one real volume; a study with 6 series produces 6 samples
+during training.
 
 > ⚠️ **Axis order is the single most bug-prone thing in this package.** Internal geometry is
-> `(D,H,W)=(S,R,A)`; everything crossing the package boundary is `(X,Y,Z)=(R,A,S)`. Convert only via
-> `geometry.dhw_to_xyz` / `xyz_to_dhw`. A skipped conversion is **silent** for a 256³ cube at
-> isotropic spacing and scrambles axes otherwise.
+> `(D,H,W)`; everything crossing the package boundary is `(X,Y,Z)`. Convert only via
+> `geometry.dhw_to_xyz`/`xyz_to_dhw` — see [`DEVELOPER_NOTES.md`](DEVELOPER_NOTES.md) for why a
+> skipped conversion can be silent.
 
-### 4.2 Batching
+Batching uses `collate_fn_r2v` + (for `geometry_mode="per_modality_plane"`)
+`GeometryBucketBatchSampler`, which only ever draws a batch from one (modality, plane) bucket at
+a time — that's what makes `batch_size > 1` legal when bucket shapes differ.
 
-`collate_fn_r2v` stacks the tensors and keeps strings as lists. Under `per_modality_plane` geometry
-each bucket has its own shape, so `GeometryBucketBatchSampler` only ever emits batches drawn from
-**one** bucket — that is what makes `batch_size > 1` legal.
+## 5. How report conditioning works
 
-`drop_last=True` (what `cli.train_r2v` uses) drops a bucket's *remainder*, never the **bucket**. A
-bucket smaller than `batch_size` has no full batch at all, so a plain `drop_last` deletes it from
-every epoch and the model silently never sees that (modality, plane). On the real train split at
-`batch_size=8` that is SWI CORONAL (4 series) and SWI SAGITTAL (2) — and neither exists in val or
-test, so no metric could have revealed it. Such buckets keep one short batch and are logged as
-`undersized_buckets`.
+1. A **frozen text encoder** turns the report into `[B, n, D]` token embeddings + an attention
+   mask. Which encoder, and whether `n` is the token count or 1, is set by `--conditioning` —
+   see [`textenc/README.md`](textenc/README.md).
+2. **`context_proj`** (trainable) projects to the adapters' width. This is the only place the
+   text encoder's width appears, so swapping encoders needs no other code change.
+3. **Five cross-attention adapters**, one per conditioned UNet level plus the bottleneck: every
+   voxel asks which words of the report are relevant to it, and adds the answer to itself.
+4. A **learned "no report" token** replaces the report for 10% of training samples, so the model
+   learns the difference a report makes — which classifier-free guidance amplifies at inference.
 
-### 4.2.1 Report format
-
-`R2VDatasetConfig.report_format` takes one name from
-[`textenc/formats.py`](textenc/formats.py) — or **several, comma-separated**, in which case one is
-drawn per sample, uniformly, deterministically from `(seed, epoch, index)`.
-
-The shipped training spec is `findings_impression_meta,impression_findings_meta`
-(`ORDER_AGNOSTIC_META_SPEC`). Two reasons, both about the challenge rather than about MR-RATE:
-
-- **Section order.** The challenge's report layout is unknown and nothing at submission time can
-  detect that the order flipped. Training on both orders means the model has seen every section in
-  first position — which matters most under truncation, where a 512-token encoder keeps the head of
-  the string (8–10% of MR-RATE studies truncate; RadBERT 9.2%).
-- **`[MODALITY] … [PLANE] … [SPACING] x y z`** leads both orderings. Spacing is `(X, Y, Z)` and
-  matches the sample's own `target_spacing_mm` exactly. It is *also* a numeric input via
-  `spacing_tensor`, but the text encoder is the only path that sees modality, plane and spacing
-  together, and it is the path a challenge request can populate with no volume attached.
-
-Validation is pinned to the spec's **first** name — a sampled format would add format variance to a
-curve whose only job is to show model improvement. The checkpoint records the whole spec, so
-`cli.generate_r2v` accepts a cohort built under either ordering.
-
-At inference (`cli.generate_r2v --report`) the prefix is prepended from `--modality`, `--plane` and
-`--spacing`, and `--dim`/`--spacing` default to that bucket's own trained grid. Only pass them to
-override; an unknown (modality, plane) still lands on NVIDIA's 256³ @ 1 mm.
-
-### 4.3 One training step
-
-```python
-latents   = vae.encode_stage_2_inputs(image) * scale_factor      # frozen, no_grad
-spacing   = target_spacing_mm * 1e2                              # NVIDIA's own transform
-modality  = augment_modality_label(class_ids, prob=0.1)          # NVIDIA's own dropout
-cond      = radbert.encode(report_text)                          # frozen -> tokens + mask
-drop      = sample_report_drop_mask(B, 0.10)                     # 10% get the learned null token
-
-noise     = randn_like(latents)
-timesteps = scheduler.sample_timesteps(latents)                  # RFlow picks its own
-noisy     = scheduler.add_noise(latents, noise, timesteps)
-
-pred   = unet(x=noisy, timesteps=timesteps, spacing_tensor=spacing, class_labels=modality,
-              context=cond.token_embeddings, context_mask=cond.attention_mask,
-              context_drop_mask=drop)
-target = latents - noise                       # rectified-flow velocity
-loss   = L1Loss()(pred, target)
-```
-
-**The loss is NVIDIA's own**: `L1` on the velocity target `x0 − ε`. Not MSE, not SNR-weighted, and
-**no auxiliary report/image alignment term** — the adapter has to earn its keep on the original
-generative objective. `Adam(lr=1e-5)`, `PolynomialLR(power=2)`, AMP + `GradScaler`. **No EMA**,
-because there is none in the official code either.
-
-`training.py`'s module docstring carries the line-by-line mapping to
-`NV-Generate-CTMR/scripts/diff_model_train.py`, including the three deliberate differences (optimizer
-sees only the adapter; `scale_factor` comes from the checkpoint; latents encoded on the fly).
-
-### 4.4 How report conditioning works
-
-Four steps — full detail in [`models/README.md`](models/README.md):
-
-1. **A frozen text encoder** turns the report into `[B, n, D]` embeddings plus an attention mask
-   (`no_grad`, permanently in `eval()`). Which encoder, and whether `n` is the token count or 1,
-   is set by `--conditioning` — see [`textenc/README.md`](textenc/README.md) Part 4. `n` is the
-   longest report in the batch, capped at `--max-report-tokens`; padding is masked out.
-2. **`context_proj`** (a small trainable MLP) projects to `[B, n, 512]`, preserving the sequence
-   axis. This is the *only* place the text encoder's width appears, which is why swapping encoders
-   needs no other code change.
-3. **Five cross-attention adapters** sit at the input of each conditioned UNet level and at the
-   bottleneck. Each is `x + proj_out(attn(norm(x)))`, with `proj_out` zero-initialised. Read it as:
-   *every voxel of the feature map asks which words of this report are relevant to it, and adds the
-   answer to itself.* The mask is honoured, so padding never joins the softmax.
-
-   This only does anything for `n > 1`: softmax over a single key is identically 1, so a pooled
-   one-token configuration reduces the adapter to a per-channel bias applied uniformly at every
-   voxel, and its query/key projections receive no gradient at all.
-4. **A learned `null_context` token** replaces the report for 10% of training samples. So the model
-   learns both "with this report" and "with no report" — and the difference between the two is
-   exactly the report's contribution, which guidance amplifies at inference. Training dropout and
-   inference CFG go through the *same* code path.
-
-### 4.5 Inference
-
-`sampling.py` is `diff_model_infer.py` step for step: latent noise at `dim // 4`, RFlow timesteps,
-guided model output, `scheduler.step`, then NVIDIA's `ReconModel` decode under a
-`SlidingWindowInferer` (roi 80³, gaussian, overlap 0.4), then their MR postprocessing to int16
-`[0, 1000]` and an axis-aligned affine.
-
-Guidance is **hierarchical**, with the report as an increment on NVIDIA's modality term:
-
-```
-D_guided = D_00 + s_modality · (D_m0 − D_00) + s_report · (D_mr − D_m0)
-```
-
-| branch | modality label | report |
-|---|---|---|
-| `D_00` | null class | null token |
-| `D_m0` | real class | null token |
-| `D_mr` | real class | **the report** |
-
-- `--report-guidance-scale 0` collapses this to `diff_model_infer.py:207` **exactly** — asserted
-  numerically in `tests/test_r2v_conditioning.py`, so report guidance cannot silently change what
-  NVIDIA's model does.
-- `--report-guidance-scale 1 --modality-guidance-scale 1` gives plainly `D_mr`.
-- All branches run as one batched UNet call (the same trick official uses for its two).
-
-### 4.6 Evaluation
-
-`eval/runner.py:run_evaluation` is the only evaluation path — the CLI and the tests both call it.
-`--task` decides the metric set; nothing else does. Full detail in [`eval/README.md`](eval/README.md).
-
----
-
-## 5. Metrics
-
-### During training
-
-There is **no validation metric**. Per step the trainer logs:
-
-| key | meaning |
-|---|---|
-| `loss` | the L1 velocity loss — the only optimisation signal |
-| `lr` | current learning rate |
-| `n_dropped_reports` | how many samples got the null token this step |
-| `timestep_mean` | mean sampled timestep — a sanity check on scheduler behaviour |
-
-`train_summary.json` adds steps, wall time, final/mean loss, and trainable vs frozen counts.
-
-### At test time (`--task report2volume`)
-
-| group | metrics |
-|---|---|
-| **fidelity** | `mae_whole`, `mse_whole`, `psnr_whole`, `ncc_whole`, `ssim3d_whole`, `mae_fg`, `mse_fg`, `psnr_fg`, `ncc_fg`, `relative_intensity_error_fg` |
-| **perceptual** | `edge_preservation_fg`, `laplacian_variance_ratio_fg`, `hf_energy_ratio`, `ssim2d_{sagittal,coronal,axial}_mean` |
-| **distribution** | MedicalNet 3D FID (bootstrap CI), 2.5D Inception FID, Inception Score, precision / recall / density / coverage, intra-set MS-SSIM (mode-collapse probe) |
-| **anatomy** | L-R symmetry NCC, intracranial fraction, tissue-contrast separation, foreground compactness, background purity — compared to the real population by two-sample KS |
-| **report_alignment** | `report_image_similarity_score` — ⚠️ a **hook**, currently always `available=False` (no validated MRI image-text model exists in this project yet). It never substitutes a different model and calls the result report alignment. |
-| **report_consistency** | the blinded pathology classifier: per-label AUROC / average precision on generated volumes against the conditioning reports' labels, each next to the same classifier's score on the **real** volumes (the ceiling) and 0.5 (the image-blind floor), plus a per-case score for a case-level permutation test. The local stand-in for the challenge's Blinded Classifier Consistency — see `eval/report_classifier.py`. Needs `--report-classifier`; otherwise `available=False` with a reason. |
-
-Three properties worth stating explicitly:
-
-- **The foreground mask always comes from the ground truth**, never the prediction — otherwise a
-  degenerate prediction picks its own easier evaluation region.
-- **A shape-mismatched prediction is excluded with a reason, never resized.** Equal `.shape` is never
-  treated as proof of the same physical space.
-- **A frequency-weighted aggregate weights by population bucket counts**, never cohort counts — the
-  cohort is balanced per bucket by design, so cohort counts are a sampling artefact.
-
-`--task generation` structurally cannot get a voxelwise metric, whatever flags you pass.
-
----
+Full detail (including the guidance formula and the exact training step) is in
+[`DEVELOPER_NOTES.md`](DEVELOPER_NOTES.md) and [`models/README.md`](models/README.md).
 
 ## 6. How to run it
 
-Paths below use `<ws>` for the workspace (`/hnvme/workspace/y100dc19-nvidia-mri-brain`) and
-`<data_ws>` for the data workspace. Cohorts and prediction sets are ~17–24 MB/volume — **workspace
-only, never git or `$HOME`.**
+Paths below use `<ws>` for the workspace and `<data_ws>` for the data workspace. Results are
+tens of MB per volume — **workspace only, never git or `$HOME`.**
 
 ### 6.0 First: does it wire up at all? (CPU, seconds, no data)
 
@@ -322,13 +118,13 @@ cd contrastive-pretraining
 python -m mrrate_r2v.cli.train_r2v --dry-run --max-steps 2 --out /tmp/r2v_dryrun --text-encoder mock
 ```
 
-Synthetic latents, fabricated reports, a two-level UNet — the whole trainer path with no manifest,
-VAE, checkpoint or GPU. If this fails, nothing else will work.
+Synthetic latents, fabricated reports, a two-level UNet — the whole trainer path with no
+manifest, VAE, checkpoint, or GPU. Try this first if anything seems broken.
 
-### 6.1 Build the manifest (once)
+### 6.1 Build the manifest (once per storage location)
 
 ```bash
-python -m mrrate_r2v.cli.build_manifest --source shards_parquet \
+python -m mrrate_r2v.cli.build_manifest \
     --shards-root <data_ws>/MR-Rate-raw \
     --out-csv           <data_ws>/r2v_manifest/manifest_shards_native.csv \
     --out-report-index-csv <data_ws>/r2v_manifest/report_index_shards_native.csv \
@@ -357,31 +153,20 @@ python -m mrrate_r2v.cli.train_r2v \
 On the cluster:
 
 ```bash
-sbatch slurm/06_train_r2v.sbatch                                     # 4-step smoke run first
+sbatch slurm/train_r2v.sbatch                                     # 4-step smoke run first
 sbatch --export=ALL,R2V_MAX_STEPS=0,R2V_EPOCHS=1 --time=24:00:00 \
-       slurm/06_train_r2v.sbatch                                     # then the real run
+       slurm/train_r2v.sbatch                                     # then the real run
 ```
 
-**The arguments that actually change the result** (everything else is in
-[`cli/README.md`](cli/README.md)):
+The handful of flags most worth tuning (everything else is in
+[`cli/README.md`](cli/README.md)): `--lr` (default `1e-5`, conservative — raising it is often
+the first experiment to try), `--batch-size`/`--grad-accumulation-steps`, and
+`--report-dropout-probability`. Leave `--scale-factor` at `auto`.
 
-| argument | default | why you would change it |
-|---|---|---|
-| `--lr` | `1e-5` | NVIDIA's own value. The adapter is small and starts at identity, so this is conservative — raising it is the first experiment to try. |
-| `--batch-size` / `--grad-accumulation-steps` | `1` / `1` | effective batch. Memory-bound: one 256³ volume per sample. |
-| `--report-dropout-probability` | `0.10` | how much unconditional signal the model sees. Too low → guidance has nothing to amplify; too high → wasted capacity. |
-| `--cross-attention-dim` | `512` | adapter capacity. Bigger = more parameters at every conditioned level. |
-| `--conditioning-levels` | `attention_levels` | where the report enters. Adding low levels means high-resolution attention → expensive. |
-| `--report-sections` | `findings impression` | what the model is told. Adding `clinical_information` leaks indication, not observation. |
-| `--max-report-tokens` | `512` | truncation. RadBERT's usable budget is `max_position_embeddings − 2`; exceeding it is refused up front. |
-| `--scale-factor` | `auto` | **leave it.** `recompute` rescales the latent space out from under a denoiser that is frozen and cannot follow. |
-| `--seed` | `0` | also seeds the dedicated report-dropout generator, so a resumed run reproduces the same drops. |
-
-**Outputs:** `<out>/adapter_last.pt` (~8M params, plus optimizer/scheduler/scaler/RNG state, the base
-checkpoint's sha256, and the text-encoder identity) and `<out>/train_summary.json`. Resume with
+**Outputs:** `<out>/adapter_last.pt` and `<out>/train_summary.json`. Resume with
 `--resume <adapter.pt>`.
 
-### 6.3 Look at one sample (quickest way to know if training did anything)
+### 6.3 Look at one sample
 
 ```bash
 python -m mrrate_r2v.cli.generate_r2v \
@@ -396,29 +181,16 @@ python -m mrrate_r2v.cli.generate_r2v \
     --out <ws>/samples/case001.nii.gz
 ```
 
-or `sbatch slurm/07_generate_r2v.sbatch <ws>/runs/r2v_adapter_v1/adapter_last.pt`.
+or `sbatch slurm/generate_r2v.sbatch <ws>/runs/r2v_adapter_v1/adapter_last.pt`.
 
-**The inference knobs:**
+`--report-guidance-scale` is the first thing worth sweeping (`0` reproduces NVIDIA's original,
+unconditional output — a useful sanity check that base/VAE loading is correct before blaming
+your adapter).
 
-| argument | default | effect |
-|---|---|---|
-| `--report-guidance-scale` | `4.0` | how hard the report is pushed. `0` = NVIDIA's original behaviour exactly; `1` = the plain conditioned prediction; higher = stronger and eventually over-saturated. **The first thing to sweep.** |
-| `--modality-guidance-scale` | `10.0` | NVIDIA's own `cfg_guidance_scale`. `0` leaves the modality conditioned and guides the report only. |
-| `--num-inference-steps` | `30` | NVIDIA's default; quality vs wall-clock |
-| `--dim` / `--spacing` | the `(--modality, --plane)` bucket's own grid | the output grid. Spacing is a **real conditioning input**, so asking for a bucket's own FOV is what makes generated and real populations comparable. `--dim` must be divisible by 4. Unknown (modality, plane) → NVIDIA's 256³ @ 1 mm. |
-| `--modality` | `T1w` | the class label the frozen model is conditioned on, and the `[MODALITY]` marker under a `*_meta` format |
-| `--plane` | `AXIAL` | selects the geometry bucket and the `[PLANE]` marker |
-| `--seed` | `1234` | reproducibility |
-| `--latent-only` | off | skip the VAE decode — a cheap check that the diffusion loop runs |
+### 6.4 Score a checkpoint
 
-A sanity ladder that isolates where a problem is: `--report-guidance-scale 0` should reproduce
-NVIDIA's unconditional output (if *that* looks wrong, the base/VAE loading is wrong, not your
-adapter); then `1`, then `4`, on the same seed and report.
-
-### 6.4 Score a checkpoint properly
-
-One command. It builds the dataset, generates one volume per case from that case's own report, and
-scores — there is no cohort to build first and no prediction set to hand off.
+One command builds the dataset, generates one volume per case from that case's own report, and
+scores it — no cohort to build first, no prediction set to hand off.
 
 ```bash
 python -m mrrate_r2v.cli.evaluate --task report2volume \
@@ -429,82 +201,51 @@ python -m mrrate_r2v.cli.evaluate --task report2volume \
     --base-checkpoint <ws>/models/diff_unet_3d_rflow-mr-brain_v0.pt \
     --vae-checkpoint  <ws>/models/autoencoder_v1.pt \
     --report-format findings_impression_meta \
-    --medicalnet-checkpoint <ws>/pretrained/medicalnet/resnet_10_23dataset_statedict.pth \
-    --report-classifier <ws>/models/report_classifier_v2.pt \
     --out <ws>/results/report2volume_r2v_v1 \
     --n-per-bucket 8        # drop this for the entire test split
 ```
 
-`--report-format` must be one the adapter was trained on, or the run is refused — the conditioning
-text would be composed differently from what the model saw, which is silent at generation time and
-only shows up as a worse score.
-
-**What gets evaluated:** every case in the split, in a deterministic order with **no RNG**, unless
-`--n-per-bucket N` caps it — and the cap takes the *first* N per bucket in that same order, so a
-cheap run is a prefix of the full one rather than a different sample. Sampler noise is
-`stable_seed(--seed, case_id)`, a function of the case, so a rerun reproduces every volume.
+`--report-format` must be one the adapter was trained on, or the run is refused.
 
 | Scale | Cases | Wall clock (1×H200) |
 |---|---|---|
-| `--n-per-bucket 8` | 80 | ~10 min — wiring check; no metric means anything |
-| `--n-per-bucket 200` | 2,000 | ~4 h — the scale earlier results were produced at |
+| `--n-per-bucket 8` | 80 | ~10 min — wiring check; no metric means anything yet |
+| `--n-per-bucket 200` | 2,000 | ~4 h |
 | unset (**default**) | 29,027 | ~60 h — the entire test split |
 
-Then, **before** reading any number as a result:
-
-```bash
-python3 slurm/check_run.py --results <ws>/results/report2volume_r2v_v1
-```
-
-It checks a finished run against [`slurm/SUCCESS_CRITERIA.md`](../slurm/SUCCESS_CRITERIA.md) and
-exits 0 only if every applicable check passes. Checks whose inputs are absent are reported as
-**SKIP, not PASS** — "not run" must never read as "fine".
-
-Two baselines, same command, same split, same case list:
+Two useful baselines, same command shape:
 
 ```bash
 # the upper bound any latent-space method can reach
-python -m mrrate_r2v.cli.evaluate --task reconstruction  --vae-checkpoint ... --out .../recon
-# NVIDIA's model with no report at all -- if report-conditioned FID is not better, the report
-# is not contributing
+python -m mrrate_r2v.cli.evaluate --task reconstruction --vae-checkpoint ... --out .../recon
+# NVIDIA's model with no report at all -- if report-conditioned FID isn't better, the report
+# isn't contributing
 python -m mrrate_r2v.cli.evaluate --task generation --base-checkpoint ... --vae-checkpoint ... \
     --out .../generation
 ```
 
----
+See [`eval/README.md`](eval/README.md) for what each metric means.
 
 ## 7. Things that will bite you
 
 | | |
 |---|---|
-| **Axis order** | internal `(D,H,W)`, external `(X,Y,Z)`. Convert only via `geometry.dhw_to_xyz`/`xyz_to_dhw`. Silent for isotropic cubes, scrambling otherwise. |
-| **Two divisors** | `4` for sampling (output ÷ latent), `16` for VAE-encode padding. Swapping them yields a valid file 4× too small on every axis. |
-| **`--series-selection`** | `one_per_study_per_bucket` is the default and must stay it. `one_per_study_per_sequence` silently collapses the *planes*. |
+| **Axis order** | internal `(D,H,W)`, external `(X,Y,Z)`. Convert only via `geometry.dhw_to_xyz`/`xyz_to_dhw`. |
+| **`--series-selection`** | `one_per_study_per_bucket` is the default for evaluation and must stay it — other modes silently collapse planes or modalities. |
 | **`--export=NONE`** | on every sbatch script — `VAR=x sbatch ...` does not reach the job. Use `--export=ALL,VAR=x`. Every Helma partition defaults to a **10-minute** walltime without `--time`. |
-| **`drop_last` and tiny buckets** | a bucket smaller than `batch_size` keeps one short batch instead of vanishing. Before the fix, `drop_last=True` removed SWI CORONAL and SWI SAGITTAL from every epoch and nothing failed — see §4.2. |
-| **W&B needs the proxy** | compute nodes have no direct route off-site. `slurm/_common.sh:setup_proxy` exports `http(s)_proxy` **and** passes them into the container. Without it `wandb.init(mode="online")` fails and `WandbRun` degrades to a silent no-op, so the run looks like "W&B just isn't logging". `R2V_WANDB=online` probes `api.wandb.ai` before any GPU work; `R2V_NO_PROXY=1` disables the proxy. |
-| **`report_format` at inference** | a `*_meta` format's `[MODALITY]/[PLANE]/[SPACING]` prefix is a trained token sequence. `cli.generate_r2v` prepends it for free-form text and refuses a cohort composed under a format the adapter never saw. |
-| **Privacy** | `study_uid`/`series_id` appear only in a cohort's `index.csv`. Everything else on disk uses `case_id` and `cohort_id`. Don't log identifiers verbatim or write them into results. |
-| **Disk** | `/hnvme` has a **file-count** quota (61k soft), not a space quota — hence one archive per bucket instead of one file per volume. |
-| **Fréchet distance** | computed in `eval/distribution.py`, not via `monai.metrics.FIDMetric` (that path passes a `disp=` kwarg scipy removed in 1.17). Don't reintroduce the monai call. |
+| **W&B needs the proxy** | compute nodes have no direct route off-site. `slurm/_common.sh:setup_proxy` handles it; without it, `wandb` silently degrades to a no-op instead of erroring. |
+| **`report_format` at inference** | a `*_meta` format's prefix is a trained token sequence — `cli.generate_r2v` prepends it for you, and `cli.evaluate` refuses a format the adapter never trained on. |
+| **Privacy** | `study_uid`/`series_id` are identifiers — don't log them verbatim or write them into results. |
 
----
+More of these, with the full reasoning, are in [`DEVELOPER_NOTES.md`](DEVELOPER_NOTES.md).
 
 ## 8. Testing
 
 ```bash
 cd contrastive-pretraining
 python -m pytest                                   # everything, with coverage
-python -m pytest tests/test_r2v_training.py -v --no-cov
 ```
 
-All R2V tests run on CPU with synthetic fixtures — no checkpoints, no real data, seconds.
-
-Two files are **load-bearing invariants, not ordinary unit tests** — do not weaken them to make a
-change pass:
-
-- `tests/test_cohort_contract.py` — that `cohort_id` changes when the seed, FOV, normalizer or case
-  list changes, and that a prediction set from a different cohort is refused.
-- `tests/test_eval_tasks_and_runner.py` — that `--task generation` never produces a voxelwise
-  metric, that all tasks share one result layout, and that a shape-mismatched prediction is excluded
-  rather than resized.
+There is currently no r2v-specific automated test suite in this repo (the module docstrings and
+`docs/R2V.md` reference test files from an earlier state of the package that no longer exist) —
+treat that as a gap to fill, not as a passing suite to trust.

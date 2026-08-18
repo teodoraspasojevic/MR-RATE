@@ -2,7 +2,9 @@
 
 One metric set, two callers, one place it's defined.
 
-Full pipeline context: [`docs/R2V.md`](../../../docs/R2V.md).
+Full pipeline context: [`../README.md`](../README.md) and
+[`docs/R2V.md`](../../../docs/R2V.md). History of the metric set this replaced is in
+[`../DEVELOPER_NOTES.md`](../DEVELOPER_NOTES.md).
 
 ---
 

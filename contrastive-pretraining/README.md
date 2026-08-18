@@ -139,12 +139,10 @@ contrastive-pretraining/
 │   │   └── optimizer.py               # Optimizer utilities
 │   └── setup.py
 ├── mrrate_r2v/               # Report-to-volume pipeline (separate; see ../docs/R2V.md)
-│   ├── cohort.py             # Frozen ground-truth cohort -- the comparability contract
-│   ├── predictions.py        # Its mirror on the prediction side
 │   ├── data/                 # Manifest -> Dataset -> preprocessed volume (own README.md)
-│   ├── eval/                 # Cohort + predictions + task -> metrics (own README.md)
-│   ├── models/nvidia.py      # The only import of vendored NV-Generate-CTMR code
-│   └── cli/                  # preprocess / predict_* / evaluate / build_manifest
+│   ├── eval/                 # Cohort + task -> metrics (own README.md)
+│   ├── models/nvidia.py      # The only place NVIDIA-authored model-loading code is used
+│   └── cli/                  # build_manifest / train_r2v / evaluate / generate_r2v
 ├── scripts/                  # Training, inference, and evaluation
 │   ├── run_train.py          # Training entry point (all encoder variants)
 │   ├── mr_rate_trainer.py    # Distributed trainer (accelerate, W&B, resume)

@@ -53,7 +53,7 @@ class PercentileNormalizer:
     using the same bounds but does not clamp, so values beyond the upper
     percentile can map above upper_limit -- this matches NV-Generate-CTMR's
     MRI intensity transform (ScaleIntensityRangePercentilesd(..., clip=False),
-    ../../NV-Generate-CTMR/scripts/transforms.py:42-71) for consumers that
+    scripts/transforms.py:42-71 in github.com/nvidia-medtech/NV-Generate-CTMR) for consumers that
     want to match that pipeline exactly.
     """
 

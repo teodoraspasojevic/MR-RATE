@@ -15,23 +15,23 @@
 # asserts that before the first step and logs both parameter counts.
 #
 # Smoke run (4 steps, no validation -- the acceptance gate before any long run):
-#   sbatch --export=ALL,R2V_CONFIG=A slurm/11_train_conditioning.sbatch
-#   sbatch --export=ALL,R2V_CONFIG=B slurm/11_train_conditioning.sbatch
-#   sbatch --export=ALL,R2V_CONFIG=C slurm/11_train_conditioning.sbatch
+#   sbatch --export=ALL,R2V_CONFIG=A slurm/train_conditioning.sbatch
+#   sbatch --export=ALL,R2V_CONFIG=B slurm/train_conditioning.sbatch
+#   sbatch --export=ALL,R2V_CONFIG=C slurm/train_conditioning.sbatch
 #
 # Real single-GPU run with validation and W&B:
 #   sbatch --export=ALL,R2V_CONFIG=A,R2V_MAX_STEPS=0,R2V_VALIDATE_EVERY=500,R2V_WANDB=online \
-#          --time=24:00:00 slurm/11_train_conditioning.sbatch
+#          --time=24:00:00 slurm/train_conditioning.sbatch
 #
 # Real 4-GPU run on one node (DDP via torchrun; R2V_NGPU is the TOTAL rank count):
 #   sbatch --export=ALL,R2V_CONFIG=C,R2V_MAX_STEPS=0,R2V_NGPU=4,R2V_VALIDATE_EVERY=500 \
-#          --gres=gpu:h200:4 --cpus-per-task=32 --time=24:00:00 slurm/11_train_conditioning.sbatch
+#          --gres=gpu:h200:4 --cpus-per-task=32 --time=24:00:00 slurm/train_conditioning.sbatch
 #
 # Multi-node (2 nodes x 4 GPUs = 8 ranks). --ntasks-per-node=1 is REQUIRED: one torchrun per node,
 # which then forks one rank per GPU. R2V_NGPU must equal nodes x GPUs-per-node:
 #   sbatch --export=ALL,R2V_CONFIG=A,R2V_MAX_STEPS=0,R2V_NGPU=8,R2V_VALIDATE_EVERY=500 \
 #          --nodes=2 --ntasks-per-node=1 --gres=gpu:h200:4 --cpus-per-task=32 \
-#          --time=24:00:00 slurm/11_train_conditioning.sbatch
+#          --time=24:00:00 slurm/train_conditioning.sbatch
 #
 # `#SBATCH --export=NONE` means a plain `VAR=x sbatch ...` does NOT reach the job -- always pass
 # overrides through --export=ALL,... as above. R2V_MAX_STEPS=0 removes the step cap.
@@ -130,22 +130,7 @@ if [[ -n "${R2V_VALIDATE_EVERY:-}" ]]; then
         --val-inference-steps "${R2V_VAL_STEPS:-30}"
         --val-visualize "${R2V_VAL_VISUALIZE:-4}"
         --val-seed "${R2V_VAL_SEED:-0}"
-        --medicalnet-checkpoint "$MEDICALNET_CHECKPOINT"
-        --val-metrics ${R2V_VAL_METRICS:-fvd fid_2p5d ssim}
-        --val-fvd-extractor "${R2V_VAL_FVD_EXTRACTOR:-r3d18}"
-        --val-feature-cache "$WORKSPACE/cache/r2v/val_features"
-        --torch-home "$TORCH_HOME_DIR"
     )
-    # Condition-sensitivity diagnostic: swaps in another study's report at a fixed seed to prove the
-    # model uses its text at all. Costs a second generation per case, so it runs on a small subset.
-    [[ -n "${R2V_SENSITIVITY_EVERY:-}" ]] && ARGS+=(
-        --val-sensitivity-every-steps "$R2V_SENSITIVITY_EVERY"
-        --val-sensitivity-samples "${R2V_SENSITIVITY_N:-8}")
-    [[ -n "${R2V_VALIDATION_REFERENCE:-}" ]] && ARGS+=(
-        --validation-reference "$R2V_VALIDATION_REFERENCE")
-    [[ -n "${R2V_VALIDATE_FULL_EVERY:-}" ]] && ARGS+=(--validate-full-every-steps "$R2V_VALIDATE_FULL_EVERY")
-    [[ -n "${R2V_VAL_FULL:-}" ]] && ARGS+=(--val-full-samples "$R2V_VAL_FULL")
-    [[ -n "${R2V_VALIDATE_FULL_AT_END:-}" ]] && ARGS+=(--validate-full-at-end)
 else
     ARGS+=(--no-validate-at-end)
 fi

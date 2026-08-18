@@ -2,13 +2,13 @@
 
 Full guide: `docs/R2V.md`. The pipeline is three stages, each a CLI under `mrrate_r2v.cli`:
 
-    1. preprocess   ->  a frozen ground-truth cohort   (cohort.py)
-    2. predict_*    ->  a prediction set               (predictions.py)
-    3. evaluate     ->  metrics                        (eval/runner.py)
+    1. build_manifest  ->  once per storage location
+    2. train_r2v       ->  --split train
+    3. evaluate        ->  --split test, generates and scores in one streaming pass
 
-`cohort.py` and `predictions.py` define the two on-disk contracts that hold it together: a
-prediction set records which cohort it was produced against, and the evaluator refuses to
-score a mismatch. That is what makes two experiments comparable.
+Train and test are the same program up to the point where one backprops and the other samples --
+both build the dataset straight from the manifest, so training and evaluation preprocessing can
+never drift apart undetected.
 """
 
 __version__ = "2.0"

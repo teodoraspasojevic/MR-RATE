@@ -5,28 +5,25 @@ it is (modality, plane, split) -- never anything about geometry policy, report s
 sampling. So switching `series_selection`, `geometry_mode`, or report store costs nothing;
 only a change of underlying storage requires a rebuild.
 
-Three builders, one per storage layout MR-RATE actually ships in:
+One builder, for the one storage layout this pipeline actually reads from:
+`build_manifest_rows_from_shards_parquet`, over SHARDS_PATH's WebDataset-style
+`shard-*.tar` + `series.parquet`. It works purely from that root's existing index, so a
+full build takes seconds and touches no image bytes. Use `verify_archive_locators_sample`
+afterwards to spot-check that the filename convention still holds before trusting a build.
 
-| Builder | Layout | Opens archives? |
-|---|---|---|
-| `build_manifest_rows` | extracted directory tree | reads one NIfTI header per series |
-| `build_manifest_rows_from_data_path_zips` | `batchNN.tar` of per-study zips | no |
-| `build_manifest_rows_from_shards_parquet` | WebDataset `shard-*.tar` + `series.parquet` | no |
+(Two other builders -- for an already-extracted directory tree, and for DATA_PATH's
+`batchNN.tar` of per-study zips -- existed here and were removed 2026-08-18: nothing in
+this repo built a manifest from either layout. Re-add one only if a real storage location
+needs it; `git log` has the removed implementations if so.)
 
-The two archive builders work purely from each root's existing index, so a full build takes
-seconds and touches no image bytes. Use `verify_archive_locators_sample` afterwards to
-spot-check that the filename convention still holds before trusting a build.
-
-**This module deliberately imports no torch.** `scripts/data.py` (torch, nibabel) and
-pyarrow are imported lazily inside the builders that need them, so a pyarrow-only
-interpreter can build a shards manifest and a torch-only interpreter can build an
-extracted-dir one. Both work from this single implementation -- there is no duplicate.
+**This module deliberately imports no torch.** pyarrow is imported lazily inside the one
+builder that needs it, so a pyarrow-only interpreter can build a manifest without ever
+importing torch.
 """
 import csv
 import json
 import os
 import random
-import warnings
 from dataclasses import dataclass
 from typing import Optional
 
@@ -244,115 +241,6 @@ def read_manifest_csv(path):
 
 
 # --------------------------------------------------------------------------- builders
-
-
-def build_manifest_rows(data_folder, space="native_space", metadata_csv=None,
-                        excluded_modalities=DEFAULT_EXCLUDED_MODALITIES,
-                        exclude_derived=True, exclude_localizer=True,
-                        splits_csv=None):
-    """Build rows from an already-extracted directory tree.
-
-    Deterministic and self-resuming: `discover_subjects` sorts every directory level it
-    walks, so re-running against an unchanged `data_folder` produces byte-identical output.
-    Re-running *is* the resume path -- there is no separate bookkeeping.
-
-    Opens one NIfTI header per eligible series (header/affine only, no voxel decode) to
-    capture native geometry. This is never taken from the metadata CSV's array_* columns --
-    see `SeriesMeta`'s docstring for the axis-order trap that would introduce. An unreadable
-    file (~0.43% of series) is skipped with a warning rather than aborting the build.
-    """
-    from ._preprocess_ops import discover_subjects, load_all_splits, read_native_geometry
-
-    subjects = discover_subjects(data_folder, space)
-    splits = load_all_splits(splits_csv) if splits_csv else {}
-    metadata = MetadataStore(metadata_csv) if metadata_csv else None
-    if metadata is None:
-        warnings.warn(
-            "build_manifest_rows: no metadata_csv given -- modality/plane conditioning and "
-            "the exclusion policy (derived/localizer/MRA) are unavailable; every discovered "
-            "series will be treated as eligible with modality=plane=None.",
-            stacklevel=2,
-        )
-
-    rows = []
-    n_geometry_failed = 0
-    for sub in subjects:
-        study_uid = sub["subject_id"]
-        split = splits.get(study_uid)
-        for idx, path in enumerate(sub["image_paths"]):
-            series_id = series_id_from_path(path, study_uid)
-            meta = metadata.get(study_uid, series_id) if metadata else None
-            if not is_eligible(meta, excluded_modalities, exclude_derived, exclude_localizer):
-                continue
-            try:
-                native_shape, native_spacing = read_native_geometry(path)
-            except Exception as e:  # noqa: BLE001 -- skip unreadable files, keep building
-                n_geometry_failed += 1
-                warnings.warn(f"build_manifest_rows: skipping unreadable series "
-                              f"(study={study_uid!r} idx={idx}): {type(e).__name__}: {e}")
-                continue
-            rows.append(ManifestRow(
-                study_uid=study_uid, series_id=series_id, image_path=path, split=split,
-                modality=meta.modality if meta else None,
-                plane=meta.plane if meta else None,
-                is_center_modality=bool(meta.is_center_modality) if meta else False,
-                native_shape=native_shape, native_spacing_mm=native_spacing,
-                cache_index=idx,
-            ))
-    if n_geometry_failed:
-        print(f"[build_manifest_rows] {n_geometry_failed} series skipped (unreadable NIfTI header)")
-    return rows
-
-
-# MR-RATE's official filename convention: outer tar member = "{batch_id}/{study_uid}.zip";
-# inner zip member = "{study_uid}/img/{study_uid}_{series_id}.nii.gz".
-def _data_path_member_chain(batch_id, study_uid, series_id):
-    outer = f"{batch_id}/{study_uid}.zip"
-    inner = f"{study_uid}/img/{study_uid}_{series_id}.nii.gz"
-    return (outer, inner)
-
-
-def build_manifest_rows_from_data_path_zips(
-    data_root, metadata_source, splits_csv,
-    excluded_modalities=DEFAULT_EXCLUDED_MODALITIES,
-    exclude_derived=True, exclude_localizer=True,
-    batch_tar_pattern="{batch_id}.tar",
-):
-    """Build rows for DATA_PATH's layout (28 `batchNN.tar` files of per-study zips) without
-    opening a single archive.
-
-    Locators come purely from `splits_csv` (needs a `batch_id` column -- the real released
-    splits.csv has one) and `metadata_source` (a `MetadataStore`, or a path handed straight
-    to one), using the verified filename convention above. Run
-    `verify_archive_locators_sample` afterwards to check that convention against real
-    members before trusting a full build.
-
-    `native_shape`/`native_spacing_mm` are left None: resolving them here would require
-    decompressing every series. The Dataset resolves them lazily from the same bytes it
-    reads for training.
-    """
-    metadata = metadata_source if isinstance(metadata_source, MetadataStore) else MetadataStore(metadata_source)
-
-    rows = []
-    for split_row in iter_csv_dict_rows(splits_csv):
-        study_uid = split_row.get("study_uid")
-        batch_id = split_row.get("batch_id")
-        split = split_row.get("split")
-        if not study_uid or not batch_id:
-            continue
-        archive_path = os.path.join(data_root, batch_tar_pattern.format(batch_id=batch_id))
-        for series_id, meta in metadata.by_study.get(study_uid, {}).items():
-            if not is_eligible(meta, excluded_modalities, exclude_derived, exclude_localizer):
-                continue
-            rows.append(ManifestRow(
-                study_uid=study_uid, series_id=series_id, image_path="", split=split,
-                modality=meta.modality, plane=meta.plane,
-                is_center_modality=bool(meta.is_center_modality),
-                native_shape=None, native_spacing_mm=None, cache_index=0,
-                backend="archive", archive_path=archive_path,
-                member_chain=_data_path_member_chain(batch_id, study_uid, series_id),
-            ))
-    return rows
 
 
 # The released splits.csv and this package use "val". SHARDS_PATH's series.parquet `split`

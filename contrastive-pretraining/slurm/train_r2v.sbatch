@@ -14,12 +14,12 @@
 # never updated -- the trainer asserts that before the first step and logs the two parameter counts.
 #
 # Smoke run (default: 4 steps, ~minutes) -- the acceptance gate before any long run:
-#   sbatch slurm/06_train_r2v.sbatch
+#   sbatch slurm/train_r2v.sbatch
 #
 # Real run: raise --time, --epochs and R2V_MAX_STEPS, and consider --save-every-steps. Note that
 # `#SBATCH --export=NONE` means a plain `VAR=x sbatch ...` does NOT reach the job -- pass overrides
 # through --export:
-#   sbatch --export=ALL,R2V_MAX_STEPS=0,R2V_EPOCHS=1 --time=24:00:00 slurm/06_train_r2v.sbatch
+#   sbatch --export=ALL,R2V_MAX_STEPS=0,R2V_EPOCHS=1 --time=24:00:00 slurm/train_r2v.sbatch
 #
 # Multi-GPU (the official launcher shape -- diff_model_train.py sets DDP up the same way):
 #   #SBATCH --gres=gpu:h200:4 ... and replace `run_py_text` below with

@@ -20,15 +20,13 @@ import importlib
 # public name -> submodule that defines it
 _EXPORTS = {
     # dataset.py (torch)
-    "ARCHIVE_ACCESS_MODES": "dataset",
     "BUCKET_ORDERS": "dataset",
     "SERIES_SELECTION_MODES": "dataset",
     "GeometryBucketBatchSampler": "dataset",
     "MRReportToVolumeDataset": "dataset",
     "R2VDatasetConfig": "dataset",
+    "build_r2v_dataset": "dataset",
     "collate_fn_r2v": "dataset",
-    "compute_modality_balance_weights": "dataset",
-    "get_modality_balanced_sampler": "dataset",
     # geometry.py
     "FALLBACK_GEOMETRY_KEY": "geometry",
     "FIXED_GEOMETRY_KEY": "geometry",
@@ -45,8 +43,6 @@ _EXPORTS = {
     "ManifestRow": "manifest",
     "MetadataStore": "manifest",
     "SeriesMeta": "manifest",
-    "build_manifest_rows": "manifest",
-    "build_manifest_rows_from_data_path_zips": "manifest",
     "build_manifest_rows_from_shards_parquet": "manifest",
     "build_shard_report_index": "manifest",
     "is_eligible": "manifest",

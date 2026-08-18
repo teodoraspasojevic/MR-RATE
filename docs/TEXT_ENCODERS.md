@@ -4,10 +4,13 @@ Everything about turning an MR-RATE radiology report into the tensor the conditi
 attends over: what the reports actually look like, which encoders are staged, which report format
 to use, where acquisition metadata should come from, and how the choice was measured.
 
-Companion documents: [`R2V.md`](R2V.md) for the generation/evaluation pipeline this feeds,
+Companion document: [`R2V.md`](R2V.md) for the generation/evaluation pipeline this feeds, and
 [`mrrate_r2v/textenc/README.md`](../contrastive-pretraining/mrrate_r2v/textenc/README.md) for the
-production API, [`mrrate_r2v/textbench/README.md`](../contrastive-pretraining/mrrate_r2v/textbench/README.md)
-for the selection benchmark.
+production API this document's findings are baked into.
+
+**The selection benchmark (`textbench/` and its three driving CLIs) has been removed** -- the
+study below is a completed, one-off report, not a runnable tool anymore. What's kept is the
+methodology and the measured conclusions that the current encoder/format choice rests on.
 
 Confidence key: **VERIFIED** (measured here, or quoted from a primary source that was fetched) /
 **INFERRED** (well supported but not stated outright) / **ASSUMED** (a provisional choice).
@@ -21,29 +24,22 @@ contrastive-pretraining/mrrate_r2v/
 ├── textenc/                    PRODUCTION: what the trainer and sampler use
 │   ├── formats.py              named report formats            (no torch)
 │   ├── encoders.py             HFTextEncoder + ENCODER_SPECS
-│   ├── fusion.py               MultiEncoderEmbedder, ProjectedConcatFusion
+│   ├── fusion.py               ProjectedConcatFusion (used by SectionedFusionEmbedder)
 │   ├── conditioning.py         the three supported configurations         (§9)
 │   └── README.md
-├── textbench/                  SELECTION: never imported by the trainer
-│   ├── corpus.py               report/label corpus from the shard tars   (no torch)
-│   ├── analysis.py             dataset statistics                        (no torch)
-│   ├── negation.py             negation minimal pairs                    (no torch)
-│   ├── embed.py                embedding cache
-│   ├── tasks.py                the five metrics
-│   ├── runner.py               the one scoring path
-│   └── README.md
 └── cli/
-    ├── download_text_encoders.py   stage checkpoints (idempotent, pinned revisions)
-    ├── analyze_reports.py          build-corpus | analyze | tokens
-    ├── embed_reports.py            GPU: cache embeddings
-    ├── eval_text_encoders.py       CPU: score the matrix
-    └── benchmark_h200.py           GPU: environment + step time/memory per config   (§9.7)
+    └── download_text_encoders.py   stage checkpoints (idempotent, pinned revisions)
 
 mrrate_r2v/validation.py            step-based validation: FID + alignment proxy      (§9.6)
 slurm/configs/{A,B,C}_*.sh          one file per configuration                        (§9.5)
-slurm/10_benchmark_h200.sbatch      the H200 measurements
-slurm/11_train_conditioning.sbatch  trains any of the three
+slurm/train_conditioning.sbatch  trains any of the three
 ```
+
+The selection study itself ran through `textbench/` (`corpus.py`, `analysis.py`, `negation.py`,
+`embed.py`, `tasks.py`, `runner.py`) and three CLIs (`analyze_reports.py`, `embed_reports.py`,
+`eval_text_encoders.py`) -- all now removed. The unrelated GPU timing tool, `benchmark_h200.py`
+(§9.7), has also been removed since its batch-size recommendations are already baked into
+`slurm/configs/*.sh`. §2-§4 and §9.7 below are the two studies' findings; neither can be re-run.
 
 Changed, minimally: `mrrate_r2v/text.py` (the factory resolves zoo names; `encode_reports` is the
 one dispatch seam; `rebuild_embedder` is the one inference-side rebuild), `mrrate_r2v/data/dataset.py`
@@ -64,7 +60,7 @@ behaviours *did* change, both because they were broken: `--validate-every-steps`
 
 ## 2. The reports (measured on all 98,334 studies)
 
-Reproduce with:
+Produced with (`cli.analyze_reports`, since removed):
 
 ```bash
 cd contrastive-pretraining
@@ -467,25 +463,9 @@ anisotropy rather than negation sensitivity (asserted by
 
 ### 6.2 Running it
 
-```bash
-cd contrastive-pretraining
-
-# GPU, ~1 h: 8 encoders x 8 formats x (20,000 train + 5,554 test) at a common 512-token budget
-sbatch slurm/08_embed_reports.sbatch 512 20000 budget512
-
-# CPU, ~15 min: score the matrix, plus any fusion pairs
-sbatch slurm/09_eval_text_encoders.sbatch budget512 20000 \
-    bioclinical_mbert+radbert medembed_large+radbert medembed_small+radbert \
-    cxr_bert+bio_clinicalbert+medembed_large
-
-# the 8192-context question, as a separate run so the caches never mix
-sbatch slurm/08_embed_reports.sbatch native 20000 nativectx
-sbatch slurm/09_eval_text_encoders.sbatch nativectx 20000
-```
-
-Results land in
-`/hnvme/workspace/y100dc19-nvidia-mri-brain/cache/r2v/textbench/<run>/results/`:
-`metrics_matrix.csv`, `per_label_auroc.csv`, `summary.json`.
+**No longer runnable** -- `embed_reports.py`, `eval_text_encoders.py` and the `textbench` package
+they drove have been removed, along with the `08_embed_reports.sbatch`/`09_eval_text_encoders.sbatch`
+scripts. This subsection is kept only as a record of how the §6.3 results below were produced.
 
 ### 6.3 Results
 
@@ -495,23 +475,16 @@ Results land in
 
 ## 7. Troubleshooting
 
+Applies to anything still live (`textenc`, `download_text_encoders.py`); rows specific to the
+removed selection benchmark have been dropped.
+
 | symptom | cause | fix |
 |---|---|---|
 | `FileNotFoundError: text encoder '<x>' checkpoint directory not found` | not staged | `python -m mrrate_r2v.cli.download_text_encoders --encoders <x>` |
 | `ValueError: max_length=N exceeds what '<x>' supports` | asked for more tokens than the checkpoint has positions | lower `--max-report-tokens`, or use `bioclinical_mbert` (8192) |
 | `contains custom code which must be executed` | loading `cxr_bert` through plain `AutoModel` | use `build_encoder("cxr_bert")` — the spec's `bert_shim` loader avoids `trust_remote_code` |
 | `Cannot use torch.load ... CVE-2025-32434` | a `.bin`-only checkpoint under torch < 2.6 | `download_text_encoders` converts `bio_clinicalbert` on stage; `text.ensure_local_safetensors` handles `radbert` |
-| `KeyError: N cached study ids are absent from the corpus` | `--train-limit`/`--seed`/`--corpus` differ between embed and eval | pass the same values to both — this check exists so a mismatch is loud |
-| probe AUROC ≈ 0.5 everywhere | embeddings collapsed, or the corpus key names changed | check `summary.json`'s `nn_jaccard_raw` vs `nn_jaccard_random`; rebuild the corpus with `build-corpus` |
 | `AssocGrpGRES` pending forever | GPU job submitted without `--qos=mq_health` | the sbatch scripts set it; keep it if you copy them |
-| out of GPU memory | `medembed_large` at batch 64 × 1024 tokens | `--batch-size 32`, or `--dtype bfloat16` |
-| `ModuleNotFoundError: sklearn` in the eval job | ran the scoring stage inside a container | scoring uses `run_py_host`; neither SIF has scikit-learn |
-
-**Memory and time, measured.** The embedding stage is the only expensive one: ~1 GPU-hour for the
-full 8 × 8 matrix at 512 tokens. Scoring is CPU-only and takes minutes because no model is loaded.
-Caches are ~25 MB per (encoder, format, split) in float16; the full matrix is ~3 GB — workspace
-only, never `$HOME`, and note `/hnvme`'s **file-count** quota (61k soft): the full matrix writes
-~260 files.
 
 ---
 
@@ -624,7 +597,7 @@ training; here they run live, which the H200 measurements in §9.7 show costs 0.
 
 Files: [`slurm/configs/`](../contrastive-pretraining/slurm/configs/README.md), one per
 configuration, sourced by
-[`slurm/11_train_conditioning.sbatch`](../contrastive-pretraining/slurm/11_train_conditioning.sbatch).
+[`slurm/train_conditioning.sbatch`](../contrastive-pretraining/slurm/train_conditioning.sbatch).
 
 ```bash
 cd contrastive-pretraining
@@ -634,17 +607,17 @@ python -m mrrate_r2v.cli.train_r2v --dry-run --max-steps 2 --device cpu \
     --conditioning cxr_bert_cls --max-report-tokens 64 --out /tmp/dry_A
 
 # 4-step GPU smoke run, per configuration
-sbatch --export=ALL,R2V_CONFIG=A slurm/11_train_conditioning.sbatch
-sbatch --export=ALL,R2V_CONFIG=B slurm/11_train_conditioning.sbatch
-sbatch --export=ALL,R2V_CONFIG=C slurm/11_train_conditioning.sbatch
+sbatch --export=ALL,R2V_CONFIG=A slurm/train_conditioning.sbatch
+sbatch --export=ALL,R2V_CONFIG=B slurm/train_conditioning.sbatch
+sbatch --export=ALL,R2V_CONFIG=C slurm/train_conditioning.sbatch
 
 # Real single-H200 run, validation every 500 optimizer steps, W&B online
 sbatch --export=ALL,R2V_CONFIG=A,R2V_MAX_STEPS=0,R2V_VALIDATE_EVERY=500,R2V_WANDB=online \
-       --time=24:00:00 slurm/11_train_conditioning.sbatch
+       --time=24:00:00 slurm/train_conditioning.sbatch
 
 # Real 4-GPU DDP run on one node
 sbatch --export=ALL,R2V_CONFIG=C,R2V_MAX_STEPS=0,R2V_NGPU=4,R2V_VALIDATE_EVERY=500 \
-       --gres=gpu:h200:4 --cpus-per-task=32 --time=24:00:00 slurm/11_train_conditioning.sbatch
+       --gres=gpu:h200:4 --cpus-per-task=32 --time=24:00:00 slurm/train_conditioning.sbatch
 ```
 
 `#SBATCH --export=NONE` means a bare `VAR=x sbatch ...` does **not** reach the job — always use
@@ -1020,11 +993,11 @@ weights with no shape error at all; and a cohort whose `report_format` differs f
 
 1. **The one that closes the loop:** train the existing report-conditioning adapter
    (`cli.train_r2v`) twice — best encoder vs. `radbert` baseline, same seed, same steps — and
-   compare with `cli.evaluate --task report2volume` on a frozen cohort. Everything needed is
+   compare with `cli.evaluate --task report2volume` on the same test split. Everything needed is
    already wired; this is the only experiment that validates limitation 4.
-2. **Token-level conditioning ablation:** `MultiEncoderEmbedder(mode="token")` vs `mode="feature"`
-   through the actual adapter. Report2CT used pooled-concat; whether token-level cross-attention
-   beats it on MR is untested.
+2. **Token-level conditioning ablation:** the `_tokens` configurations (kept token axis) vs. the
+   pooled ones (`cxr_bert_cls`/`radbert_mean`), through the actual adapter. Report2CT used
+   pooled-concat; whether token-level cross-attention beats it on MR is untested.
 3. **`impression_findings` under a real 512 budget**, end to end. The truncation argument is
    sound but its effect size on generated volumes is unknown.
 4. **Unfreeze the top N layers** of the chosen encoder (`trainable=True` is already supported) and

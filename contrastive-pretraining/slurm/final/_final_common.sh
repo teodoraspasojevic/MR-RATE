@@ -91,7 +91,7 @@ EPOCHS=2
 #
 # Past 24 h there is only the `preempt` partition (48 h, and the account has the QOS), where a job
 # can be killed at any moment by higher-priority work. That is survivable with checkpoint resume,
-# which `R2V_RESUME` / `R2V_RESUME_LR_SCHEDULE` now plumb into 11_train_conditioning.sbatch (see
+# which `R2V_RESUME` / `R2V_RESUME_LR_SCHEDULE` now plumb into train_conditioning.sbatch (see
 # run_D_continue.sh) -- but a preempted job still loses everything since its last checkpoint, so
 # pair it with `SAVE_EVERY_EPOCHS=1` or a tight `VALIDATE_EVERY`.
 #
@@ -114,23 +114,6 @@ WALLTIME=24:00:00
 # a val curve turn over, and 7 x ~17 min is ~2 h against ~11 h of training rather than ~3 h.
 VALIDATE_EVERY=600
 VAL_QUICK=128
-# One full pass late in training, not one per epoch: at N=512 a pass is expensive and the calibrated
-# distribution numbers come from `cli.evaluate` over a real cohort anyway.
-VALIDATE_FULL_EVERY=4000
-VAL_FULL=512
-# The condition-sensitivity swap costs a second generation per case and measured 192-282 s per pass,
-# so it gets its own rarer schedule. It is the diagnostic that says whether the report is used at all.
-SENSITIVITY_EVERY=1800
-SENSITIVITY_N=8
-
-# Real-vs-real noise floor from cli.validation_reference (job 713833).
-#
-# **n256, not n64, and the factor of two is the point**: `real_vs_real_baseline` splits its sample in
-# half, so an n=256 reference describes a 128-per-side floor -- which is exactly what VAL_QUICK=128
-# compares. Measured FVD 10.22 / 2.5D FID 7.83 there, against 30.01 / 21.14 at n=64 (32 per side):
-# the floor falls by ~3x for a 4x larger sample, so a reference taken at the wrong N understates the
-# model's true margin badly. ssim_autoencoder is 0.915 +/- 0.036 (n=256), confirming 0.910 at n=64.
-VALREF_JSON="$WORKSPACE/cache/r2v/validation_reference_n256_seed0.json"
 
 # ---------------------------------------------------------------- reporting
 # The order-agnostic spec: [MODALITY]/[PLANE]/[SPACING] prefix, then findings/impression in one of
@@ -181,16 +164,8 @@ submit_final_run() {
     else
         exports+=",R2V_MAX_STEPS=0,R2V_EPOCHS=${EPOCHS},R2V_LR=${R2V_LR}"
         exports+=",R2V_VALIDATE_EVERY=${VALIDATE_EVERY},R2V_VAL_QUICK=${VAL_QUICK}"
-        exports+=",R2V_VALIDATE_FULL_EVERY=${VALIDATE_FULL_EVERY},R2V_VAL_FULL=${VAL_FULL}"
-        exports+=",R2V_SENSITIVITY_EVERY=${SENSITIVITY_EVERY},R2V_SENSITIVITY_N=${SENSITIVITY_N}"
         exports+=",R2V_WANDB=${WANDB_MODE},R2V_WANDB_PROJECT=${WANDB_PROJECT}"
         exports+=",R2V_SAVE_EVERY=${VALIDATE_EVERY},R2V_KEEP_LAST_N=3"
-        if [[ -f "$VALREF_JSON" ]]; then
-            exports+=",R2V_VALIDATION_REFERENCE=${VALREF_JSON}"
-        else
-            echo "note: $VALREF_JSON does not exist yet (job 713010), so the curves will have no" >&2
-            echo "      real-vs-real reference line. Not fatal; rerun 12_validation_reference.sbatch." >&2
-        fi
         # W&B online needs credentials inside the container; the sbatch fails fast without them.
         if [[ -z "${WANDB_API_KEY:-}" && ! -f "$HOME/.netrc" ]]; then
             echo "W&B online needs WANDB_API_KEY exported, or 'wandb login' run once." >&2
@@ -205,7 +180,6 @@ submit_final_run() {
     # these are unset for the original A-E runs, so those still submit exactly as they did;
     # run_D_continue.sh is the only caller that sets them.
     [[ -n "${SAVE_EVERY_EPOCHS:-}" ]] && exports+=",R2V_SAVE_EVERY_EPOCHS=${SAVE_EVERY_EPOCHS}"
-    [[ -n "${VALIDATE_FULL_AT_END:-}" && "$SMOKE" != "1" ]] && exports+=",R2V_VALIDATE_FULL_AT_END=1"
     if [[ -n "${RESUME_FROM:-}" ]]; then
         [[ -f "$RESUME_FROM" ]] || { echo "RESUME_FROM does not exist: $RESUME_FROM" >&2; exit 1; }
         exports+=",R2V_RESUME=${RESUME_FROM}"
@@ -222,5 +196,5 @@ submit_final_run() {
            --gres="gpu:h200:${GPUS_PER_NODE}" --cpus-per-task=32 \
            --time="$walltime" --exclude="$EXCLUDE_NODES" \
            --export="$exports" \
-           "$REPO_ROOT/slurm/11_train_conditioning.sbatch"
+           "$REPO_ROOT/slurm/train_conditioning.sbatch"
 }

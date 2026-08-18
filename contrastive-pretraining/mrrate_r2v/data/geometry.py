@@ -9,7 +9,7 @@ Two policies, both selected via `R2VDatasetConfig.geometry_mode`:
   shapes differ between buckets, so batch_size > 1 needs `GeometryBucketBatchSampler`
   and the numbers are not comparable with a fixed-mode run.
 
-Axis order here is (D, H, W) = (Superior, Right, Anterior), matching `scripts/data.py`'s
+Axis order here is (D, H, W) = (Superior, Right, Anterior), matching `_preprocess_ops.py`'s
 internal convention. `dhw_to_xyz` converts to the (X, Y, Z) = (R, A, S) order the Dataset
 actually returns -- see `dataset.py`'s docstring for why the conversion happens exactly
 once, at the end.

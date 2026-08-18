@@ -1,7 +1,7 @@
 # The supported conditioning configurations
 
 One file per configuration. Each is a shell fragment sourced by
-[`11_train_conditioning.sbatch`](../11_train_conditioning.sbatch), so the flags live in exactly one
+[`train_conditioning.sbatch`](../train_conditioning.sbatch), so the flags live in exactly one
 place and a run cannot silently disagree with what is documented.
 
 | file | `--conditioning` | encoder(s) | conditioning tensor | report format |
@@ -34,9 +34,9 @@ objective, so there was no trained summary vector to pool to) but it is kept run
 `R2V_CONFIG=superseded_radbert_mean` so existing checkpoints stay loadable.
 
 ```bash
-sbatch --export=ALL,R2V_CONFIG=A slurm/11_train_conditioning.sbatch      # 4-step smoke run
+sbatch --export=ALL,R2V_CONFIG=A slurm/train_conditioning.sbatch      # 4-step smoke run
 sbatch --export=ALL,R2V_CONFIG=D,R2V_MAX_STEPS=0 --time=24:00:00 \
-       --gres=gpu:h200:4 slurm/11_train_conditioning.sbatch              # real 4-GPU run
+       --gres=gpu:h200:4 slurm/train_conditioning.sbatch              # real 4-GPU run
 ```
 
 `R2V_MAX_STEPS=0` means "no step cap" (run `--epochs` to completion). `#SBATCH --export=NONE` in

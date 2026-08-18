@@ -20,12 +20,6 @@ SIF_IMAGE="$WORKSPACE/containers/nvidia_mri_vae_dmvae.sif"
 SIF_IMAGE_TEXT="$WORKSPACE/containers/nvidia+redbert.sif"
 RADBERT_CHECKPOINT="$WORKSPACE/pretrained/RadBERT-RoBERTa-4m"
 PRETRAINED_DIR="$WORKSPACE/pretrained"
-# The text-encoder benchmark's CPU scoring stage needs scikit-learn, which neither container has.
-# It runs on the host module-system python instead (see run_py_host); the GPU embedding stage
-# still runs in SIF_IMAGE_TEXT like every other model job.
-HOST_PYTHON="${R2V_HOST_PYTHON:-/apps/python/3.12-conda/envs/pytorch2.5.1/bin/python3}"
-TEXTBENCH_ROOT="$WORKSPACE/cache/r2v/textbench"
-REPORT_CORPUS="$WORKSPACE/cache/r2v/report_analysis/reports_all.jsonl"
 
 # Persistent artifacts.
 #
@@ -39,13 +33,7 @@ RESULT_ROOT="$WORKSPACE/cache/r2v/results"
 VAE_CHECKPOINT="$WORKSPACE/models/autoencoder_v1.pt"
 # NVIDIA stores this path relative to cwd in its env config, so it must be given absolutely.
 UNET_CHECKPOINT="$WORKSPACE/models/diff_unet_3d_rflow-mr-brain_v0.pt"
-MEDICALNET_CHECKPOINT="$WORKSPACE/pretrained/medicalnet/resnet_10_23dataset_statedict.pth"
-# The blinded pathology classifier behind `--task report2volume`'s report_consistency group, fitted
-# by slurm/14_train_report_classifier.sbatch on the TRAIN split. Passed by 05_evaluate only when
-# the file exists; the evaluator records the group unavailable with a reason otherwise, never a
-# faked number.
-REPORT_CLASSIFIER="${R2V_REPORT_CLASSIFIER:-$WORKSPACE/models/report_classifier_v2.pt}"
-# torchvision's r3d_18 Kinetics-400 weights, for the FVD-adaptation feature extractor. Staged here
+# torchvision's squeezenet1_1 weights (the challenge FID_2p5D feature extractor). Staged here
 # rather than in $HOME/.cache so the containers see it and no job depends on a download.
 TORCH_HOME_DIR="$WORKSPACE/pretrained/torchhub"
 
@@ -94,7 +82,7 @@ setup() {
     echo "=== job ${SLURM_JOB_ID:-local} on $(hostname -f) ==="
     echo "R2V_REPO=$R2V_REPO"
     setup_proxy
-    preflight "$REPO_ROOT" "$CP_ROOT" "$WORKSPACE" "$SIF_IMAGE" "$REPO_ROOT/NV-Generate-CTMR"
+    preflight "$REPO_ROOT" "$CP_ROOT" "$WORKSPACE" "$SIF_IMAGE"
     mkdir -p "$WORKSPACE/slurm_logs" "$RESULT_ROOT"
     APPTAINER_ARGS=(--nv
         --bind "$REPO_ROOT:$REPO_ROOT"
@@ -142,12 +130,4 @@ run_sh() {
 run_py_text() {
     [[ -n "${APPTAINER_ARGS+x}" ]] || { echo "run_py_text called before setup()" >&2; exit 1; }
     apptainer exec "${APPTAINER_ARGS[@]}" "$SIF_IMAGE_TEXT" python3 -m "$@"
-}
-
-# run_py_host <module> [args...] -- no container, host python, for the CPU-only scoring stages
-# that need scikit-learn. Never use this for anything touching a model checkpoint or a GPU:
-# the containers exist precisely so those runs are reproducible.
-run_py_host() {
-    [[ -x "$HOST_PYTHON" ]] || { echo "HOST_PYTHON not executable: $HOST_PYTHON" >&2; exit 1; }
-    PYTHONPATH="$CP_ROOT" "$HOST_PYTHON" -m "$@"
 }

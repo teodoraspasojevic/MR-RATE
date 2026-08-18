@@ -118,39 +118,8 @@ def parse_args(argv=None):
 
     val = p.add_argument_group("validation")
     val.add_argument("--val-split", default="val")
-    val.add_argument("--validate-full-every-steps", type=int, default=None,
-                     help="optimizer steps between *full* validation passes; quick otherwise")
     val.add_argument("--val-quick-samples", type=int, default=64,
-                     help="fixed, seeded, bucket-stratified subset used at every validation step. "
-                          "Must stay >= 16 or the Frechet metrics are withheld as unreliable")
-    val.add_argument("--val-metrics", nargs="+", default=["fvd", "fid_2p5d", "ssim"],
-                     choices=["fvd", "fid_2p5d", "ssim"],
-                     help="fvd and fid_2p5d are distribution-level (lower better); ssim is paired "
-                          "(higher better). None measures report-to-volume semantic agreement")
-    val.add_argument("--val-fvd-extractor", default="r3d18",
-                     choices=["r3d18", "medicalnet"],
-                     help="r3d18 = torchvision Kinetics-400 (primary); medicalnet = the staged 3D "
-                          "classifier, this pipeline's analogue of GenerateCT's FVD_CT-Net. "
-                          "Neither is I3D, so neither is standard FVD")
-    val.add_argument("--val-sensitivity-every-steps", type=int, default=None,
-                     help="condition-sensitivity diagnostic interval, in optimizer steps. Swaps in "
-                          "another study's report at a fixed seed to check the model uses its text "
-                          "at all. Costs a second generation for --val-sensitivity-samples cases")
-    val.add_argument("--val-sensitivity-samples", type=int, default=8,
-                     help="cases the sensitivity diagnostic uses (a small subset of the quick set, "
-                          "not the whole validation split)")
-    val.add_argument("--val-sequence-frames", type=int, default=16,
-                     help="frames per FVD sequence; fixed per volume so a thick volume cannot "
-                          "contribute more evidence than a thin one")
-    val.add_argument("--val-feature-cache", type=Path, default=None,
-                     help="directory for cached real features (real volumes never change)")
-    val.add_argument("--validation-reference", type=Path, default=None,
-                     help="JSON from cli.validation_reference: real-vs-real noise floors and SSIM "
-                          "ceilings, logged as flat reference lines and never recomputed")
-    val.add_argument("--torch-home", type=Path, default=None,
-                     help="where torchvision's r3d_18 Kinetics-400 weights are staged")
-    val.add_argument("--val-full-samples", type=int, default=None,
-                     help="the larger set; must be >= --val-quick-samples (the quick set is its prefix)")
+                     help="fixed, seeded, bucket-stratified sample scored every validation step")
     val.add_argument("--val-inference-steps", type=int, default=30,
                      help="sampler steps during validation. Lower than a real generation run on "
                           "purpose: the metric only has to rank checkpoints against each other")
@@ -160,10 +129,6 @@ def parse_args(argv=None):
                      help="fixes the validation subset and the sampler noise, so the curve is "
                           "comparable across runs and across resumes")
     val.add_argument("--no-validate-at-end", dest="validate_at_end", action="store_false")
-    val.add_argument("--validate-full-at-end", action="store_true")
-    val.add_argument("--medicalnet-checkpoint", type=Path, default=None,
-                     help="MedicalNet ResNet-10 weights for the FID proxy; default "
-                          "$MRRATE_PRETRAINED_DIR/medicalnet/resnet_10_23dataset.pth")
 
     wb = p.add_argument_group("weights & biases")
     wb.add_argument("--wandb-mode", default="disabled", choices=["online", "offline", "disabled"],
@@ -385,13 +350,13 @@ def setup_distributed(args):
     if not dist.is_initialized():
         # **A one-hour timeout, not NCCL's 600 s default, and validation is why.** After the ranks
         # all_gather their per-case features, rank 0 alone computes the Frechet distances -- and
-        # `scipy.linalg.sqrtm` on the 2048x2048 InceptionV3 covariance is minutes of single-threaded
-        # work while every other rank sits inside the next collective. At 600 s the watchdog calls
-        # that a hung collective and aborts the job: job 713012 finished all 600 optimizer steps and
-        # then died in its final validation with
+        # `scipy.linalg.sqrtm` on the SqueezeNet feature covariance is real single-threaded work
+        # while every other rank sits inside the next collective. At 600 s the watchdog calls that a
+        # hung collective and aborts the job: job 713012 finished all 600 optimizer steps and then
+        # died in its final validation with
         # `WorkNCCL(SeqNum=240014, OpType=ALLGATHER) ran for 600011 milliseconds before timing out`,
         # losing its summary. The collective is not hung, it is waiting on honest CPU work, so the
-        # fix is to let it wait. This grows with --val-quick-samples and --val-full-samples.
+        # fix is to let it wait. This grows with --val-quick-samples.
         from datetime import timedelta
 
         dist.init_process_group(backend=backend, world_size=world_size, rank=rank,
@@ -439,37 +404,6 @@ class ShardedBatchSampler:
         self._length = len(self.underlying) // self.world_size
 
 
-def build_dataset(args, split: str, report_format):
-    from ..data import MRReportToVolumeDataset, R2VDatasetConfig
-    from ..data.reports import ShardReportStore
-
-    config = R2VDatasetConfig(
-        split=split,
-        report_sections=tuple(args.report_sections),
-        report_format=report_format,
-        geometry_mode=args.geometry_mode,
-        # "all": every eligible series is a training sample, so a study's report is paired with
-        # each of its ~7 series. That contrast -- one report, several modalities, distinguished
-        # only by class_labels/spacing_tensor -- is what stops the report adapter from absorbing
-        # modality. The one-per-study modes exist for cohort construction, not for training.
-        series_selection="all",
-        # Passed explicitly rather than left to the dataclass defaults. Both are hashed into an
-        # evaluation cohort's `cohort_id`, so a training run and its cohort silently disagreeing
-        # about them is exactly the class of bug the cohort contract exists to prevent -- and it
-        # happened: training took posterior_shift_mm=15.0 from the default while every R2V cohort
-        # was built at 0.
-        posterior_shift_mm=args.posterior_shift_mm,
-        normalizer=args.normalizer,
-        dtype=torch.float32,
-        seed=args.seed,
-    )
-    dataset = MRReportToVolumeDataset(
-        str(args.manifest), ShardReportStore(str(args.report_index)), config=config
-    )
-    log.info("dataset: %d (report, volume) pairs in split '%s'", len(dataset), split)
-    return dataset
-
-
 def build_dataloader(args, log, dataset, rank: int = 0, world_size: int = 1):
     from torch.utils.data import DataLoader
 
@@ -499,22 +433,6 @@ def build_dataloader(args, log, dataset, rank: int = 0, world_size: int = 1):
         persistent_workers=args.num_workers > 0,
         prefetch_factor=4 if args.num_workers > 0 else None,
     )
-
-
-def git_state():
-    """Commit and dirty flag, for the W&B run config. Never fatal -- a tarball checkout has no git."""
-    import subprocess
-
-    def run(*cmd):
-        try:
-            return subprocess.run(cmd, capture_output=True, text=True, timeout=10,
-                                  cwd=str(Path(__file__).resolve().parent)).stdout.strip()
-        except Exception:  # noqa: BLE001
-            return ""
-
-    commit = run("git", "rev-parse", "HEAD")
-    return {"git_commit": commit or "unknown",
-            "git_dirty": bool(run("git", "status", "--porcelain"))}
 
 
 def build_wandb_run(args, embedder, training_config, world_size: int):
@@ -557,7 +475,6 @@ def build_wandb_run(args, embedder, training_config, world_size: int):
         "report_dropout_probability": args.report_dropout_probability,
         "modality_dropout_probability": args.modality_dropout_probability,
         "log_reports": args.wandb_log_reports,
-        **git_state(),
     }
     return WandbRun(
         mode=args.wandb_mode, entity=args.wandb_entity, project=args.wandb_project,
@@ -568,7 +485,7 @@ def build_wandb_run(args, embedder, training_config, world_size: int):
 
 def build_validation_runner(args, dataset, autoencoder, divisor, scale_factor, noise_scheduler,
                             embedder, cfg_args, wandb_run):
-    """A `validate(trainer, step, full)` callable for `MRRateAdapterTrainer.fit`.
+    """A `validate(trainer, step)` callable for `MRRateAdapterTrainer.fit`.
 
     The sampler is rebuilt per validation step from the *live* trainer's UNet, so it always
     reflects the current adapter weights rather than a stale reference.
@@ -577,43 +494,9 @@ def build_validation_runner(args, dataset, autoencoder, divisor, scale_factor, n
     from ..validation import ValidationConfig, ValidationRunner
 
     config = ValidationConfig(
-        every_steps=args.validate_every_steps, at_end=args.validate_at_end,
-        n_quick=args.val_quick_samples, n_full=args.val_full_samples,
-        full_every_steps=args.validate_full_every_steps, seed=args.val_seed,
+        n_samples=args.val_quick_samples, seed=args.val_seed,
         num_inference_steps=args.val_inference_steps, n_visualize=args.val_visualize,
-        sequence_frames=args.val_sequence_frames,
-        enabled_metrics=tuple(args.val_metrics),
-        sensitivity_every_steps=args.val_sensitivity_every_steps,
-        n_sensitivity=args.val_sensitivity_samples,
-        feature_cache_dir=str(args.val_feature_cache) if args.val_feature_cache else None,
-        reference_path=str(args.validation_reference) if args.validation_reference else None,
     )
-
-    # FVD: torchvision r3d_18 (Kinetics-400). An MRI-volume adaptation of FVD, not standard FVD --
-    # see eval/video_features.py for exactly how it differs from the I3D reference implementation.
-    sequence_extractor = None
-    if "fvd" in config.enabled_metrics:
-        try:
-            from ..eval.video_features import build_sequence_extractor
-
-            sequence_extractor = build_sequence_extractor(
-                args.val_fvd_extractor, device=str(args.device),
-                torch_home=str(args.torch_home) if args.torch_home else None,
-                checkpoint_path=args.medicalnet_checkpoint,
-            )
-            log.info("FVD extractor: %s", json.dumps(sequence_extractor.configuration(), default=str))
-        except Exception as exc:  # noqa: BLE001
-            log.warning("FVD extractor unavailable (%s): validation will skip val/fvd. Stage "
-                        "r3d_18 into --torch-home first.", exc)
-
-    inception_extractor = None
-    if "fid_2p5d" in config.enabled_metrics:
-        try:
-            from ..eval.distribution import InceptionFeatureExtractor
-
-            inception_extractor = InceptionFeatureExtractor(device=str(args.device))
-        except Exception as exc:  # noqa: BLE001
-            log.warning("Inception extractor unavailable (%s): validation will skip val/fid_2p5d.", exc)
 
     from ..sampling import SamplerConfig, official_latent_divisor
 
@@ -644,21 +527,17 @@ def build_validation_runner(args, dataset, autoencoder, divisor, scale_factor, n
             # `decode`, NOT `generate`: `generate` ends in postprocess_mr, which rescales the
             # decoder's [0, 1] output to int16 [0, 1000]. The ground truth here is the Dataset's
             # percentile-normalised volume, so a postprocessed generation would be 1000x off and
-            # every metric would still return a plausible number. See
-            # eval/video_features.METRIC_INTENSITY_SPACE.
+            # every metric would still return a plausible number.
+            # `ValidationRunner._check_intensity_space` catches it if this line ever changes.
             return sampler.decode(latent)
 
         return generate
 
     runner = ValidationRunner(
         dataset=dataset, sampler_factory=sampler_factory,
-        sequence_extractor=sequence_extractor, inception_extractor=inception_extractor,
         config=config, wandb_run=wandb_run if args.wandb_log_reports else None,
-        output_dir=args.out,
+        output_dir=args.out, device=str(args.device),
     )
-    if wandb_run is not None:
-        wandb_run.log({}, step=0)   # establishes step 0 before any reference line is drawn
-    log.info("validation configuration: %s", json.dumps(runner.configuration(), default=str))
     if wandb_run is not None and not args.wandb_log_reports:
         log.info("validation panels disabled: --wandb-log-reports not set (report text is patient "
                  "data). Metrics are still logged.")
@@ -768,11 +647,28 @@ def main(argv=None) -> int:
     cfg_args = load_config(str(DEFAULT_ENV_CONFIG), str(DEFAULT_MODEL_CONFIG), str(network_config))
     noise_scheduler = define_instance(cfg_args, "noise_scheduler")
 
+    from ..data import build_r2v_dataset
+
     train_loader, validation_dataset, autoencoder, divisor = None, None, None, None
     if args.dry_run:
         train_loader = synthetic_loader(steps=args.max_steps or 2)
     else:
-        dataset = build_dataset(args, args.split, report_format)
+        # "all": every eligible series is a training sample, so a study's report is paired with
+        # each of its ~7 series. That contrast -- one report, several modalities, distinguished
+        # only by class_labels/spacing_tensor -- is what stops the report adapter from absorbing
+        # modality. The one-per-study modes exist for cohort construction, not for training.
+        # `posterior_shift_mm`/`normalizer` are passed explicitly rather than left to the
+        # dataclass defaults: both are hashed into an evaluation cohort's `cohort_id`, so a
+        # training run and its cohort silently disagreeing about them is exactly the class of bug
+        # the cohort contract exists to prevent -- and it happened once (training took
+        # posterior_shift_mm=15.0 from the default while every R2V cohort was built at 0).
+        dataset = build_r2v_dataset(
+            args.manifest, args.report_index, split=args.split, report_format=report_format,
+            geometry_mode=args.geometry_mode, series_selection="all",
+            posterior_shift_mm=args.posterior_shift_mm, normalizer=args.normalizer, seed=args.seed,
+            report_sections=args.report_sections,
+        )
+        log.info("dataset: %d (report, volume) pairs in split %r", len(dataset), args.split)
         train_loader = build_dataloader(args, log, dataset, rank=rank, world_size=world_size)
         from ..models.nvidia import load_autoencoder
 
@@ -790,7 +686,12 @@ def main(argv=None) -> int:
             # Except when the format is a multi-name spec: the val split takes the FIRST name only.
             # A sampled format would add format variance to a curve whose only job is to show model
             # improvement, and would do it inconsistently across validation steps.
-            validation_dataset = build_dataset(args, args.val_split, validation_report_format)
+            validation_dataset = build_r2v_dataset(
+                args.manifest, args.report_index, split=args.val_split,
+                report_format=validation_report_format, geometry_mode=args.geometry_mode,
+                series_selection="all", posterior_shift_mm=args.posterior_shift_mm,
+                normalizer=args.normalizer, seed=args.seed, report_sections=args.report_sections,
+            )
 
     unet = wrap_distributed(unet, local_rank) if world_size > 1 else unet
 
@@ -799,9 +700,7 @@ def main(argv=None) -> int:
         grad_accumulation_steps=args.grad_accumulation_steps, grad_clip_norm=args.grad_clip_norm,
         amp=args.amp, amp_dtype=args.amp_dtype, seed=args.seed, log_every=args.log_every,
         save_every_steps=args.save_every_steps, save_every_epochs=args.save_every_epochs,
-        validate_every_steps=args.validate_every_steps,
-        validate_full_every_steps=args.validate_full_every_steps,
-        validate_at_end=args.validate_at_end, validate_full_at_end=args.validate_full_at_end,
+        validate_every_steps=args.validate_every_steps, validate_at_end=args.validate_at_end,
         keep_last_n=args.keep_last_n, save_format=args.save_format,
         conditioning_name=args.conditioning, report_format=report_format,
         conditioning=ConditioningConfig(

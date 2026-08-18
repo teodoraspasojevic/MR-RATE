@@ -18,7 +18,7 @@
 # holds the evaluation until the blinded classifier exists, with **afterany**: a missing classifier
 # makes one metric group unavailable-with-a-reason, which is not a reason to sit in the queue.
 #
-# `--export=NONE` in 05_evaluate.sbatch means the environment does NOT reach the job on its own;
+# `--export=NONE` in evaluate.sbatch means the environment does NOT reach the job on its own;
 # everything below is passed through `--export=ALL,...` explicitly.
 
 set -euo pipefail
@@ -150,15 +150,6 @@ WANDB_GROUP="${R2V_WANDB_GROUP:-final_four_${SPLIT}}"
 WANDB_PANELS="${R2V_WANDB_PANELS:-6}"
 WANDB_REPORTS="${R2V_WANDB_REPORTS:-1}"
 
-# ---------------------------------------------------------------- training provenance
-#
-# Configuration C's training job died before writing `train_summary.json`, which is where
-# `world_size` (and hence the effective batch, and hence the training-sample count) is recorded.
-# All four arms were launched from `slurm/final/_final_common.sh` at 2 nodes x 4 GPUs, so 8 is a
-# recorded fact of the run rather than a guess; `world_size_source` in the results says which arms
-# took it from the summary and which were told. Only C needs it.
-TRAIN_WORLD_SIZE="${R2V_TRAIN_WORLD_SIZE:-8}"
-
 # ---------------------------------------------------------------- run map
 run_dir_for() {
     case "$1" in
@@ -217,7 +208,6 @@ submit_final_eval() {
     exports+=",R2V_MODALITY_GUIDANCE=${MODALITY_GUIDANCE},R2V_SEED=${SEED}"
     exports+=",R2V_SPLIT=${SPLIT},R2V_POSTERIOR_SHIFT=${POSTERIOR_SHIFT}"
     exports+=",R2V_NORMALIZER=${NORMALIZER},R2V_REPORT_FORMAT=${REPORT_FORMAT}"
-    exports+=",R2V_TRAIN_WORLD_SIZE=${TRAIN_WORLD_SIZE}"
     exports+=",R2V_WANDB=${WANDB_MODE},R2V_WANDB_PROJECT=${WANDB_PROJECT}"
     exports+=",R2V_WANDB_GROUP=${WANDB_GROUP},R2V_WANDB_NAME=${config}_${tag}"
     exports+=",R2V_WANDB_PANELS=${WANDB_PANELS},R2V_WANDB_REPORTS=${WANDB_REPORTS}"
@@ -232,7 +222,7 @@ submit_final_eval() {
     local job_id
     job_id=$(sbatch --parsable --job-name="evaluate_${run_tag}" --time="$walltime" \
         --export="$exports" ${dependency+"${dependency[@]}"} \
-        "$REPO_ROOT/slurm/05_evaluate.sbatch" report2volume "$run_tag" "$adapter")
+        "$REPO_ROOT/slurm/evaluate.sbatch" report2volume "$run_tag" "$adapter")
     echo "    job        : $job_id"
     echo "    results    : $WORKSPACE/cache/r2v/results/report2volume_${run_tag}"
 }

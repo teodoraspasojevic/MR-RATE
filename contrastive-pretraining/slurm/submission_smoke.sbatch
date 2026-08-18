@@ -13,7 +13,7 @@
 # Runs `submission/predict.py` -- the challenge container's entry point -- end to end on real GPU
 # hardware, against `submission/mock_input/prompts.json`.
 #
-#   sbatch slurm/15_submission_smoke.sbatch <ws>/runs/<tag>/adapter_step0004200.pt
+#   sbatch slurm/submission_smoke.sbatch <ws>/runs/<tag>/adapter_step0004200.pt
 #
 # This does NOT build or run the Docker image (Helma has no Docker, only Apptainer). What it does
 # validate is everything inside the image that can fail: the prompt parser, the routing table, the
@@ -29,7 +29,7 @@
 #   R2V_STEPS=10                           fewer diffusion steps for a faster check
 #   R2V_SMOKE_RESUME=1                     second pass, to prove /checkpoint resume skips the done
 #
-# Override with `sbatch --export=ALL,R2V_STEPS=10 slurm/15_submission_smoke.sbatch <adapter>`,
+# Override with `sbatch --export=ALL,R2V_STEPS=10 slurm/submission_smoke.sbatch <adapter>`,
 # because `--export=NONE` means a plain `VAR=x sbatch ...` never reaches the job.
 
 unset SLURM_EXPORT_ENV

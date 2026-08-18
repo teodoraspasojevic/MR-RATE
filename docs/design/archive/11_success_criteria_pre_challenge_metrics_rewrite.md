@@ -1,3 +1,36 @@
+# Archived: success criteria for the pre-challenge-metrics evaluation run
+
+This is `slurm/SUCCESS_CRITERIA.md` as it stood before the evaluation metrics were rewritten to
+match the VLM3D `mr-volume-generation` challenge's own scoring code. It described a **different,
+richer metrics schema** than what `cli.evaluate` produces today — not just the cohort/prediction
+stages the file's own "What changed (2026-08-10)" section already flagged as gone, but the metric
+set itself. `slurm/check_run.py`, which parsed this schema's output files, was deleted alongside
+it (both unrunnable against current output; see `mrrate_r2v/README.md` and `mrrate_r2v/eval/README.md`
+for why).
+
+**Then → now**, per `mrrate_r2v/eval/README.md`: `metrics_per_bucket.csv` + `metrics_summary.csv`
+(10 per-bucket rows, ~30 independently-defined metrics — fidelity/perceptual/distribution/anatomy/
+report_alignment/report_consistency) → one `<out>/metrics.json` shaped `{"metrics": {...},
+"per_case": [...], ...}`, scored by `challenge_metrics.ChallengeAccumulator` against exactly the
+VLM3D challenge's own evaluation code (MSE/PSNR/SSIM/FID_2p5D per plane/`dice`, plus bookkeeping
+counts). None of `psnr_fg`, `edge_preservation_fg`, `ssim3d_whole`, `ncc_fg`, per-bucket FID
+comparisons, or `report_consistency`/`macro_auroc_usable_labels` exist in the current output —
+this document's specific criteria (E5–E9, ER3) cannot be checked against it.
+
+The original content is preserved below because deriving the E5/E7 revisions and the
+known-acceptable-outcomes findings cost real GPU time and analysis; the specific thresholds are
+not directly portable to the new metric set, but the underlying findings likely still bear on
+interpreting the new one (e.g. T2w CORONAL's low training-count/cubic-geometry quality issue,
+PSNR's non-clipped percentile-normalizer reference scale, MedicalNet FID's validity problems
+relative to the 2.5D Inception features `challenge_metrics` actually uses).
+
+Read this before writing a new success-criteria document against the current `metrics.json`
+schema, so the earlier findings aren't silently lost or rediscovered from scratch.
+
+---
+
+<!-- Original content of slurm/SUCCESS_CRITERIA.md follows, unedited. -->
+
 # Success criteria for the R2V evaluation run
 
 What a job must satisfy before its output is treated as a result. A job that "finished" without

@@ -59,7 +59,6 @@ from .models.adapter import (
     freeze_to_adapter_only,
     save_adapter_checkpoint,
     save_full_unet_checkpoint,
-    sha256_file,
 )
 
 log = logging.getLogger("mrrate_r2v.training")
@@ -174,7 +173,7 @@ class LatentEncoder:
 
     @torch.no_grad()
     def encode(self, images: torch.Tensor) -> torch.Tensor:
-        from .eval.geometry_contract import pad_to_divisible
+        from .eval.padding import pad_to_divisible
 
         # End-only padding, the same primitive and the same convention `cli/evaluate.py:reconstruct` uses, so
         # the encoder sees a training volume padded exactly as an evaluated one is.
@@ -206,17 +205,15 @@ class TrainingConfig:
     grad_accumulation_steps: int = 1
     #: Gradient-norm clip. **On by default, unlike the official trainer.** With `grad_clip_norm=None`
     #: and no GradScaler, a single non-finite gradient writes NaN into the weights and every later
-    #: step, checkpoint and validation number is garbage -- observed in jobs 690054-57. The official
-    #: trainer gets away without it because float16 + GradScaler silently *skips* such steps; that
-    #: masking is what made the same failure look like a step-240 divergence under float16.
+    #: step, checkpoint and validation number is garbage. The official trainer gets away without it
+    #: because float16 + GradScaler silently *skips* such steps instead.
     grad_clip_norm: Optional[float] = 1.0
     amp: bool = True
     #: Autocast dtype. **bfloat16 by default, deliberately diverging from the official trainer.**
-    #: `torch.amp.autocast("cuda")` with no dtype silently means *float16*, and float16 overflows:
-    #: an LR sweep (jobs 689068-71) produced NaN at the identical step for every learning rate
-    #: from 1e-5 to 3e-4, with losses matching to four decimals -- i.e. not divergence, an
-    #: overflow. bfloat16 has float32's exponent range, is native on H200 (bf16_supported=True),
-    #: and needs no GradScaler. Set "float16" to reproduce NVIDIA's exact setup.
+    #: `torch.amp.autocast("cuda")` with no dtype silently means *float16*, which overflows at
+    #: every learning rate tried (measured: identical-step NaN across a full LR sweep, i.e. an
+    #: overflow, not divergence). bfloat16 has float32's exponent range, is native on H200, and
+    #: needs no GradScaler. Set "float16" to reproduce NVIDIA's exact setup.
     amp_dtype: str = "bfloat16"
     #: Consecutive non-finite losses tolerated before the run is stopped. One is survivable (the
     #: scaler skips the step); a run of them means the weights are gone and every later number,
@@ -229,13 +226,10 @@ class TrainingConfig:
     save_every_steps: Optional[int] = None
     #: Epochs between end-of-epoch checkpoints (`adapter_epoch<N>.pt`, absolute epoch number so a
     #: resumed run continues the numbering). Counted in epochs, not steps, because an epoch boundary
-    #: does not land on a multiple of `save_every_steps` in general -- 2 epochs of configuration D
-    #: is 4493 optimizer steps, so the boundary sits at 2246.5. Never pruned by `keep_last_n`.
+    #: does not land on a multiple of `save_every_steps` in general. Never pruned by `keep_last_n`.
     save_every_epochs: Optional[int] = None
     validate_every_steps: Optional[int] = None
-    validate_full_every_steps: Optional[int] = None
     validate_at_end: bool = True
-    validate_full_at_end: bool = False
     save_format: str = "adapter"  # adapter | full | both
     #: How many periodic step checkpoints to keep. `last`/`best_*` are never counted or deleted.
     keep_last_n: Optional[int] = 3
@@ -311,7 +305,6 @@ class MRRateAdapterTrainer:
         self._nonfinite_streak = 0
         self.skipped_steps = 0
         #: The reference constants are identical at every validation; the Table goes out once.
-        self._reference_table_logged = False
         # The gate that makes "only adapters train" a checked fact rather than an intention.
         assert_only_adapter_trainable(self._unwrapped(), self.optimizer, text_embedder)
         log.info("adapter training: %s", self.freeze_report.format())
@@ -324,7 +317,7 @@ class MRRateAdapterTrainer:
         self.start_epoch = 0
         # Lower-is-better and higher-is-better tracked separately, both persisted, so a resumed run
         # does not overwrite a better checkpoint with a worse one on its first validation.
-        self.best_metrics: dict = {"fvd": None, "fid_2p5d": None, "ssim": None}
+        self.best_metrics: dict = {"fid_2p5d": None, "ssim": None}
         # Report dropout draws from its own generator so a resumed run reproduces the same drops
         # regardless of what else consumed the global RNG.
         self.dropout_generator = torch.Generator().manual_seed(config.seed + 12345)
@@ -499,17 +492,16 @@ class MRRateAdapterTrainer:
                     log.info("retention: removed %s", path.name)
 
     def _maybe_save_best(self, validation: dict) -> list:
-        """Update the best-metric checkpoints. Lower FID is better, higher alignment is better."""
+        """Update the best-metric checkpoints. Lower FID is better, higher SSIM is better."""
         saved = []
         if self.local_rank != 0:
             return saved
-        # One entry per headline validation metric, with its direction stated rather than implied.
-        # FVD and 2.5D FID are distributional distances (lower better, optimum 0); SSIM is a paired
-        # similarity (higher better, max 1).
+        # The two headline challenge metrics, with direction stated rather than implied. FID_2p5D is
+        # a distributional distance (lower better, optimum 0); SSIM is a paired similarity (higher
+        # better, max 1).
         candidates = [
-            ("fvd", "val/fvd", min),
-            ("fid_2p5d", "val/fid_2p5d", min),
-            ("ssim", "val/ssim", max),
+            ("fid_2p5d", "val/FID_2p5D_Avg", min),
+            ("ssim", "val/SSIM_mean", max),
         ]
         for key, metric_name, better in candidates:
             value = validation.get(metric_name)
@@ -524,80 +516,36 @@ class MRRateAdapterTrainer:
                 saved.append(key)
         return saved
 
-    def validate_now(self, validate, full: bool = False) -> dict:
+    def validate_now(self, validate) -> dict:
         """Run validation and act on it. Every rank calls this -- `validate` is responsible for its
         own sharding and gathering -- but only rank 0 writes checkpoints or logs.
 
-        **Exactly three curves reach W&B**, and only from the quick pass:
+        The challenge metrics reach W&B as curves, one series per key:
 
-            val/quick/{fvd,fid_2p5d,ssim}
-
-        A pass returns ~47 numbers (per plane, per bucket, rank flags, timings, counts, the
-        sensitivity diagnostic); logging all of them produced a dashboard nobody could read.
-
-        **Anything measured once is a summary entry, not a curve.** That covers the reference
-        constants (`val/reference/*`, computed once by `cli.validation_reference` and identical at
-        every step) and the full pass (`val/full/*`, which runs on the order of once per run). A
-        one-point series renders as a lone marker or, worse, a flat line that reads as "tracked and
-        unchanging" -- so those go to `run.summary`, which is a table.
-
-        Quick and full are never merged into one series in any case: they measure the *same* metric
-        at different N, and for a Frechet distance N is part of the number, so overlaying them would
-        draw a step change that is a sample-size artefact rather than a model change.
-
-        Everything else stays in the returned payload and lands in `train_summary.json`.
+            val/{MSE_mean,PSNR_mean,SSIM_mean,FID_2p5D_XY,FID_2p5D_XZ,FID_2p5D_YZ,FID_2p5D_Avg,dice}
         """
-        from .validation import HEADLINE_METRICS
-
-        validation = validate(self, self.optimizer_step, full)
-        is_full = bool(validation.get("val/full"))
-        curves, once = {}, {}
-        for metric in HEADLINE_METRICS:
-            value = validation.get(f"val/{metric}")
-            if isinstance(value, (int, float)) and value == value:      # present and not NaN
-                (once if is_full else curves)[f"val/{'full' if is_full else 'quick'}/{metric}"] = float(value)
-        if is_full:
-            once["val/full/n_cases"] = validation.get("val/n_cases")
-            once["val/full/optimizer_step"] = self.optimizer_step
-        once.update({k: v for k, v in validation.items()
-                     if k.startswith("val/reference/") and isinstance(v, (int, float))})
-        if curves:
-            self._log_metrics(curves, step=self.optimizer_step)
-        if once and self.local_rank == 0 and self.wandb_run is not None:
-            self.wandb_run.set_summary(once)
-            # `set_summary` only populates the Overview tab. The reference constants are meant to be
-            # read *together*, beside the curves they calibrate, so they also go out once as a real
-            # Table panel -- otherwise "it is in the table" means a key/value list on another page.
-            references = {k: v for k, v in once.items() if k.startswith("val/reference/")}
-            if references and not self._reference_table_logged:
-                self._reference_table_logged = True
-                self.wandb_run.log_table(
-                    "val/reference", ["reference", "value"],
-                    sorted((k.removeprefix("val/reference/"), v) for k, v in references.items()),
-                    step=self.optimizer_step)
+        validation = validate(self, self.optimizer_step)
+        self._log_metrics(validation, step=self.optimizer_step)
         self._maybe_save_best(validation)
         return validation
 
     def fit(self, train_loader, validate=None) -> dict:
-        """`validate(trainer, optimizer_step, full) -> dict`, or None to skip validation.
+        """`validate(trainer, optimizer_step) -> dict`, or None to skip validation.
 
         `ValidationRunner.run` matches that signature. It is passed in rather than constructed
-        here so the trainer keeps no dependency on the sampler or the feature extractor.
+        here so the trainer keeps no dependency on the sampler.
         """
         micro_per_epoch = max(len(train_loader), 1)
         # Both budgets count what THIS invocation does, not the model's whole history: `n_epochs` is
         # epochs to run and `max_steps` is micro-steps to run. Measuring `max_steps` against the
-        # cumulative `self.step` instead made it meaningless after a resume -- the D checkpoint is at
-        # micro-step 17972, so any smoke-sized cap was already exceeded before the first batch and
-        # the job stopped one micro-step in while reporting that it had honoured the cap.
+        # cumulative `self.step` instead would make a resumed run's smoke-sized cap already exceeded
+        # before the first batch, stopping one micro-step in while reporting the cap was honoured.
         start_step = self.step
         total_micro = self.config.max_steps or int(self.config.n_epochs * micro_per_epoch)
         # `PolynomialLR` is stepped once per *optimizer* step, so its horizon must be counted in
         # optimizer steps -- but both `max_steps` and `len(train_loader)` are micro-step counts.
-        # Passing the micro count made the schedule decay `grad_accumulation_steps` times too
-        # slowly: job 690962 (accum 2, max_steps 3000) reached only 64% of its base LR by its last
-        # optimizer step instead of ~0, and at config B's accum 16 the LR would have been constant
-        # to within 12% for the whole run. Every LR sweep before 2026-08-07 measured that schedule.
+        # Passing the micro count instead would decay the schedule `grad_accumulation_steps` times
+        # too slowly (measured: a factor of accum steps too flat by the run's last optimizer step).
         total_steps = max(1, total_micro // self.config.grad_accumulation_steps)
         if self.lr_scheduler is None:
             self.lr_scheduler = build_scheduler(self.optimizer, total_steps)
@@ -618,11 +566,10 @@ class MRRateAdapterTrainer:
         start = time.time()
         # Intervals fire on the optimizer step *transition*, so an interval is never missed and
         # never fires twice for one optimizer step (which `step % N` on micro-steps would do
-        # whenever grad_accumulation_steps > 1).
-        # Anchored at the *current* optimizer step, not at 0. A resumed run starts at step 4493, and
-        # `4493 // 600 > 0 // 600` is true, so anchoring at 0 fired a validation, a full validation
-        # and a checkpoint save all on the first optimizer step after every resume.
-        last_validated = last_saved = last_full = self.optimizer_step
+        # whenever grad_accumulation_steps > 1). Anchored at the *current* optimizer step, not at
+        # 0 -- anchoring at 0 would fire a validation and a checkpoint save on the first optimizer
+        # step after every resume.
+        last_validated = last_saved = self.optimizer_step
         # `n_epochs` is how many epochs *this* invocation runs; `start_epoch` is where they sit in
         # the model's whole training history (0 for a fresh run, past the resumed epoch otherwise).
         # Every epoch number that leaves this loop -- the log line, the W&B curve, the checkpoint
@@ -669,12 +616,7 @@ class MRRateAdapterTrainer:
                     if (interval and validate is not None
                             and self.optimizer_step // interval > last_validated // interval):
                         last_validated = self.optimizer_step
-                        full_interval = self.config.validate_full_every_steps
-                        full = bool(full_interval
-                                    and self.optimizer_step // full_interval > last_full // full_interval)
-                        if full:
-                            last_full = self.optimizer_step
-                        validations.append(self.validate_now(validate, full=full))
+                        validations.append(self.validate_now(validate))
 
                     save_interval = self.config.save_every_steps
                     if (save_interval and self.local_rank == 0
@@ -699,7 +641,7 @@ class MRRateAdapterTrainer:
                 break
 
         if self.config.validate_at_end and validate is not None:
-            validations.append(self.validate_now(validate, full=self.config.validate_full_at_end))
+            validations.append(self.validate_now(validate))
         if self.local_rank == 0:
             self.save(self.output_dir / "adapter_last.pt",
                       loss=history[-1]["loss"] if history else None,
@@ -795,11 +737,10 @@ class MRRateAdapterTrainer:
           schedule was built for.
         * ``restart`` -- discard the stored schedule and LR, and build a fresh `PolynomialLR` from
           ``config.lr`` over *this* run's horizon. Required when extending a run that already ran to
-          completion, because `PolynomialLR` reaches exactly 0 at `total_iters` and stays there:
-          `r2v_final_D_report2ct_style/adapter_last.pt` stores
-          ``{total_iters: 4493, last_epoch: 4493, _last_lr: [0.0]}`` and an optimizer whose
-          ``param_groups[0]["lr"]`` is ``0.0``. Continuing that schedule trains at LR 0 -- a silent
-          no-op that burns the whole walltime and writes a checkpoint identical to its input.
+          completion, because `PolynomialLR` reaches exactly 0 at `total_iters` and stays there: a
+          finished run's checkpoint stores an optimizer whose ``param_groups[0]["lr"]`` is ``0.0``.
+          Continuing that schedule trains at LR 0 -- a silent no-op that burns the whole walltime
+          and writes a checkpoint identical to its input.
 
         `fit` refuses to run a restored schedule that is already exhausted, so the failure above is
         an error rather than a wasted job.
@@ -904,6 +845,5 @@ __all__ = [
     "official_timesteps",
     "resolve_scale_factor",
     "set_loader_epoch",
-    "sha256_file",
     "wrap_distributed",
 ]

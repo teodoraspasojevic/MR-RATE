@@ -7,8 +7,7 @@ This is the only document you need; the per-module READMEs
 
 For the *conditioning* side — which text encoder, which report format, and where modality/spacing
 should come from — see **[TEXT_ENCODERS.md](TEXT_ENCODERS.md)** and the
-[textenc](../contrastive-pretraining/mrrate_r2v/textenc/README.md) /
-[textbench](../contrastive-pretraining/mrrate_r2v/textbench/README.md) READMEs.
+[textenc README](../contrastive-pretraining/mrrate_r2v/textenc/README.md).
 
 **Training a report adapter? Start at
 [`textenc/README.md` Part 4](../contrastive-pretraining/mrrate_r2v/textenc/README.md) for the four
@@ -143,8 +142,8 @@ sbatch slurm/01_smoke_test.sbatch                        # whole pipeline, 2 cas
 sbatch slurm/02_preprocess.sbatch test_v1 200            # cohort: 200 per (modality, plane)
 sbatch slurm/03_predict_vae.sbatch test_v1 vae_v1
 sbatch slurm/04_predict_generation.sbatch test_v1 0 gen_v1   # 0 = match the cohort's counts
-sbatch slurm/05_evaluate.sbatch reconstruction test_v1 vae_v1
-sbatch slurm/05_evaluate.sbatch generation     test_v1 gen_v1
+sbatch slurm/evaluate.sbatch reconstruction test_v1 vae_v1
+sbatch slurm/evaluate.sbatch generation     test_v1 gen_v1
 ```
 
 Paths and the apptainer invocation live in `slurm/_common.sh` — edit them in that one place.
@@ -400,7 +399,7 @@ what the metrics can consume.
 
 Use `--workers` instead. Per-case scoring is embarrassingly parallel and scales near-linearly
 (measured 7.32× at 8 workers), with byte-identical results at any worker count.
-`slurm/05_evaluate.sbatch` already passes `$SLURM_CPUS_PER_TASK` with 32 CPUs requested.
+`slurm/evaluate.sbatch` already passes `$SLURM_CPUS_PER_TASK` with 32 CPUs requested.
 
 It does not help `--task generation`, which has no paired metrics, and it does not speed up the
 distribution-metric feature extractors (serial, on GPU). Full breakdown:
@@ -454,7 +453,7 @@ cli.generate_r2v  →  volume + manifest   (one report, or a whole cohort)
 cli.predict_r2v   →  PREDICTION dir      (a cohort, in the format cli.evaluate scores)
 ```
 
-`slurm/06_train_r2v.sbatch` and `slurm/07_generate_r2v.sbatch` are the runnable versions of both.
+`slurm/train_r2v.sbatch` and `slurm/generate_r2v.sbatch` are the runnable versions of both.
 They use `$SIF_IMAGE_TEXT` (`nvidia+redbert.sif`), not the base image, because the base image has no
 transformers.
 
@@ -749,7 +748,7 @@ slurm/final_eval/run_D_report2ct_style.sh
 slurm/final_eval/run_E_report2ct_style_meta.sh
 ```
 
-Each submits **two** jobs — `13_predict_r2v.sbatch` then `05_evaluate.sbatch`, chained with
+Each submits **two** jobs — `13_predict_r2v.sbatch` then `evaluate.sbatch`, chained with
 `--dependency=afterok` so a failed prediction set can never be scored. The four `run_*.sh` scripts
 set `R2V_CONFIG` and nothing else; every other parameter lives in
 `slurm/final_eval/_final_eval_common.sh`, exactly as `slurm/final/_final_common.sh` does for
@@ -770,12 +769,12 @@ or set `CHECKPOINT_KIND=step4200` for the step-matched comparison.
 | | writes | scoreable |
 |---|---|---|
 | `13_predict_r2v.sbatch` (`cli.predict_r2v`) | `predictions.json` + per-bucket `.npz`, in the cohort's percentile-normalised space | **yes** |
-| `07_generate_r2v.sbatch` (`cli.generate_r2v`) | `.nii.gz` + a generation manifest, in NVIDIA's int16 `[0, 1000]` range | no — use it to *look* at a sample |
+| `generate_r2v.sbatch` (`cli.generate_r2v`) | `.nii.gz` + a generation manifest, in NVIDIA's int16 `[0, 1000]` range | no — use it to *look* at a sample |
 
 ### W&B: one table, a few panels
 
 `slurm/final_eval/` logs to W&B by default (`R2V_WANDB=online`, project `mr-rate-r2v-eval`, one
-group for the four arms, run named after the arm). A hand-run `05_evaluate.sbatch` stays offline
+group for the four arms, run named after the arm). A hand-run `evaluate.sbatch` stays offline
 unless you set `R2V_WANDB`.
 
 | What | Where | Note |
@@ -831,7 +830,7 @@ Nothing — and there was no such evaluation, because two of these five defects 
 2. **Configurations B and C could not be rebuilt at inference.** `rebuild_embedder` had no branch
    for `kind="tokens"`, so those adapters fell through to a path that defaults to RadBERT — and
    since CXR-BERT and RadBERT are both 768-wide, every downstream shape check passed. Given
-   `--text-checkpoint` (which `07_generate_r2v.sbatch` hardcoded) a CXR-BERT arm silently loaded
+   `--text-checkpoint` (which `generate_r2v.sbatch` hardcoded) a CXR-BERT arm silently loaded
    RadBERT. `load_adapter_checkpoint` is now also given the live embedder's identity, so
    `assert_conditioning_compatible` actually runs.
 3. **Configuration D could not run at all**, since nothing passed it per-section text.
@@ -883,11 +882,9 @@ No GPU, no real data, no checkpoints — a few seconds. Two files are worth know
 ```
 contrastive-pretraining/
   mrrate_r2v/
-    cohort.py          the frozen ground-truth contract
-    predictions.py     its mirror on the prediction side
     data/              manifest -> Dataset -> preprocessed volume   (README.md)
-    eval/              cohort + predictions + task -> metrics       (README.md)
-    models/nvidia.py   the only place vendored NVIDIA code is imported
+    eval/              task -> metrics                              (README.md)
+    models/nvidia.py   the only place NVIDIA-authored model-loading code is used
     models/report_conditioned_unet.py
                        the pretrained diffusion UNet + report cross-attention adapters,
                        and the strict pretrained-checkpoint loader
@@ -896,13 +893,12 @@ contrastive-pretraining/
                        plus encode_reports (the one dispatch seam) and rebuild_embedder
     textenc/           the encoder zoo + report formats + fusion            (README.md)
                        conditioning.py = the named configurations (textenc/README.md Part 4)
-    textbench/         encoder x format selection benchmark; never imported by the trainer
-                       (README.md; results and rationale in docs/TEXT_ENCODERS.md)
     conditioning.py    modality ids, NVIDIA's own modality dropout, report dropout, CFG
     training.py        adapter training; mirrors NV-Generate-CTMR/scripts/diff_model_train.py
     validation.py      step-based validation during training: FID + alignment proxy, DDP-safe
     sampling.py        report-to-volume sampling; mirrors scripts/diff_model_infer.py
-    cli/               the entry points (nine generation + four text-encoder + one benchmark)
+    cli/               the entry points: build_manifest, train_r2v, evaluate, generate_r2v,
+                       download_text_encoders
   scripts/             the contrastive-pretraining pipeline (separate; see its own README)
   slurm/               _common.sh + the numbered job scripts
   tests/
@@ -913,9 +909,12 @@ docs/
   nhr_official_docs/   FAU cluster documentation
 ```
 
-`scripts/data.py` is shared: the R2V Dataset imports its volume preprocessing unchanged, so both
-pipelines can never drift apart on how a volume is prepared. Everything else in `scripts/` belongs
-to the contrastive model and is untouched by this pipeline.
+`mrrate_r2v` has no import dependency on `contrastive-pretraining/scripts/` (or on `mr_rate/` /
+`vision_encoder/`). Volume preprocessing (`mrrate_r2v/data/_preprocess_ops.py`) was originally
+forked verbatim from the contrastive pipeline's `scripts/data.py`, but the two are now
+maintained independently — this is deliberate, so `mrrate_r2v` can be extracted into its own
+repository without carrying any of `contrastive-pretraining/scripts/`, `mr_rate/`, or
+`vision_encoder/` along with it.
 
 ---
 

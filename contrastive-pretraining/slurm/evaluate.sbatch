@@ -12,16 +12,16 @@
 #
 # The ONE evaluation job. Builds the dataset, generates, and scores -- no cohort, no prediction set.
 #
-#   sbatch slurm/05_evaluate.sbatch <task> <run_tag> [adapter.pt]
+#   sbatch slurm/evaluate.sbatch <task> <run_tag> [adapter.pt]
 #
 #     report2volume    a trained adapter, conditioned on each case's own report   (needs adapter.pt)
 #     reconstruction   the frozen NVIDIA autoencoder, encode then decode
 #     generation       the frozen base UNet from a modality label alone, report-blind
 #
 # Examples:
-#   sbatch slurm/05_evaluate.sbatch reconstruction  vae_baseline
-#   sbatch slurm/05_evaluate.sbatch generation      nvidia_uncond
-#   sbatch slurm/05_evaluate.sbatch report2volume   r2v_A  $WS/runs/r2v_final_A_cxr_bert_cls/adapter_last.pt
+#   sbatch slurm/evaluate.sbatch reconstruction  vae_baseline
+#   sbatch slurm/evaluate.sbatch generation      nvidia_uncond
+#   sbatch slurm/evaluate.sbatch report2volume   r2v_A  $WS/runs/r2v_final_A_cxr_bert_cls/adapter_last.pt
 #
 # **What gets evaluated.** Every case in `--split test`, in a deterministic order with no RNG,
 # unless R2V_N_PER_BUCKET caps it -- and the cap takes the FIRST N per bucket in that same order,
@@ -46,8 +46,8 @@ R2V_REPO="${R2V_REPO:-/home/hpc/y100dc/y100dc19/VLM3D-MRI-R2V-MICCAI-26/MR-RATE}
 source "$R2V_REPO/contrastive-pretraining/slurm/_common.sh"
 setup
 
-TASK="${1:?usage: sbatch 05_evaluate.sbatch <task> <run_tag> [adapter.pt]}"
-TAG="${2:?usage: sbatch 05_evaluate.sbatch <task> <run_tag> [adapter.pt]}"
+TASK="${1:?usage: sbatch evaluate.sbatch <task> <run_tag> [adapter.pt]}"
+TAG="${2:?usage: sbatch evaluate.sbatch <task> <run_tag> [adapter.pt]}"
 ADAPTER="${3:-}"
 
 case "$TASK" in
@@ -60,7 +60,7 @@ if [[ "$TASK" == "report2volume" && -z "$ADAPTER" ]]; then
 fi
 
 OUT="$RESULT_ROOT/${TASK}_${TAG}"
-preflight "$MANIFEST_CSV" "$REPORT_INDEX_CSV" "$VAE_CHECKPOINT" "$MEDICALNET_CHECKPOINT"
+preflight "$MANIFEST_CSV" "$REPORT_INDEX_CSV" "$VAE_CHECKPOINT"
 [[ -z "$ADAPTER" ]] || preflight "$ADAPTER"
 
 ARGS=(
@@ -76,10 +76,8 @@ ARGS=(
     --normalizer "${R2V_NORMALIZER:-percentile}"
     --geometry-mode per_modality_plane
     --report-sections findings impression
-    --medicalnet-checkpoint "$MEDICALNET_CHECKPOINT"
     --seed "${R2V_SEED:-42}"
     --device cuda
-    --save-figures "${R2V_SAVE_FIGURES:-3}"
     --overwrite
 )
 
@@ -98,24 +96,6 @@ ARGS=(
 )
 [[ "$TASK" == "generation" ]] && ARGS+=(--base-checkpoint "$UNET_CHECKPOINT")
 [[ -n "${R2V_N_PER_BUCKET:-}" ]] && ARGS+=(--n-per-bucket "$R2V_N_PER_BUCKET")
-# R2V_CASE_SELECTION_SEED draws the N per bucket at random instead of taking the first N. The
-# prefix is a convenience sample and measurably skewed (see the flag's help); this is how you get a
-# representative estimate. It changes run_id, so a seeded run cannot be mistaken for a prefix run.
-[[ -n "${R2V_CASE_SELECTION_SEED:-}" ]] && ARGS+=(--case-selection-seed "$R2V_CASE_SELECTION_SEED")
-# R2V_N_TOTAL drops per-bucket balancing: draw this many cases from the whole split, so each bucket
-# appears at its population frequency (4.5%-16.3%) instead of 1/10th. That is the mixture training
-# saw and the one the challenge scores. Mutually exclusive with R2V_N_PER_BUCKET -- the CLI refuses
-# both -- so a caller setting this must not also set that.
-[[ -n "${R2V_N_TOTAL:-}" ]] && ARGS+=(--n-total "$R2V_N_TOTAL")
-[[ -n "${R2V_FRECHET_BATCH:-}" ]] && ARGS+=(--frechet-batch-size "$R2V_FRECHET_BATCH")
-# Keep the generated volumes so a later metric does not need a second 4-hour sampling run.
-# R2V_SAVE_VOLUMES=1 puts them next to the results; give a path to put them elsewhere.
-if [[ "${R2V_SAVE_VOLUMES:-0}" == "1" ]]; then
-    ARGS+=(--save-volumes "$OUT/volumes")
-elif [[ -n "${R2V_SAVE_VOLUMES:-}" && "${R2V_SAVE_VOLUMES}" != "0" ]]; then
-    ARGS+=(--save-volumes "$R2V_SAVE_VOLUMES")
-fi
-[[ -n "${R2V_SAVE_VOLUMES_DTYPE:-}" ]] && ARGS+=(--save-volumes-dtype "$R2V_SAVE_VOLUMES_DTYPE")
 # For the cross-format ablation only: A/B/C trained on the two *_meta formats, so the two
 # non-meta ones are out of distribution and `assert_report_format_matches` refuses them by
 # default. That refusal is the safety net -- override it only when the OOD degradation IS the
@@ -123,17 +103,6 @@ fi
 [[ "${R2V_ALLOW_FORMAT_MISMATCH:-0}" == "1" ]] && ARGS+=(--allow-report-format-mismatch)
 # Fail on a missing encoder zoo now, not after the queue wait.
 [[ "$TASK" != "report2volume" ]] || preflight "$PRETRAINED_DIR"
-[[ -n "${R2V_TRAIN_WORLD_SIZE:-}" ]] && ARGS+=(--train-world-size "$R2V_TRAIN_WORLD_SIZE")
-
-# The blinded classifier is passed only when it exists. Without it the report_consistency group is
-# recorded unavailable WITH A REASON -- never faked, never silently dropped.
-if [[ -f "$REPORT_CLASSIFIER" ]]; then
-    ARGS+=(--report-classifier "$REPORT_CLASSIFIER")
-    echo "blinded classifier: $REPORT_CLASSIFIER"
-else
-    echo "NOTE: $REPORT_CLASSIFIER not found -- report_consistency will be reported unavailable."
-    echo "      Fit it with: sbatch slurm/14_train_report_classifier.sbatch"
-fi
 
 WANDB_MODE_ARG="${R2V_WANDB:-disabled}"
 ARGS+=(--wandb-mode "$WANDB_MODE_ARG")
@@ -173,8 +142,6 @@ fi
 
 echo "=== evaluating: task=$TASK tag=$TAG split=${R2V_SPLIT:-test} ==="
 echo "    n-per-bucket: ${R2V_N_PER_BUCKET:-<entire split>}"
-echo "    n-total     : ${R2V_N_TOTAL:-<per-bucket balanced>}"
-echo "    selection   : ${R2V_CASE_SELECTION_SEED:+random, seed $R2V_CASE_SELECTION_SEED}${R2V_CASE_SELECTION_SEED:-first-N prefix}"
 echo "    results     : $OUT"
 
 # run_py_text, not run_py: report2volume needs the text-encoder stack, and using one image for all
@@ -182,12 +149,6 @@ echo "    results     : $OUT"
 run_py_text mrrate_r2v.cli.evaluate "${ARGS[@]}"
 
 echo
-echo "=== acceptance gate (slurm/SUCCESS_CRITERIA.md) ==="
-# Never fatal: the metrics are already written and a checker that cannot run must not make a
-# completed evaluation look like a failed one. Read its verdict before reading any number.
-PYTHONPATH="$CP_ROOT" "$HOST_PYTHON" "$CP_ROOT/slurm/check_run.py" --results "$OUT" || true
-
-echo
-echo "=== headline CSVs ==="
-head -20 "$OUT/metrics_summary.csv" 2>/dev/null || true
+echo "=== metrics.json ==="
+cat "$OUT/metrics.json" 2>/dev/null || true
 sacct -j "$SLURM_JOB_ID" --format=JobID,State,Elapsed,MaxRSS 2>&1 || true
