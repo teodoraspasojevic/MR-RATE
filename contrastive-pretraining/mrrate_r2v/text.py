@@ -425,41 +425,10 @@ def encode_reports(embedder, batch: dict, device) -> TextConditioning:
     return embedder.encode(batch["report_text"], device)
 
 
-class ReportEncodingCache:
-    """Optional memo for `TextEmbedder.encode` on single reports. Correctness never depends on it:
-    a miss just re-encodes. The key covers the encoder identity, so two encoders, two max lengths or
-    two tokenisers can never collide.
-    """
-
-    def __init__(self, embedder: TextEmbedder, max_entries: int = 4096) -> None:
-        self.embedder = embedder
-        self.max_entries = max_entries
-        self._entries: dict[str, TextConditioning] = {}
-        identity = sorted(embedder.identity.items())
-        self._identity_key = hashlib.sha256(repr(identity).encode()).hexdigest()[:16]
-        self.hits = self.misses = 0
-
-    def key(self, report: str) -> str:
-        return f"{self._identity_key}:{hashlib.sha256(report.encode()).hexdigest()}"
-
-    def encode_one(self, report: str, device: torch.device) -> TextConditioning:
-        key = self.key(report)
-        cached = self._entries.get(key)
-        if cached is not None:
-            self.hits += 1
-            return cached.to(device=device)
-        self.misses += 1
-        encoded = self.embedder.encode([report], device=torch.device("cpu"))
-        if len(self._entries) < self.max_entries:
-            self._entries[key] = encoded
-        return encoded.to(device=device)
-
-
 __all__ = [
     "DEFAULT_MAX_REPORT_TOKENS",
     "MockTextEmbedder",
     "RadBertEmbedder",
-    "ReportEncodingCache",
     "TEXT_EMBEDDERS",
     "TextConditioning",
     "TextEmbedder",

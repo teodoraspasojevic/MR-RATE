@@ -196,9 +196,7 @@ class ReportToVolumeSampler:
     def decode(self, latent: torch.Tensor) -> np.ndarray:
         """`diff_model_infer.py:213-224`: NVIDIA's `ReconModel` (which divides by `scale_factor`
         before decoding) driven by their sliding-window inferer at the same settings."""
-        from .models import nvidia as _nvidia  # noqa: F401  -- puts the vendored root on sys.path
-        from scripts.utils import dynamic_infer
-        from scripts.utils_infer import ReconModel
+        from .models.nvidia import ReconModel, dynamic_infer
 
         recon = ReconModel(autoencoder=self.autoencoder, scale_factor=self.scale_factor).to(self.device)
         inferer = SlidingWindowInferer(

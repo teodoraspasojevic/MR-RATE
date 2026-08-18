@@ -21,10 +21,6 @@ override it. When the adapter was trained on a `*_meta` format, the `[MODALITY]/
 prefix is prepended from those same values -- so a challenge request that carries no acquisition
 metadata just takes the defaults, and the text and the numeric conditioning still agree.
 
-Every case in a cohort's validation split, from its paired MR-RATE report:
-
-    python -m mrrate_r2v.cli.generate_r2v --cohort <ws>/cohorts/val_v1 --out-dir <ws>/samples/val_v1 ...
-
 Modality-only generation (NVIDIA's original behaviour, no report term):
 
     ... --report "" --report-guidance-scale 0 --modality-guidance-scale 10
@@ -61,16 +57,9 @@ def parse_args(argv=None):
     source = p.add_argument_group("report source (exactly one)")
     source.add_argument("--report", default=None, help="report text")
     source.add_argument("--report-file", type=Path, default=None, help="file containing the report text")
-    source.add_argument("--cohort", type=Path, default=None,
-                        help="generate one volume per case from the cohort's paired reports")
-    source.add_argument("--allow-report-format-mismatch", action="store_true",
-                        help="generate even when the cohort's report_format differs from the one "
-                             "the adapter was trained on. For a deliberate ablation only -- the "
-                             "mismatch is otherwise silent")
 
     out = p.add_argument_group("output")
-    out.add_argument("--out", type=Path, default=None, help="output .nii.gz (single report)")
-    out.add_argument("--out-dir", type=Path, default=None, help="output directory (--cohort)")
+    out.add_argument("--out", type=Path, default=None, help="output .nii.gz")
     out.add_argument("--modality", default="T1w", choices=["T1w", "T2w", "FLAIR", "SWI", "unknown"],
                      help="the modality to generate. Also the [MODALITY] marker when the adapter "
                           "was trained on a metadata format -- there is no 'unspecified' option, "
@@ -99,12 +88,9 @@ def parse_args(argv=None):
                          help="load an adapter trained against a different base checkpoint")
 
     args = p.parse_args(argv)
-    sources = [args.report is not None, args.report_file is not None, args.cohort is not None]
-    if sum(sources) != 1:
-        p.error("give exactly one of --report, --report-file, --cohort")
-    if args.cohort is not None and args.out_dir is None:
-        p.error("--cohort needs --out-dir")
-    if args.cohort is None and args.out is None:
+    if sum([args.report is not None, args.report_file is not None]) != 1:
+        p.error("give exactly one of --report, --report-file")
+    if args.out is None:
         p.error("--report/--report-file needs --out")
     args.dim, args.spacing, args.geometry_source = resolve_output_geometry(args)
     return args
@@ -350,10 +336,10 @@ def assert_report_format_matches(payload: dict, cohort, allow_mismatch: bool = F
         return
     message = (
         f"report-format mismatch: the adapter was trained on report_format={trained!r} but this "
-        f"cohort's text was composed with report_format={built!r}. The conditioning strings differ, "
+        f"run's text was composed with report_format={built!r}. The conditioning strings differ, "
         f"which is silent at generation time and only shows up as a worse score.\n"
-        f"  Rebuild the cohort with `cli.preprocess --report-format "
-        f"{trained_names[0] if trained_names else trained}`, or pass "
+        f"  Pass --report-format "
+        f"{trained_names[0] if trained_names else trained}, or pass "
         f"--allow-report-format-mismatch for a deliberate cross-format ablation."
     )
     if allow_mismatch:
@@ -365,60 +351,6 @@ def assert_report_format_matches(payload: dict, cohort, allow_mismatch: bool = F
 def main(argv=None) -> int:
     args = parse_args(argv)
     sampler, embedder, payload = build_sampler(args)
-
-    if args.cohort is not None:
-        from ..cohort import Cohort
-
-        cohort = Cohort(args.cohort)
-        assert_report_format_matches(payload, cohort,
-                                     allow_mismatch=args.allow_report_format_mismatch,
-                                     embedder=embedder)
-        args.out_dir.mkdir(parents=True, exist_ok=True)
-        # Same up-front check `cli.predict_r2v` makes: a sectioned-fusion configuration needs the
-        # cohort's unjoined per-section text, and finding that out on case 1 of 2,000 is wasteful.
-        needs_sections = bool(getattr(embedder, "needs_sections", False))
-        if needs_sections and not cohort.has_report_sections:
-            raise SystemExit(
-                f"this adapter encodes report sections separately, but {args.cohort} has no "
-                f"report_sections.json. Rebuild the cohort with `cli.preprocess`."
-            )
-        written = []
-        for case in cohort.cases:
-            report_text = cohort.load_report(case.case_id)
-            if not report_text:
-                raise SystemExit(
-                    f"cohort case {case.case_id} carries no report text; regenerate the cohort with "
-                    "reports, or use --report/--report-file"
-                )
-            path = args.out_dir / f"{case.case_id}.nii.gz"
-            # The *case's* modality, not `--modality`: a cohort spans four sequences, and
-            # conditioning an SWI case on T1w is a wrong class label that still generates fine.
-            # `--modality` remains the flag for the free-form path, where there is no case to ask.
-            # `with_acquisition_section` is additive: configuration D ignores the extra key, and
-            # configuration E needs it because a cohort's stored sections are report text only --
-            # the acquisition token is composed from the case's own modality/plane/spacing, exactly
-            # as the Dataset composed it during training.
-            sections = None
-            if needs_sections:
-                from ..textenc.formats import with_acquisition_section
-
-                sections = with_acquisition_section(
-                    cohort.load_report_sections(case.case_id),
-                    case.sequence, case.acquisition_plane, case.spacing_mm,
-                )
-            volume = sampler.generate(
-                report_text, tuple(case.shape), tuple(case.spacing_mm),
-                seed=args.seed, modality=case.sequence, report_sections=sections,
-            )
-            from ..sampling import save_volume
-
-            save_volume(volume, case.spacing_mm, path)
-            written.append(str(path))
-            log.info("wrote %s %s", path, volume.shape)
-        (args.out_dir / "generation_manifest.json").write_text(json.dumps(
-            manifest_for(args, sampler, embedder, payload, {"cohort": str(args.cohort), "outputs": written}),
-            indent=2, default=str))
-        return 0
 
     report_text = args.report if args.report is not None else args.report_file.read_text()
     log.info("geometry: dim=%s spacing_mm=%s [X,Y,Z] (%s)", args.dim, args.spacing, args.geometry_source)

@@ -356,7 +356,8 @@ def default_unet_filename(env_config=DEFAULT_ENV_CONFIG) -> str:
 
 __all__ = [
     "DEFAULT_CONFIGS_DIR", "DEFAULT_ENV_CONFIG", "DEFAULT_MODEL_CONFIG", "DEFAULT_NETWORK_CONFIG",
-    "load_models", "prepare_tensors", "run_inference", "set_random_seed", "load_config", "define_instance",
-    "augment_modality_label", "required_spatial_divisor", "load_autoencoder", "load_autoencoder_and_unet",
+    "ReconModel", "dynamic_infer", "load_models", "prepare_tensors", "run_inference",
+    "set_random_seed", "load_config", "define_instance", "augment_modality_label",
+    "required_spatial_divisor", "load_autoencoder", "load_autoencoder_and_unet",
     "default_unet_filename",
 ]

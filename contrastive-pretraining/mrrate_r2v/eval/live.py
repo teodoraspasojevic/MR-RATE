@@ -44,9 +44,7 @@ class LiveCase:
 
     @property
     def bucket(self) -> str:
-        from ..volumes import bucket_name
-
-        return bucket_name(self.sequence, self.acquisition_plane)
+        return f"{self.sequence}__{self.acquisition_plane}"
 
 
 def select_eval_cases(dataset, n_per_bucket: int | None = None) -> list:
