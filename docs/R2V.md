@@ -43,8 +43,7 @@ All code lives in one package: `contrastive-pretraining/mrrate_r2v/`. Run everyt
                                                                      │
                                                                      ▼
                                                               RESULTS DIRECTORY
-                                                              metrics_per_bucket.csv
-                                                              metrics_summary.csv + 6 more
+                                                              metrics.json
 ```
 
 **Train and test are the same program up to the point where one trains and the other infers.**
@@ -57,16 +56,20 @@ Three properties follow, and they are the reason it has this shape:
 | Property | How it is guaranteed |
 |---|---|
 | **Test preprocesses exactly like train** | There is one `R2VDatasetConfig` and one `build_dataset`. Not a convention — there is no second code path that *could* differ. |
-| **Evaluation is always the same** | One `LiveEvaluator.run`. Every task, every model. `eval/tasks.py` decides the metric set from `--task` and nothing else does. |
+| **Evaluation is always the same** | One `LiveEvaluator.run`, and one metric definition in `eval/challenge_metrics.py`. Every task, every model — the task only decides how a volume is *produced*. |
 | **The same cases, every time** | Case selection uses **no RNG**: ordered by `(study_uid, series_id)` within each (modality, plane) bucket, round-robined across buckets. Prefix-stable, so `--n-per-bucket` is a prefix of the full run. |
-| **The same volumes, every time** | Sampler noise is `stable_seed(--seed, case_id)` — a function of the case, not of iteration order. A rerun, a resume, a `--n-per-bucket`, or a different world size all reproduce the same volume for the same case. |
+| **The same volumes, every time** | Sampler noise is `--seed + <dataset index>` — a function of the case's position in the manifest, not of iteration order. A rerun, a resume or a smaller `--n-per-bucket` all reproduce the same volume for the same case. |
 
-And the gate that replaces the old `cohort_id` handshake: `run_id` hashes the ordered case list
-with every preprocessing setting, the task, the sample cap, the seed and the model checkpoint.
-Equal `run_id` means the same cases at the same geometry under the same preprocessing. On top of
-that, `cli.evaluate --task report2volume` compares its own `--posterior-shift-mm` / `--normalizer` /
-`--geometry-mode` against what the adapter recorded at training time and **refuses to run** on a
-mismatch, before any GPU work.
+What records comparability: `metrics.json` carries `dataset_config.geometry_fingerprint()` —
+every preprocessing setting that affects the tensor — alongside the model identity, the task, the
+split and the sample cap. Two runs whose fingerprints agree saw the same cases at the same geometry
+under the same preprocessing.
+
+> ⚠️ **There is no longer an automatic refusal on a train/test preprocessing mismatch.** An earlier
+> version compared `--posterior-shift-mm` / `--normalizer` / `--geometry-mode` against what the
+> adapter recorded at training time and refused to run before any GPU work; that check went with
+> the declutter. **Check the fingerprint against the run's `train_summary.json` yourself** — this is
+> exactly the class of divergence that voided a whole sweep once (see the box below).
 
 > **Why this replaced the cohort pipeline (2026-08-10).** The old design froze a cohort directory,
 > wrote a prediction set, and scored the two against each other with a `cohort_id` handshake. It
@@ -109,75 +112,88 @@ python -m mrrate_r2v.cli.build_manifest --source shards_parquet \
     --verify-sample 20
 ```
 
-### Then, per experiment set — freeze a cohort (once)
+### Then, per model — evaluate
+
+There is no cohort or prediction step any more: one command builds the Dataset, generates and
+scores.
 
 ```bash
-python -m mrrate_r2v.cli.preprocess \
-    --manifest-csv     .../manifest_shards_native.csv \
-    --report-index-csv .../report_index_shards_native.csv \
-    --split test --sequences T1w T2w FLAIR SWI --n-per-bucket 200 \
-    --out /hnvme/workspace/y100dc19-nvidia-mri-brain/cache/r2v/cohorts/test_v1
-```
+WS=/hnvme/workspace/y100dc19-nvidia-mri-brain
 
-Note the `cohort_id` it prints. That is the identifier of your experiment set.
-
-### Then, per model — predict and evaluate
-
-```bash
-COHORT=.../cohorts/test_v1
-
-python -m mrrate_r2v.cli.predict_vae --cohort $COHORT \
-    --checkpoint .../models/autoencoder_v1.pt --out .../predictions/vae_v1
-
+# the frozen autoencoder — the ceiling any generator is measured against
 python -m mrrate_r2v.cli.evaluate --task reconstruction \
-    --gt $COHORT --pred .../predictions/vae_v1 --out .../results/vae_v1
+    --manifest .../manifest_shards_native.csv \
+    --report-index .../report_index_shards_native.csv \
+    --split test --n-per-bucket 200 \
+    --vae-checkpoint $WS/models/autoencoder_v1.pt \
+    --out $WS/cache/r2v/results/vae_v1
+
+# a trained report adapter
+python -m mrrate_r2v.cli.evaluate --task report2volume \
+    --manifest .../manifest_shards_native.csv \
+    --report-index .../report_index_shards_native.csv \
+    --split test --n-per-bucket 200 \
+    --checkpoint $WS/runs/r2v_final_D_report2ct_style/adapter_last.pt \
+    --out $WS/cache/r2v/results/r2v_D
 ```
 
-Read `.../results/vae_v1/metrics_per_bucket.csv` and `metrics_summary.csv`.
+Read `<out>/metrics.json` — `SSIM_mean` is the platform's primary metric. Check `n_scored_files`
+against `n_total_files` every time (§5).
+
+> **`--posterior-shift-mm` and `--normalizer` must match what the adapter trained under.** Nothing
+> checks this for you any more. `slurm/evaluate.sbatch` defaults to `15` / `percentile`, which is
+> what the final runs used.
 
 ### On the cluster
 
 ```bash
-sbatch slurm/01_smoke_test.sbatch                        # whole pipeline, 2 cases. Do this first.
-sbatch slurm/02_preprocess.sbatch test_v1 200            # cohort: 200 per (modality, plane)
-sbatch slurm/03_predict_vae.sbatch test_v1 vae_v1
-sbatch slurm/04_predict_generation.sbatch test_v1 0 gen_v1   # 0 = match the cohort's counts
-sbatch slurm/evaluate.sbatch reconstruction test_v1 vae_v1
-sbatch slurm/evaluate.sbatch generation     test_v1 gen_v1
+sbatch slurm/evaluate.sbatch reconstruction vae_baseline
+sbatch slurm/evaluate.sbatch generation     nvidia_uncond
+sbatch slurm/evaluate.sbatch report2volume  r2v_D  $WS/runs/r2v_final_D_report2ct_style/adapter_last.pt
 ```
 
-Paths and the apptainer invocation live in `slurm/_common.sh` — edit them in that one place.
-Set each job's `--time` from the smoke test's measured per-case rate rather than guessing.
+Scale with `R2V_N_PER_BUCKET` (`8` ≈ 10 min wiring check, `200` ≈ 4 h, unset = the full 29,027-case
+split ≈ 60 h). Paths and the apptainer invocation live in `slurm/_common.sh` — edit them in that
+one place. For a whole sweep of arms and guidance scales, use `slurm/final_eval/run_sweep.sh`.
 
 ---
 
 ## 3. The three tasks
 
-`--task` is the only thing that decides which metrics run.
+`--task` decides only **how a volume is produced**. Every task is then scored identically, by
+`eval/challenge_metrics.py`.
 
-| `--task` | The model was given | Ground truth? | Metrics computed |
+| `--task` | The model was given | Paired ground truth | What the number means |
 |---|---|---|---|
-| `reconstruction` | a real volume, to encode and decode | yes, that exact volume | fidelity, perceptual, distribution, anatomy |
-| `report2volume` | a report | yes, the series that report describes | fidelity, perceptual, distribution, anatomy, report alignment, **report consistency** |
-| `generation` | a modality label only | **no** | distribution, anatomy |
+| `reconstruction` | a real volume, to encode and decode | yes, that exact volume | the **ceiling**: no generator can beat its own autoencoder |
+| `report2volume` | the case's report | yes, the series that report describes | the result you are actually after |
+| `generation` | a modality label only, report-blind | none in principle — but see below | the **floor** |
 
-**Why `generation` gets no voxelwise metrics.** An unconditional generator is told "make a T1w
-brain" and nothing about any patient. Computing MAE or SSIM against an arbitrary real scan would
-measure "how different are two random brains," not generation quality. This is enforced in
-[`eval/tasks.py`](../contrastive-pretraining/mrrate_r2v/eval/tasks.py) as a property of the task,
-not as a flag you could forget.
+> ⚠️ **`generation` is now scored voxelwise too, and that number needs care.** An unconditional
+> generator is told "make a T1w brain" and nothing about any patient, yet it is still compared
+> against the real series for that case — so its SSIM/PSNR measures *how similar two unrelated
+> brains are*, not generation quality. An earlier design made this structurally impossible
+> (`eval/tasks.py` marked the task unpaired); the port of the official metrics removed that
+> distinction, since the challenge scores whatever you submit against the paired ground truth
+> regardless.
+>
+> Read `generation` as the **floor** — the score obtainable with no report information at all. A
+> `report2volume` run that does not clearly beat it has not learned to use its report. That is a
+> genuinely useful baseline; treating it as "the unconditional model's quality" is not.
 
-**Expect `report2volume` fidelity to be much weaker than `reconstruction`.** A report constrains
-pathology and gross anatomy, not voxel positions. Low PSNR there is not necessarily a bug; compare
-against other report-to-volume runs on the same cohort, never against a reconstruction number.
+**Expect `report2volume` fidelity to sit well below `reconstruction`.** A report constrains
+pathology and gross anatomy, not voxel positions. A low PSNR there is not necessarily a bug —
+compare against other report-to-volume runs on the same split, and against the two bounds above,
+never against a reconstruction number alone.
 
 ---
 
 ## 4. Controlling the experiment
 
-Every knob below belongs to `cli.preprocess` and is recorded in `cohort.json`. That is the point:
-changing any of them produces a different `cohort_id`, so results across the change can never be
-silently mixed.
+Every knob below belongs to `cli.evaluate` (and, where it affects the tensor, to `cli.train_r2v`
+too) and is recorded in `metrics.json` under `dataset_config`. **Changing one changes the numbers,
+and nothing stops you comparing across the change** — the automatic refusal is gone (§1), so
+compare `dataset_config` between two runs before reading their metrics against each other.
 
 ### How many samples
 
@@ -263,7 +279,7 @@ input to the diffusion UNet, not just metadata — comes out as whatever makes i
 
 Why 32 and not 16: the UNet has 4 levels, the latent is `shape / 4`, and the latent must be
 divisible by 8. A div-16-but-not-32 shape raises a skip-connection size mismatch mid-sampling
-(verified: `(240, 240, 176)` fails with "Expected size 14 but got size 15"). `cli.predict_generation`
+(verified: `(240, 240, 176)` fails with "Expected size 14 but got size 15"). The `generation` task
 refuses such a shape up front rather than padding, since padding would change the FOV.
 
 | Bucket | shape (X, Y, Z) | spacing (mm) | FOV (mm, = NVIDIA's) |
@@ -283,10 +299,9 @@ This replaced a single 256³ @ 1 mm grid, which padded a measured **52%** of eac
 background; at the per-bucket FOVs it is **9.7%**.
 
 **`--fixed-shape` and `--fixed-spacing-mm` are `(X, Y, Z)`** = (Right-Left, Anterior-Posterior,
-Superior-Inferior) — the same order the Dataset returns, the cohort records, and the NVIDIA model
-uses. Internally the preprocessing works in `(D, H, W)`; `cli.preprocess` converts at the boundary
-via `geometry.xyz_to_dhw`. You never see `(D, H, W)` from outside the package: every file in a
-cohort directory is `(X, Y, Z)`.
+Superior-Inferior) — the same order the Dataset returns, `LiveCase` records, and the NVIDIA model
+uses. Internally the preprocessing works in `(D, H, W)`; the CLI converts at the boundary via
+`geometry.xyz_to_dhw`. You never see `(D, H, W)` from outside the package.
 
 Because shapes differ between buckets, use `GeometryBucketBatchSampler` for batch_size > 1, and
 never compare a per-bucket run's numbers with a fixed-mode run's.
@@ -315,10 +330,10 @@ penalised the coronal and sagittal buckets specifically, for a displacement the 
 
 `test_v2` (shift 0) is therefore superseded by **`test_v3` (shift 15)**. The earlier note that 0
 "won 8 of 10 buckets" was measured on cohort construction alone and never applied to training; it is
-not a reason to score a model on a grid it never saw. Both CLIs now expose the knob, the training
-flag's default is read off the dataclass so the two cannot drift, and the value is hashed into
-`cohort_id` so the two can never be mixed. Pinned by
-`test_r2v_inference_contracts.py::test_training_and_cohort_preprocessing_defaults_are_reachable_and_agree`.
+not a reason to score a model on a grid it never saw. Both CLIs expose the knob and the training
+flag's default is read off the dataclass so the two cannot drift — but **the cross-check that used
+to refuse a mismatched evaluation no longer exists**, so the value in `dataset_config` has to be
+compared against the run's `train_summary.json` by hand.
 
 Heads up: the default percentile normalizer does **not** clip. Values above the 99.5th percentile
 exceed 1.0. PSNR's `data_range=1.0` is therefore a fixed reference scale, not a true ceiling —
@@ -337,109 +352,172 @@ text is used every time — never truncated or randomly subsampled.
 
 ## 5. Reading the results
 
-Same layout for every task:
+One file per run: **`<out>/metrics.json`**.
 
-| File | What it is |
-|---|---|
-| `metrics_per_bucket.csv` | **read this first.** One row per (modality, plane): the shape and spacing it was scored at, the sample counts, and every metric. |
-| `metrics_summary.csv` | the aggregates — one row per modality, then `overall_macro` and `overall_weighted` |
-| `per_case_metrics.csv` | one row per scored case |
-| `summary.json` | the same numbers machine-readably, plus which metric groups ran and why |
-| `distribution_metrics.json` | FID and diversity metrics, when computed |
-| `anatomy_metrics.json` | anatomical plausibility of the produced population against the real one |
-| `excluded_cases.json` | every case that was *not* scored, with a specific reason |
-| `run_manifest.json` | exactly what ran: `cohort_id`, task, checkpoint hashes, versions |
-| `figures/` | example slice montages (ground truth / prediction / difference), worth a look before trusting any number |
+```json
+{
+  "metrics": {"MSE_mean": ..., "PSNR_mean": ..., "SSIM_mean": ..., "dice": ...,
+              "FID_2p5D_XY": ..., "FID_2p5D_XZ": ..., "FID_2p5D_YZ": ..., "FID_2p5D_Avg": ...,
+              "n_total_files": 2000, "n_scored_files": 1988,
+              "n_missing_outputs": 12, "n_excluded_out_of_scope_modality": 0},
+  "per_case": [{"case_id": "...", "bucket": "T1w_AXIAL", "status": "scored",
+                "MSE": ..., "PSNR": ..., "SSIM": ...}, ...],
+  "task": "report2volume", "split": "test", "n_per_bucket": 200, "elapsed_sec": 14203.6,
+  "model": {...}, "dataset_config": {...}
+}
+```
 
-### The two overall rows
-
-`metrics_summary.csv` ends with two rows that will not agree, deliberately:
-
-| Row | What it means |
-|---|---|
-| `overall_macro` | unweighted mean across buckets — every anatomy counts equally |
-| `overall_weighted` | weighted by `population_bucket_counts`, i.e. what the real test split looks like |
-
-The cohort is sampled to **equal size per bucket**, so cohort counts carry no information about how
-common a bucket is and must never be used as weights — that would silently turn the weighted
-aggregate back into the macro one. Quote `overall_macro` when comparing models, `overall_weighted`
-when claiming what a clinical population would see.
-
-`metrics_per_bucket.csv` also carries `nvidia_train_n` — NVIDIA's own published count of training
-images for that bucket — and an `nvidia_low_train_n` flag. Three T2w buckets were trained on
-195/125/551 images and NVIDIA states quality is not guaranteed there. They are **kept** in every
-aggregate; the column is there so a weak number can be read as coverage rather than failure.
-
-Always check `n_scored` against `n_cohort` per bucket. If they differ, `excluded_cases.json` says
-why for every case. Nothing is ever silently dropped.
+The old `metrics_per_bucket.csv` / `metrics_summary.csv` / `per_case_metrics.csv` /
+`summary.json` / `distribution_metrics.json` / `anatomy_metrics.json` / `excluded_cases.json` /
+`run_manifest.json` set is gone, along with `slurm/check_run.py` and `SUCCESS_CRITERIA.md`.
+Per-bucket aggregates are no longer precomputed — group `per_case` by `bucket` yourself.
 
 ### The metrics
 
-| Metric | Tells you | Direction | Reasonable range here | Watch out |
-|---|---|---|---|---|
-| MAE / MSE (fg) | average per-voxel error | lower | compare within your own runs | foreground mask comes from the ground truth only |
-| PSNR (fg) | error on a log scale | higher | ~25-30 dB is a faithful VAE reconstruction; single digits means something is broken | reference scale is fixed at 1.0, not a real max |
-| SSIM (3D + per plane) | does it look like the same image | higher, max 1.0 | > 0.5 typical for a lossy 3D VAE, > 0.8 strong | inflated on nearly-empty slices — check `n_slices_used` |
-| Edge preservation, Laplacian variance, HF energy | is detail surviving or blurring | ~1.0 = preserved | 0.6-0.9 common for a compressive VAE | secondary; read alongside PSNR/SSIM |
-| MedicalNet FID | do the real and produced *populations* match, in 3D medical features | lower | generation will be much higher than reconstruction — expected, not a bug | MedicalNet was trained on many organs, not brain MRI specifically |
-| 2.5D Inception FID | same idea, on 2D slices across all three planes | lower | not comparable in scale to the MedicalNet number | Inception-v3 has never seen a medical image |
-| Inception Score | generic "confident and diverse" | higher | not very informative for brain MRI | prefer precision/recall below |
-| Precision / Recall / Density / Coverage | precision = do outputs look real; recall/coverage = do they span the real range | higher | high precision + low recall = mode collapse | needs 50+ per group to be stable |
-| Intra-set SSIM (real vs produced) | mode collapse, the standard generation-literature probe | compare the two, not the absolute value | produced clearly **above** real = less variety than the data | mid-axial slices only, capped at 200 pairs per bucket |
-| Anatomy (L-R symmetry, intracranial fraction, tissue contrast, background purity) | does the output look like a brain at all | closer to the real column | a large KS statistic means the populations differ on that measure | heuristic masks, not a segmentation |
-| Report-image similarity | does the volume match the report | higher | **unavailable** | no validated MRI image-text model exists in this project; recorded as unavailable with a reason, never faked |
-| **Blinded classifier consistency** | does a classifier trained only on *real* volumes read, off a generated one, the findings its conditioning report described | higher | above 0.5; judge against the real-volume reference in the same table | needs `--report-classifier`. Per-label AUROC is only meaningful where the classifier is `usable` — i.e. where it can do that label on real data |
+All eight come from `eval/challenge_metrics.py`, a port of the official evaluation container. **This
+is the same code `validation.py` calls**, so a training curve and a final score are the same
+numbers at different sample sizes.
 
-### Speed
+| Metric | Tells you | Direction | Watch out |
+|---|---|---|---|
+| `SSIM_mean` | does it look like the same image | higher, max 1.0 | the platform's **primary** metric |
+| `dice` | nothing extra — a literal copy of `SSIM_mean` | higher | not a real Dice. It is what the ranking config reads; do not "fix" it |
+| `MSE_mean` | mean squared error after percentile normalisation | lower | scale-invariant, so it says nothing about output range |
+| `PSNR_mean` | the same error on a log scale | higher | `data_range` is fixed at 1.0 post-normalisation, not a real max |
+| `FID_2p5D_{XY,XZ,YZ}` | do the real and produced *populations* match, per plane | lower | squeezenet1_1 features; never trained on medical images |
+| `FID_2p5D_Avg` | the mean of the three | lower | needs a few hundred cases before it is stable |
+| `n_scored_files` | how many actually entered the means | — | **always check against `n_total_files`** |
+| `n_missing_outputs` | generations that failed | — | these are *excluded*, not penalised — a run can look good by failing |
 
-Evaluation is CPU-compute-bound: decompressing and reading both volumes takes ~0.3 s against
-~6.7 s of metric compute, so I/O is a few percent of the work. **Staging a cohort to node-local
-`$TMPDIR` is therefore not worth doing** — the filesystem already delivers 3.4 GB/s here, well past
-what the metrics can consume.
+**Two behaviours copied deliberately from the official code, both of which look like bugs:**
 
-Use `--workers` instead. Per-case scoring is embarrassingly parallel and scales near-linearly
-(measured 7.32× at 8 workers), with byte-identical results at any worker count.
-`slurm/evaluate.sbatch` already passes `$SLURM_CPUS_PER_TASK` with 32 CPUs requested.
+1. `dice` is `SSIM_mean`, not Dice.
+2. A case whose generation failed is **dropped from the means** rather than scored as worst-case.
+   So a model that crashes on its hardest cases scores *better*. `n_missing_outputs` is the only
+   thing that reveals it — read it every time.
 
-It does not help `--task generation`, which has no paired metrics, and it does not speed up the
-distribution-metric feature extractors (serial, on GPU). Full breakdown:
-[eval README](../contrastive-pretraining/mrrate_r2v/eval/README.md#making-it-fast).
+**What the metric does to your volumes.** `compute_basic_metrics` percentile-normalises (0.5/99.5)
+*both* volumes, then, if the shapes differ, resamples the **generated** volume onto the **real**
+one's shape with `scipy.ndimage.zoom(order=1)`. Two consequences:
+
+- The metrics are **invariant to the decoder's output range**, which is why
+  `cli/evaluate.py` passes `postprocess=False` — not to fix the scale, but to keep the volume in the
+  ground truth's space.
+- The **ground truth is authoritative in both shape and scale.** Whatever grid the real volume is
+  on is the grid the comparison happens on.
+
+That last point matters for the FID too, in a different way: `fid_2p5d` extracts slice features
+from each volume independently (every slice resized to 224²), so it never needs the two to share a
+shape — but the slice *count* follows each volume's own geometry.
 
 ### Comparing two runs
 
-Check that both `run_manifest.json` files show the same `cohort_id`. If they do, the two models saw
-identical cases at identical FOV with identical preprocessing, and the numbers are directly
-comparable. If they differ, they are not — and `cli.evaluate` would have refused to produce them
-against a mismatched cohort in the first place.
+Compare `dataset_config` and `model` in the two `metrics.json` files. If the geometry fingerprint,
+split and `n_per_bucket` agree, the runs saw the same cases at the same geometry under the same
+preprocessing.
+
+**Nothing enforces this any more** — the automatic train/test preprocessing check is gone (see §1).
+Two runs at different `--posterior-shift-mm` will happily produce comparable-looking numbers that
+are not comparable.
+
+### Speed
+
+Measured 6.7 s/case at 30 inference steps on one H200, plus ~1 s/case of scoring; I/O is a few
+percent. Scale with **ranks**, not workers: `LiveEvaluator` shards cases `index % world_size` and
+each rank accumulates its own `ChallengeAccumulator`, pooled once at the end (feature pooling for
+FID, not averaged distances — so a sharded run equals a single-process one).
 
 ---
 
-## 6. Scoring a checkpoint that already wrote NIfTI files
+## 6. Scoring volumes that already exist
 
-You do not need `predict_r2v` for this.
+**Short answer: you cannot re-score a finished run without regenerating it, and the earlier sweeps
+did not keep their volumes.**
+
+The `cli.import_predictions` path documented here previously is gone with the cohort/prediction-set
+layer. Evaluation now builds the Dataset, generates and scores in one pass, so there is no
+"prediction set" for an external file tree to be imported as.
+
+**What survives from a sweep run** is `metrics.json` (or, for pre-2026-08-18 runs, the old CSV set)
+and a handful of example NIfTIs under `figures/`. `SAVE_VOLUMES=1` in
+`slurm/final_eval/run_sweep.sh` was only ever set for the `headline` stage — the cheap stages
+"exist to be thrown away", at ~19 GB per run — and no headline stage was run. So the generated
+volumes for every cfg/format/epoch sweep point are **not on disk**.
+
+To score an old configuration with the current metrics, **re-run it**:
 
 ```bash
-python -m mrrate_r2v.cli.import_predictions \
-    --cohort $COHORT --predictions-csv /path/to/predictions.csv \
-    --out .../predictions/external_v1
-
-python -m mrrate_r2v.cli.evaluate --task report2volume \
-    --gt $COHORT --pred .../predictions/external_v1 --out .../results/external_v1
+CHECKPOINT_KIND=last slurm/final_eval/run_D_report2ct_style.sh    # or any arm / epoch / cfg
 ```
 
-CSV schema (`study_key`/`series_key` must match the manifest's `study_uid`/`series_id` exactly —
-never a filename or row position):
+This is not merely a formality — it is the only correct way, because the old and new numbers are
+not comparable anyway (different metric definitions, §5). Regeneration is deterministic
+(`--seed + <dataset index>`), so the volumes are the ones the old run would have produced, given
+the same checkpoint and geometry.
 
-```csv
-study_key,prediction_path,series_key
-STUDY_0001,/path/vol_0001.nii.gz,T1w-PRE-AXI
+### `--gt-space native` — scoring against the released ground truth
+
+```bash
+python -m mrrate_r2v.cli.evaluate --task report2volume --gt-space native ...
+# or, through the sweep:  GT_SPACE=native slurm/final_eval/run_sweep.sh cfg
 ```
 
-`series_key` may be omitted only when the study has exactly one case in the cohort. Ambiguous,
-duplicated, or unmatched rows are rejected into `import_report.json` with a reason — never guessed.
+| `--gt-space` | Ground truth is | Use |
+|---|---|---|
+| `model` (default) | the preprocessed volume on the model's bucket grid | comparing models to each other |
+| `native` | the released volume, RAS-reoriented and otherwise untouched — no resample, no normalize, no crop/pad | estimating what the challenge server will score |
 
-Matching happens once, here, and is recorded. The evaluator then works from `case_id` like any
-other prediction set.
+**Generation is unaffected either way.** The model always samples on its own bucket grid
+(`case.shape`); the metric resamples that volume onto the ground truth (§5). So `native` changes
+what you are compared *against*, never what the model produces.
+
+The two are **not comparable to each other**, so `gt_space` is recorded in `dataset_config` in every
+`metrics.json`.
+
+**Before doing that, know what the released volumes look like.** Measured over a random 200-series
+sample of the test split (T1w/T2w/FLAIR/SWI, seed 0, 2026-08-18):
+
+| Property | Measured |
+|---|---|
+| Stored orientation | **RAS 52%, LAS 32%, PSR 9%, LSP 7%** — 48% non-RAS |
+| Distinct shapes | **141 in 200 series** |
+| Range | ~(176, 512, 512) to ~(462, 480, 37) |
+| Slice thickness | up to **5.6 mm** |
+
+This is why `native` **still reorients to RAS**, and why that is not a compromise. `zoom` rescales;
+it never permutes or flips. Measured on real test-split series, reorientation is not cosmetic:
+
+```
+stored             stored shape        native (X, Y, Z)
+RAS   flair-raw-sag  (176, 512, 512) -> (176, 512, 512)   unchanged
+LAS   t2w-raw-axi    (396, 416,  45) -> (396, 416,  45)   flipped only
+LSP   t2w-raw-cor    (462, 480,  37) -> (462,  37, 480)   axes PERMUTED
+PSR   t2w-raw-sag    (464, 464,  32) -> ( 32, 464, 464)   axes PERMUTED
+```
+
+Pairing a generated RAS volume against an un-reoriented LSP one compares different anatomical axes
+and scores like noise, on roughly half the split. Reorientation is what makes the two arrays refer
+to the same anatomy.
+
+Resampling, normalisation and crop/pad genuinely are dropped: they exist to put a volume on the
+model's training grid, and the metric only needs a common grid, which it produces itself.
+
+### Keeping the generated volumes
+
+`--save-volumes` (or `SAVE_VOLUMES=1`, or `SAVE_VOLUMES_FOR="D:3.0 E:3.0"` for specific sweep runs)
+writes `<out>/volumes/<bucket>.f16.raw` plus an `index.json` giving each stack's shape, dtype and
+case order.
+
+**One file per bucket, not one per case**: `/hnvme`'s binding limit is a file-count quota (61k soft,
+81k hard) and it is already at it, so 2,000 loose files per run is what actually breaks — not space.
+Read one back with:
+
+```python
+index = json.loads((out / "volumes" / "index.json").read_text())["T1w__AXIAL"]
+stack = np.fromfile(out / "volumes" / "T1w__AXIAL.f16.raw", dtype=np.float16)
+stack = stack.reshape([len(index["case_ids"])] + index["shape"])
+volume = stack[index["case_ids"].index(case_id)]
+```
 
 ---
 
@@ -448,12 +526,13 @@ other prediction set.
 A frozen NV-Generate-MR-Brain denoiser plus a trained report adapter. Two extra stages:
 
 ```
-cli.train_r2v     →  adapter_*.pt        (frozen base + RadBERT; only the adapter learns)
-cli.generate_r2v  →  volume + manifest   (one report, or a whole cohort)
-cli.predict_r2v   →  PREDICTION dir      (a cohort, in the format cli.evaluate scores)
+cli.train_r2v     →  adapter_*.pt        (frozen base + text encoder; only the adapter learns)
+cli.generate_r2v  →  one .nii.gz         (one report, to look at)
+cli.evaluate      →  metrics.json        (generates and scores the split in one pass)
 ```
 
-`slurm/train_r2v.sbatch` and `slurm/generate_r2v.sbatch` are the runnable versions of both.
+`slurm/train_r2v.sbatch`, `slurm/generate_r2v.sbatch` and `slurm/evaluate.sbatch` are the runnable
+versions.
 They use `$SIF_IMAGE_TEXT` (`nvidia+redbert.sif`), not the base image, because the base image has no
 transformers.
 
@@ -700,152 +779,93 @@ budget. It is the single highest-value addition to the validation path.
 
 ---
 
-## 7b. Evaluating a trained adapter (the four-arm test run)
+## 7b. Evaluating a trained adapter (the five-arm run)
 
-Training produces `adapter_*.pt`; this is how those become numbers. Everything here postdates
-2026-08-09 — see "What a pre-2026-08-09 evaluation is worth" at the end of this section.
+Training produces `adapter_*.pt`; this is how those become numbers.
 
-### The three artifacts you need first
+### Running it
+
+Everything goes through `slurm/final_eval/`, which knows each arm's run directory and checkpoint:
 
 ```bash
 cd contrastive-pretraining
 
-# 1. the evaluated cohort -- test split, at the report format AND posterior shift training used
-sbatch slurm/02_preprocess.sbatch test_v3 200
+SMOKE=1 slurm/final_eval/run_D_report2ct_style.sh    # 8/bucket, ~20 min, wiring only
+slurm/final_eval/run_D_report2ct_style.sh            # the real thing
 
-# 2 + 3. the blinded classifier's own data -- train and val splits, never test
-R2V_SPLIT=train sbatch slurm/02_preprocess.sbatch clf_train_v2 500
-R2V_SPLIT=val   sbatch slurm/02_preprocess.sbatch clf_val_v2   100
-sbatch slurm/14_train_report_classifier.sbatch clf_train_v2 clf_val_v2 report_classifier_v2
+slurm/final_eval/run_sweep.sh cfg        # best guidance scale per arm      (25 jobs)
+slurm/final_eval/run_sweep.sh format     # report-format robustness         (12 jobs)
+slurm/final_eval/run_sweep.sh headline   # the arm-vs-arm result             (5 jobs)
+slurm/final_eval/run_sweep.sh epochs     # D at 3 and 4 epochs               (4 jobs)
 ```
 
-`02_preprocess.sbatch` now passes `--report-format findings_impression_meta` and writes
-`report_sections.json`. Both matter and neither is a default:
+**Smoke each arm once before committing long jobs.** A SMOKE run is a wiring check and its metrics
+mean nothing at 8 cases per bucket — the run says so itself.
 
-- **`--report-format`**: A, B and C were trained on the order-agnostic `*_meta` spec, whose
-  conditioning text carries a `[MODALITY]/[PLANE]/[SPACING]` prefix. A cohort built without it holds
-  text with no prefix — out of distribution for three of the four arms.
-  `assert_report_format_matches` refuses that pairing rather than scoring it, so the symptom is a
-  hard exit. A cohort freezes **one** format, so build a second with `impression_findings_meta` if
-  you want to measure the order-robustness the two-format training was for.
-- **`report_sections.json`**: configurations D and E encode findings and impression as separate
-  cross-attention tokens and cannot recover them from the joined string. `cli.predict_r2v` refuses
-  up front on a cohort that has no sections rather than conditioning D on one token instead of two.
-  E additionally needs the `acquisition` section; the Dataset composes it per case, and the
-  cohort path fills it in from the case's own modality/plane/spacing
-  (`cli/generate_r2v.py` -> `formats.with_acquisition_section`).
+**Checkpoint selection**: `adapter_last.pt` where it exists, `adapter_step0004200.pt` for C, whose
+training job was killed by a host-RAM OOM in its final validation. C is therefore compared at 4,200
+optimizer steps against 4,493 for the others — quote that caveat wherever the five-way table
+appears, or set `CHECKPOINT_KIND=step4200` for the step-matched comparison. `CHECKPOINT_KIND` also
+accepts `epoch003`-style names for the per-epoch checkpoints a continuation run writes; note that
+`model.training.epoch` in the results is **0-indexed** while the filename is 1-based.
 
-Neither exists in the old `test_v1` (built 2026-07-30), which is why the cohort is rebuilt rather
-than reused.
-
-### Then the four runs
-
-```bash
-slurm/final_eval/run_A_cxr_bert_cls.sh
-slurm/final_eval/run_B_cxr_bert_tokens.sh
-slurm/final_eval/run_C_radbert_tokens.sh
-slurm/final_eval/run_D_report2ct_style.sh
-slurm/final_eval/run_E_report2ct_style_meta.sh
-```
-
-Each submits **two** jobs — `13_predict_r2v.sbatch` then `evaluate.sbatch`, chained with
-`--dependency=afterok` so a failed prediction set can never be scored. The four `run_*.sh` scripts
-set `R2V_CONFIG` and nothing else; every other parameter lives in
-`slurm/final_eval/_final_eval_common.sh`, exactly as `slurm/final/_final_common.sh` does for
-training. "The only difference between the four evaluations is the conditioning mechanism" is
-enforced by construction rather than by four command lines staying in sync.
-
-`SMOKE=1 slurm/final_eval/run_A_cxr_bert_cls.sh` runs eight cases end to end (~30 min) and proves
-the conditioning rebuilds, the report format is accepted, and the intensity space is right. Do that
-once per arm before committing four long jobs.
-
-**Checkpoint selection**: `adapter_last.pt` where it exists, `adapter_step0004200.pt` for C — whose
-training job was killed by a host-RAM OOM in its final validation. So C is compared at 4,200
-optimizer steps against 4,493 for the others; quote that caveat wherever the four-way table appears,
-or set `CHECKPOINT_KIND=step4200` for the step-matched comparison.
-
-### 13 vs 07 — only one of them produces numbers
+### `evaluate` vs `generate_r2v`
 
 | | writes | scoreable |
 |---|---|---|
-| `13_predict_r2v.sbatch` (`cli.predict_r2v`) | `predictions.json` + per-bucket `.npz`, in the cohort's percentile-normalised space | **yes** |
-| `generate_r2v.sbatch` (`cli.generate_r2v`) | `.nii.gz` + a generation manifest, in NVIDIA's int16 `[0, 1000]` range | no — use it to *look* at a sample |
+| `evaluate.sbatch` (`cli.evaluate`) | `metrics.json` | **yes** — it generates and scores in one pass |
+| `generate_r2v.sbatch` (`cli.generate_r2v`) | one `.nii.gz` in NVIDIA's int16 `[0, 1000]` range | no — use it to *look* at a sample |
 
-### W&B: one table, a few panels
+### W&B
 
 `slurm/final_eval/` logs to W&B by default (`R2V_WANDB=online`, project `mr-rate-r2v-eval`, one
-group for the four arms, run named after the arm). A hand-run `evaluate.sbatch` stays offline
-unless you set `R2V_WANDB`.
-
-| What | Where | Note |
-|---|---|---|
-| **`metrics/all`** | a `wandb.Table` panel | **every metric that ran**: per bucket, then per modality, then `overall`, then distribution / diversity / mode-collapse / anatomy / report-consistency, then provenance rows — including **`train_samples_seen`**, the volumes the optimizer actually consumed |
-| headline scalars | run summary + run table | `psnr_fg`, `ssim3d_whole`, `mae_fg`, `ncc_fg`, both FIDs, the report-consistency macro AUROC and its real-volume ceiling, `train_samples_seen`. These become sortable columns, so the four-arm comparison *is* the W&B run table |
-| example panels | `examples/<bucket>/<case_id>` | interactive ground-truth vs generated with a slice slider and the report text, rendered by the **same** `figures.validation_panel_html` the training loop uses |
-
-The same table is printed to stdout at the end of the job, so the Slurm log carries the full result
-rather than three scalars.
-
-**Panels are a sample, never the cohort.** `--wandb-panels` defaults to 6; 2,000 interactive panels
-is ~1 GB of base64 and an unusable workspace (measured: ~1.2 MB each). Cases are the worst, best and
-median by `--wandb-rank-metric` (default `psnr_fg`), spread across buckets, and each panel records
-*why* it was picked — an unlabelled panel invites reading a best case as typical.
+group per stage, run named after the arm). A hand-run `evaluate.sbatch` stays offline unless you set
+`R2V_WANDB`.
 
 **Panels embed patient report text**, so they are gated behind `--wandb-log-reports`
 (`R2V_WANDB_REPORTS=1`, the default in `final_eval/`) exactly as in `cli.train_r2v`. Keep that
-project private, or set `R2V_WANDB_REPORTS=0` — the metrics table is logged either way and only the
-panels are withheld.
+project private, or set `R2V_WANDB_REPORTS=0` — the metrics are logged either way and only the
+panels are withheld. `--wandb-panels` is per bucket and small by design; 2,000 interactive panels is
+~1 GB of base64 and an unusable workspace (measured ~1.2 MB each).
 
-**Why the training-sample count needs `cli.predict_r2v` to record it.** The evaluator reads only
-`.npy` and `.json` by design and must never open a checkpoint, so `predict_r2v` writes
-`model.training` into `predictions.json` (`models/adapter.py:training_provenance`). `samples_seen`
-is `optimizer_step x effective_batch_size` — 1,150,208 for these runs — and is *not* the dataset
-size; `samples_per_epoch` (~575k, matching the logged train split) is reported separately rather
-than conflated. `effective_batch_size` needs `world_size`, which lives in `train_summary.json`, not
-in the checkpoint: configuration C's job died before writing one, so `final_eval/` passes
-`--train-world-size 8` (the launch geometry recorded in `slurm/final/_final_common.sh`) and the
-prediction set records `world_size_source` so a supplied value is never mistaken for a read one.
-
-### The acceptance gate
-
-```bash
-python3 slurm/check_run.py --cohort <cohort> \
-    --pred-r2v <predictions> --results-r2v <results>
-```
-
-Four report-to-volume criteria: `ER1` every case scored and none excluded, `ER2` the predictions are
-in the cohort's intensity space (checked from the numbers, not trusted), `ER3` blinded-classifier
-consistency above chance on the usable labels, `ER4` the classifier was not fitted on the test
-split. Run it before reading any number as a result.
+> The blinded report-classifier consistency metric, the `check_run.py` acceptance gate and its
+> `ER1`–`ER4` criteria were removed with the old metric suite. Scoring is now exactly the official
+> challenge metric set (§5) and nothing else.
 
 ### What a pre-2026-08-10 evaluation is worth
 
-Nothing — and there was no such evaluation, because two of these five defects made
-`cli.predict_r2v` refuse to start for three of the four arms. The other three were silent:
+Nothing — and there was no such evaluation, because two of these five defects made the predict path
+refuse to start for three of the four arms. The three CLIs named below (`cli.predict_r2v` and
+friends) no longer exist, but the failure modes are properties of *any* inference path and the
+lesson is why `tests/test_r2v_inference_contracts.py` exists:
 
-1. **`cli.predict_r2v` wrote volumes in NVIDIA's int16 `[0, 1000]` range** against a `[0, 1]`
-   ground truth. Every paired metric consumes a 1000x-offset pair and returns a plausible number.
-   `predict_generation` had always divided by 1000 and `validation.py` had a guard; the evaluated
-   path had neither. It now generates with `postprocess=False` and asserts the space on case 1.
+1. **The predict path wrote volumes in NVIDIA's int16 `[0, 1000]` range** against a `[0, 1]` ground
+   truth. Every paired metric consumed a 1000×-offset pair and returned a plausible number.
+   `cli/evaluate.py` now generates with `postprocess=False`, and the current metric normalises both
+   volumes anyway (§5) — but the flag still matters, and a test asserts the call site keeps it.
 2. **Configurations B and C could not be rebuilt at inference.** `rebuild_embedder` had no branch
-   for `kind="tokens"`, so those adapters fell through to a path that defaults to RadBERT — and
-   since CXR-BERT and RadBERT are both 768-wide, every downstream shape check passed. Given
-   `--text-checkpoint` (which `generate_r2v.sbatch` hardcoded) a CXR-BERT arm silently loaded
-   RadBERT. `load_adapter_checkpoint` is now also given the live embedder's identity, so
-   `assert_conditioning_compatible` actually runs.
+   for `kind="tokens"`, so those adapters fell through to a path defaulting to RadBERT — and since
+   CXR-BERT and RadBERT are both 768-wide, every downstream shape check passed. A CXR-BERT arm
+   silently loaded RadBERT.
 3. **Configuration D could not run at all**, since nothing passed it per-section text.
 4. **`assert_report_format_matches` compared nothing.** It read `cohort.spec.geometry_fingerprint`,
-   an attribute a parsed `cohort.json` — a plain dict — never has, so the cohort's format read as
-   `None` unconditionally. That is not a benign no-op: it passes silently when the adapter records
-   no format, and refuses *every* cohort when it records one. All four final adapters record one.
-   Its unit test survived because the test's stub cohort exposed the same wrong attribute.
-5. **The format check was applied to configuration D**, which never reads the joined string at all
-   and records `report_format=None` by construction — so it matched no cohort and D was refused
-   regardless. The check now takes the embedder and exempts a sectioned configuration; what D
-   actually needs (the cohort *has* sections) is checked separately, before any sampling.
+   an attribute a parsed dict never has, so the built format read as `None` unconditionally — which
+   passes silently when the adapter records no format and refuses *everything* when it records one.
+   Its unit test survived because the stub exposed the same wrong attribute; mocking the wrong
+   interface is what hid it.
+5. **The format check was applied to configuration D**, which never reads the joined string and
+   records `report_format=None` by construction. The check now takes the embedder and exempts a
+   sectioned configuration.
 
-Pinned by `tests/test_r2v_inference_contracts.py`, which exists because three of these produced
-complete, valid-looking output and the other two were only reachable by running the thing.
+Three of these produced complete, valid-looking output; the other two were only reachable by
+running the thing.
+
+### And what a pre-2026-08-18 evaluation is worth
+
+The numbers are real but **not comparable to anything produced now**: they came from the removed
+metric suite (`mae_fg`, `ncc_whole`, `fvd`, `medicalnet_fid`, anatomy, report-consistency), not the
+official challenge metrics. The sweep runs also did not keep their volumes, so an old configuration
+can only be re-scored by regenerating it (§6).
 
 ---
 
@@ -854,26 +874,36 @@ complete, valid-looking output and the other two were only reachable by running 
 ```bash
 cd contrastive-pretraining
 python -m pytest                          # everything, with coverage
-python -m pytest --no-cov -q              # faster
-python -m pytest tests/test_cohort_contract.py tests/test_eval_tasks_and_runner.py -v
+python -m pytest --no-cov -q              # faster (~3.5 min, 812 tests)
+python -m pytest --no-cov tests/test_eval_challenge_metrics.py tests/test_eval_live.py -v
 ```
 
+No GPU, no real data, no checkpoints. `testpaths` covers `tests/` **and** `../submission`, so the
+container's own tests run too — they previously did not, because `testpaths` named only `tests`.
+
 **The R2V tests are not in version control, and CI does not run them.** `.gitignore` ignores
-`/contrastive-pretraining/tests`, so only the 8 original *contrastive* test files are tracked; all
-33 R2V test files — including the two invariant files below — exist on the working machine only.
-This is deliberate and left as is, but it has two consequences worth knowing: the suite will not
-survive a fresh clone, and a change that breaks a load-bearing invariant will pass CI. Run
-`python -m pytest` locally before trusting any R2V change; three of the five defects fixed on
-2026-08-10 were test-visibility failures.
+`/contrastive-pretraining/tests`, so only the 8 original *contrastive* test files are tracked. This
+is deliberate and left as is, but it has two consequences: the suite will not survive a fresh clone,
+and a change that breaks a load-bearing invariant will pass CI. Run `python -m pytest` locally
+before trusting any R2V change.
 
-No GPU, no real data, no checkpoints — a few seconds. Two files are worth knowing about:
+Files whose subjects were deleted by the 2026-08-18 declutter are retired in place as
+`tests/*.py.obsolete` — not collected, kept as a record of what went.
 
-- `test_cohort_contract.py` — the comparability guarantees. That `cohort_id` changes when the seed,
-  FOV, normalizer, or case list changes; that a mismatched prediction set is refused; that
-  `cohort.json` carries no patient identifiers.
-- `test_eval_tasks_and_runner.py` — that `generation` never produces a voxelwise metric, that the
-  result layout is identical across tasks, and that a shape-mismatched prediction is excluded rather
-  than resized.
+Three files are load-bearing invariants rather than ordinary unit tests. **Do not weaken them to
+make a change pass:**
+
+- `test_r2v_validation.py::test_every_rank_enters_the_panel_gather_not_just_rank_zero` — that a
+  collective is entered by *every* rank. `gather_objects` is a no-op at world size 1, so this
+  asserts the **call**, not the numbers; the bug it guards crashed every multi-GPU run with an
+  `OutOfMemoryError: Tried to allocate more than 1EB memory` that named nothing useful.
+- `test_eval_live.py` — that the ground truth always comes from the dataset (a generator cannot
+  nominate an easier target), that an out-of-scope modality never reaches the generator, and that
+  one failed case is recorded as missing rather than losing the run.
+- `test_eval_challenge_metrics.py` — that pooling shards equals a single process (means combine
+  trivially; a Fréchet distance does not, so features must be pooled before the distance), and that
+  the official code's two quirks survive: `dice == SSIM_mean`, and a missing output is excluded from
+  the means rather than penalised.
 
 ---
 
@@ -920,21 +950,23 @@ repository without carrying any of `contrastive-pretraining/scripts/`, `mr_rate/
 
 ## 10. Storage and hygiene
 
-Cohorts and prediction sets are large, but bundled and compressed: **~14 MB per volume** at the
-per-bucket FOVs (2.91× lossless, since a padded volume is ~50% exact zeros). A 10-bucket,
-200-per-bucket cohort is ~28 GB, and each prediction set the same again.
+**Evaluation no longer writes volumes at all.** A case is preprocessed, generated, scored and
+released one at a time, so a finished run is a single `metrics.json` of a few hundred KB. The old
+cohort and prediction directories — ~14 MB per volume, ~28 GB per artifact set — are gone, and with
+them ~365 GB per experiment set.
 
-Volumes live in **one archive per bucket** (`volumes/<modality>__<plane>.npz`), so a cohort is ~10
-files rather than ~2,000. That is not cosmetic: `/hnvme` enforces a **file-count** quota (61k soft),
-and one file per volume put three artifact directories over it. An `.npz` is a zip of `.npy`
-members and zip members are individually readable, so random access is still
-`VolumeReader(root).read(bucket, case_id)` with nothing to unpack first.
+That also means **an evaluation cannot be re-scored later**: there is nothing kept to re-score (§6).
+`slurm/final_eval/run_sweep.sh` sets `SAVE_VOLUMES=1` only for the `headline` stage, on the
+principle that the cheap stages exist to be thrown away.
 
-- Write them to a workspace (`/hnvme/workspace/...`), never to git or `$HOME`.
-- `cohort.json` and every results file are identifier-free and safe to copy or share.
-- `index.csv` is the only file containing real (anonymized) `study_uid`/`series_id` values. Keep it
-  in the workspace and do not paste identifiers into logs, issues, or papers — quote the
-  `cohort_id` instead.
+`/hnvme` enforces a **file-count** quota (61k soft), not just a space quota — worth remembering
+before writing one file per volume anywhere.
+
+- Write results to a workspace (`/hnvme/workspace/...`), never to git or `$HOME`.
+- `metrics.json` is identifier-free and safe to copy or share: cases appear as `case_id`, a hash of
+  `(study_uid, series_id)`.
+- `study_uid`/`series_id` live only in the manifest CSV. Keep it in the workspace and do not paste
+  identifiers into logs, issues, or papers — quote the `case_id` instead.
 
 ---
 

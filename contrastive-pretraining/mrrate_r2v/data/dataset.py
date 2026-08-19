@@ -29,6 +29,8 @@ from torch.utils.data import Dataset, Sampler
 from ._preprocess_ops import (
     NORMALIZERS,
     preprocess_nii,
+    load_canonical_nii,
+    load_canonical_nii_from_bytes,
     preprocess_nii_from_bytes,
     read_native_geometry,
     read_native_geometry_from_bytes,
@@ -75,6 +77,12 @@ class R2VDatasetConfig:
     # [MODALITY]/[PLANE]/[SPACING] string, not a report field.
     conditioning_sections: tuple = ("findings", "impression", "acquisition")
     geometry_mode: str = "per_modality_plane"
+    #: What `sample["gt_native"]` carries, for scoring only -- never a model input.
+    #:   "off"    (default) absent; scoring uses the model-grid `image`
+    #:   "native" the released volume RAS-reoriented and otherwise untouched: no resample, no
+    #:            normalize, no crop/pad, in (X, Y, Z). This is the geometry the challenge scores
+    #:            against, and the metric resamples the *generated* volume onto it.
+    gt_space: str = "off"
     # geometry_mode="fixed" only. Both (D, H, W)-ordered like every internal geometry value --
     # convert with `geometry.xyz_to_dhw` if your value came from outside the package.
     fixed_target_shape: tuple = (256, 384, 384)
@@ -96,6 +104,8 @@ class R2VDatasetConfig:
         if self.series_selection not in SERIES_SELECTION_MODES:
             raise ValueError(f"Unknown series_selection '{self.series_selection}'. "
                              f"Choose from: {SERIES_SELECTION_MODES}")
+        if self.gt_space not in ("off", "native"):
+            raise ValueError(f"Unknown gt_space '{self.gt_space}'. Choose from: ('off', 'native')")
         if self.geometry_mode not in GEOMETRY_MODES:
             raise ValueError(f"Unknown geometry_mode '{self.geometry_mode}'. "
                              f"Choose from: {GEOMETRY_MODES}")
@@ -127,6 +137,7 @@ class R2VDatasetConfig:
         return {
             **extra,
             "geometry_mode": self.geometry_mode,
+            "gt_space": self.gt_space,
             "unet_spatial_multiple": UNET_SPATIAL_MULTIPLE,
             "fixed_target_shape_xyz": list(dhw_to_xyz(self.fixed_target_shape)) if self.geometry_mode == "fixed" else None,
             "fixed_target_spacing_mm_xyz": list(dhw_to_xyz(self.fixed_target_spacing_mm)) if self.geometry_mode == "fixed" else None,
@@ -257,6 +268,7 @@ class MRReportToVolumeDataset(Dataset):
 
         native_shape, native_spacing = row.native_shape, row.native_spacing_mm
 
+        gt_native = None
         if row.backend == "archive":
             raw_bytes = self._read_archive_bytes(row)
             if native_shape is None:
@@ -265,11 +277,15 @@ class MRReportToVolumeDataset(Dataset):
                 raw_bytes, spec.target_spacing, spec.target_shape,
                 posterior_shift_voxels, self.normalizer_obj,
             )
+            if self.config.gt_space == "native":
+                gt_native = load_canonical_nii_from_bytes(raw_bytes)
         else:
             arr = preprocess_nii(
                 row.image_path, spec.target_spacing, spec.target_shape,
                 posterior_shift_voxels, self.normalizer_obj,
             )
+            if self.config.gt_space == "native":
+                gt_native = load_canonical_nii(row.image_path)
         image = torch.from_numpy(np.ascontiguousarray(arr, dtype=np.float32)).unsqueeze(0).to(self.config.dtype)
         # The one and only axis conversion: (D,H,W) above this line, (X,Y,Z) below. Both read
         # paths above yield (D,H,W); a third read path must too, or move the permute into it.
@@ -322,12 +338,18 @@ class MRReportToVolumeDataset(Dataset):
             "native_fov_mm": torch.tensor(dhw_to_xyz(native_fov), dtype=torch.float32),
             "study_key": row.study_uid,              # traceability -- do not log verbatim
             "series_key": row.series_id,             # traceability -- do not log verbatim
+            # Scoring only, and only under gt_space="native". A plain numpy array, NOT a tensor:
+            # its shape varies per case (141 distinct shapes in a 200-series sample), so it can
+            # never be collated into a batch -- which is exactly why it must not become a model
+            # input. `collate_fn_r2v` drops it for the same reason.
+            **({"gt_native": gt_native} if gt_native is not None else {}),
         }
 
 
 def build_r2v_dataset(manifest, report_index, *, split, report_format, geometry_mode,
                       series_selection, posterior_shift_mm, normalizer, seed,
-                      report_sections=("findings", "impression")) -> "MRReportToVolumeDataset":
+                      report_sections=("findings", "impression"),
+                      gt_space="off") -> "MRReportToVolumeDataset":
     """The one place `cli.train_r2v` and `cli.evaluate` build their dataset, so the two can never
     preprocess differently. `series_selection` is the one deliberate difference: "all" for
     training, "one_per_study_per_bucket" for evaluation. `dataset.config` holds the config used.
@@ -338,7 +360,7 @@ def build_r2v_dataset(manifest, report_index, *, split, report_format, geometry_
         split=split, report_sections=tuple(report_sections), report_format=report_format,
         geometry_mode=geometry_mode, series_selection=series_selection,
         posterior_shift_mm=posterior_shift_mm, normalizer=normalizer,
-        dtype=torch.float32, seed=seed,
+        dtype=torch.float32, seed=seed, gt_space=gt_space,
     )
     return MRReportToVolumeDataset(
         str(manifest), ShardReportStore(str(report_index)), config=config

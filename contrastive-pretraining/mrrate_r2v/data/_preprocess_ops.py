@@ -237,6 +237,36 @@ def load_and_resample_nii_from_bytes(raw_bytes, target_spacing):
     return _resample_canonical(nii_img, target_spacing)
 
 
+def load_canonical_nii(path):
+    """RAS-reorient and decode, and **nothing else** -- no resample, no normalize, no crop/pad.
+
+    Returns float32 in **(X, Y, Z)** = (R, A, S), which is nibabel's own canonical array order and
+    the order a generated volume is already in. Note this is *not* the `(D, H, W)` every other
+    loader here returns: those transpose to `(Z, X, Y)` on their way into the resampler
+    (`_resample_canonical`), and this function deliberately stops before that point.
+
+    For scoring a model against the ground truth in its released geometry. The reorientation is not
+    optional and is not "preprocessing" in the sense being avoided: measured over a random
+    200-series sample of the MR-RATE test split, only **52% of volumes are stored RAS** (LAS 32%,
+    PSR 9%, LSP 7%). The challenge metric resamples a shape mismatch away but never permutes or
+    flips, so an un-reoriented pair compares different anatomical axes on ~half the split.
+    """
+    return _decode_canonical(_canonicalize(nib.load(str(path))))
+
+
+def load_canonical_nii_from_bytes(raw_bytes):
+    """`load_canonical_nii` from already-read NIfTI bytes -- the archive-backed path."""
+    payload = gzip.decompress(raw_bytes) if _looks_gzipped(raw_bytes) else raw_bytes
+    return _decode_canonical(_canonicalize(nib.Nifti1Image.from_bytes(payload)))
+
+
+def _decode_canonical(nii_img):
+    """Shared decode for the two above, so they cannot drift on dtype or NaN handling."""
+    data = nii_img.get_fdata().astype(np.float32)
+    np.nan_to_num(data, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+    return data
+
+
 def read_native_geometry(path):
     """Header-only (D, H, W)-ordered native shape/spacing, no voxel decode.
 
@@ -350,6 +380,8 @@ def preprocess_nii_from_bytes(raw_bytes, target_spacing, target_shape, posterior
 
 
 __all__ = [
+    "load_canonical_nii",
+    "load_canonical_nii_from_bytes",
     "NORMALIZERS", "crop_or_pad", "discover_subjects", "load_all_splits",
     "load_and_resample_nii", "load_and_resample_nii_from_bytes",
     "preprocess_nii", "preprocess_nii_from_bytes",

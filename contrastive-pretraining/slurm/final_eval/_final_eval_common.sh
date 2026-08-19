@@ -232,6 +232,12 @@ submit_final_eval() {
     exports+=",R2V_WANDB_GROUP=${WANDB_GROUP},R2V_WANDB_NAME=${config}_${tag}"
     exports+=",R2V_WANDB_PANELS=${WANDB_PANELS},R2V_WANDB_REPORTS=${WANDB_REPORTS}"
     [[ -n "$n_per_bucket" ]] && exports+=",R2V_N_PER_BUCKET=${n_per_bucket}"
+    # Which ground truth to score against. `native` = the released volume RAS-reoriented and
+    # otherwise untouched, which is the geometry the challenge server compares against; `model` =
+    # the preprocessed volume on the bucket grid. The two are NOT comparable, so it is recorded in
+    # every run's `dataset_config`.
+    [[ -n "${GT_SPACE:-}" ]] && exports+=",R2V_GT_SPACE=${GT_SPACE}"
+    [[ "${SAVE_VOLUMES:-0}" == "1" ]] && exports+=",R2V_SAVE_VOLUMES=1"
     [[ -n "${R2V_WANDB_ENTITY:-}" ]] && exports+=",R2V_WANDB_ENTITY=${R2V_WANDB_ENTITY}"
 
     # afterany, not afterok: a missing classifier costs one metric group (recorded unavailable with

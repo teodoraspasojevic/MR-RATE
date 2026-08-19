@@ -96,6 +96,10 @@ ARGS=(
 )
 [[ "$TASK" == "generation" ]] && ARGS+=(--base-checkpoint "$UNET_CHECKPOINT")
 [[ -n "${R2V_N_PER_BUCKET:-}" ]] && ARGS+=(--n-per-bucket "$R2V_N_PER_BUCKET")
+# Both were dead exports until 2026-08-19: run_sweep.sh set R2V_SAVE_VOLUMES and nothing consumed
+# it, so "keep the headline volumes" silently kept nothing.
+[[ "${R2V_SAVE_VOLUMES:-0}" == "1" ]] && ARGS+=(--save-volumes)
+[[ -n "${R2V_GT_SPACE:-}" ]] && ARGS+=(--gt-space "$R2V_GT_SPACE")
 # For the cross-format ablation only: A/B/C trained on the two *_meta formats, so the two
 # non-meta ones are out of distribution and `assert_report_format_matches` refuses them by
 # default. That refusal is the safety net -- override it only when the OOD degradation IS the

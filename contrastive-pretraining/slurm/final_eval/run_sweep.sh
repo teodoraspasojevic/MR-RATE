@@ -112,12 +112,29 @@ submit() {   # submit <arm> <tag suffix> <n_per_bucket> <cfg> <format> <walltime
     exports+=",R2V_WANDB_GROUP=sweep_${STAGE},R2V_WANDB_NAME=${tag}"
     exports+=",R2V_WANDB_PANELS=${WANDB_PANELS},R2V_WANDB_REPORTS=${WANDB_REPORTS}"
     exports+=",R2V_N_PER_BUCKET=${n}"
+    [[ -n "${GT_SPACE:-}" ]] && exports+=",R2V_GT_SPACE=${GT_SPACE}"
     # No `--frechet-batch-size` override any more. It existed because the old 50/bucket stage could
     # not fill a 512-case batch; every stage now runs at N_PER_BUCKET so the default 512 applies
     # everywhere, which is what keeps `overall_batched_n512` comparable across every job.
-    # Keep the volumes for the headline runs only -- ~19 GB each at float16, and the cheap sweep
-    # stages exist to be thrown away. SAVE_VOLUMES=1 forces it on for every stage.
-    [[ "${SAVE_VOLUMES:-0}" == "1" || "$STAGE" == "headline" ]] && exports+=",R2V_SAVE_VOLUMES=1"
+    # **Keeping volumes is opt-in, and per (arm, cfg).** ~19 GB per run at float16; the cheap sweep
+    # stages exist to be thrown away. Three ways to ask for them, most specific first:
+    #
+    #   SAVE_VOLUMES_FOR="D:3.0 D:4.0 E:3.0 E:4.0"   exactly those runs, nothing else
+    #   SAVE_VOLUMES=1                                every run of the stage
+    #   STAGE=headline                                the historical default
+    #
+    # `SAVE_VOLUMES_FOR` is authoritative when set, so it can also *narrow* a headline stage.
+    # Volumes land one raw float16 stack per bucket (11 files a run, not 2,000) -- `/hnvme`'s
+    # binding limit is a file-count quota, and it is already at it.
+    local save_volumes=0
+    if [[ "${SAVE_VOLUMES:-0}" == "1" || "$STAGE" == "headline" ]]; then save_volumes=1; fi
+    if [[ -n "${SAVE_VOLUMES_FOR:-}" ]]; then
+        save_volumes=0
+        for pair in $SAVE_VOLUMES_FOR; do
+            [[ "${arm}:${cfg}" == "$pair" ]] && save_volumes=1
+        done
+    fi
+    [[ "$save_volumes" == "1" ]] && exports+=",R2V_SAVE_VOLUMES=1"
     [[ -n "${R2V_WANDB_ENTITY:-}" ]] && exports+=",R2V_WANDB_ENTITY=${R2V_WANDB_ENTITY}"
 
     local dependency=()

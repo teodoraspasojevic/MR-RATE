@@ -81,6 +81,19 @@ def parse_args(argv=None):
                           "the first N of the same deterministic order, so it is a prefix of the "
                           "full run, never a different sample")
     sel.add_argument("--seed", type=int, default=42, help="seeds sampler noise only")
+    sel.add_argument("--save-volumes", action="store_true",
+                     help="keep every generated volume under <out>/volumes/ as one raw float16 "
+                          "stack per bucket plus an index.json. ~19 GB for a 2,000-case run, so "
+                          "off by default; bundled per bucket because /hnvme's binding limit is a "
+                          "file COUNT quota, not space")
+    sel.add_argument("--gt-space", default="model", choices=["model", "native"],
+                     help="which ground truth to score against. 'model' (default) is the "
+                          "preprocessed volume on the model's own bucket grid. 'native' is the "
+                          "released volume RAS-reoriented and otherwise untouched -- no resample, "
+                          "no normalize, no crop/pad -- which is the geometry the challenge scores "
+                          "against. Generation is unaffected either way: the model always samples "
+                          "on its bucket grid and the metric resamples the generated volume onto "
+                          "the ground truth")
 
     model = p.add_argument_group("model")
     model.add_argument("--checkpoint", type=Path, default=None,
@@ -142,6 +155,7 @@ def build_dataset(args):
         geometry_mode=args.geometry_mode, series_selection="one_per_study_per_bucket",
         posterior_shift_mm=args.posterior_shift_mm, normalizer=args.normalizer, seed=args.seed,
         report_sections=args.report_sections,
+        gt_space=("native" if args.gt_space == "native" else "off"),
     )
     log.info("dataset: %d (report, volume) pairs in split %r", len(dataset), args.split)
     return dataset, dataset.config
@@ -394,7 +408,7 @@ def main(argv=None) -> int:
         task_name=args.task, output_dir=args.out, split=args.split, n_per_bucket=args.n_per_bucket,
         device=args.device,
         wandb_panels=(args.wandb_panels if args.wandb_mode != "disabled" else 0),
-        wandb_log_reports=args.wandb_log_reports,
+        wandb_log_reports=args.wandb_log_reports, save_volumes=args.save_volumes,
         extra_run_metadata={"model": identity, "dataset_config": dataset_config.geometry_fingerprint()},
     )
     evaluator = LiveEvaluator(dataset, cases, config)
